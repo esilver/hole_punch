@@ -52,6 +52,25 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
     # Create a copy of the list to iterate over, allowing modification of the original
     candidate_ids = list(workers_ready_for_pairing)
     
+    # NEW: Expand candidate list to include other connected workers that have
+    # valid UDP info and active WebSocket, even if they are not currently
+    # in the "workers_ready_for_pairing" list. This prevents a situation
+    # where a long-standing worker that was already removed from the ready
+    # list never gets paired with a newly-arriving worker until it next
+    # refreshes its STUN endpoint.
+    extra_candidates = [wid for wid, wdata in connected_workers.items()
+                        if wid not in workers_ready_for_pairing
+                        and wid != newly_ready_worker_id
+                        and wdata.get("stun_reported_udp_ip")
+                        and wdata.get("stun_reported_udp_port")
+                        and wdata.get("websocket")
+                        and hasattr(wdata["websocket"], 'client_state')
+                        and wdata["websocket"].client_state.value == 1]
+    if extra_candidates:
+        print(f"Rendezvous: Found {len(extra_candidates)} additional connected worker(s) with UDP info that were not in ready list: {extra_candidates}")
+        candidate_ids.extend(extra_candidates)
+    # END NEW BLOCK
+    
     for worker_id in candidate_ids:
         worker_data = connected_workers.get(worker_id)
         # Check if worker is still valid and its WebSocket is connected
