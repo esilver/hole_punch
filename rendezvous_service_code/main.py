@@ -21,62 +21,93 @@ workers_ready_for_pairing: List[str] = []
 async def attempt_to_pair_workers(newly_ready_worker_id: str):
     global workers_ready_for_pairing, connected_workers
 
-    # Ensure the worker trying to pair is valid
-    if newly_ready_worker_id not in connected_workers or \
-       not connected_workers[newly_ready_worker_id].get("stun_reported_udp_ip"):
-        print(f"Pairing: Worker '{newly_ready_worker_id}' not in connected_workers or no UDP info. Cannot initiate pairing.")
+    # Ensure the worker trying to pair is valid and has WebSocket
+    newly_ready_worker_data = connected_workers.get(newly_ready_worker_id)
+    if not (newly_ready_worker_data and newly_ready_worker_data.get("stun_reported_udp_ip") and 
+            newly_ready_worker_data.get("websocket") and 
+            hasattr(newly_ready_worker_data["websocket"], 'client_state') and 
+            newly_ready_worker_data["websocket"].client_state.value == 1):
+        print(f"Pairing: Newly ready worker '{newly_ready_worker_id}' is not valid, lacks UDP info, or WebSocket is disconnected. Cannot initiate pairing.")
         if newly_ready_worker_id in workers_ready_for_pairing:
             workers_ready_for_pairing.remove(newly_ready_worker_id)
+        # Also ensure it's removed from connected_workers if its WebSocket is truly gone or invalid
+        if newly_ready_worker_id in connected_workers and (not newly_ready_worker_data or not newly_ready_worker_data.get("websocket") or 
+                                                        not hasattr(newly_ready_worker_data.get("websocket"), 'client_state') or
+                                                        newly_ready_worker_data.get("websocket").client_state.value != 1):
+            del connected_workers[newly_ready_worker_id]
+            print(f"Cleaned up disconnected newly_ready_worker_id '{newly_ready_worker_id}' from connected_workers.")
         return
 
-    # Add the new worker to the ready list if not already present
     if newly_ready_worker_id not in workers_ready_for_pairing:
         workers_ready_for_pairing.append(newly_ready_worker_id)
         print(f"Rendezvous: Worker '{newly_ready_worker_id}' added to ready_for_pairing list. Current list: {workers_ready_for_pairing}")
 
-    # Attempt to find a pair if there are at least two workers ready
     if len(workers_ready_for_pairing) < 2:
         print(f"Rendezvous: Not enough workers ready for pairing ({len(workers_ready_for_pairing)}). Waiting for more.")
         return
 
-    # Take the first two distinct workers from the list for pairing
-    # This is a simple strategy; more complex ones could be used (e.g., oldest, random)
     peer_a_id = None
     peer_b_id = None
+    
+    # Create a copy of the list to iterate over, allowing modification of the original
+    candidate_ids = list(workers_ready_for_pairing)
+    
+    for worker_id in candidate_ids:
+        worker_data = connected_workers.get(worker_id)
+        # Check if worker is still valid and its WebSocket is connected
+        if not (worker_data and worker_data.get("stun_reported_udp_ip") and 
+                worker_data.get("websocket") and 
+                hasattr(worker_data["websocket"], 'client_state') and 
+                worker_data["websocket"].client_state.value == 1):
+            
+            print(f"Pairing: Worker '{worker_id}' in ready_list is stale or disconnected. Removing.")
+            if worker_id in workers_ready_for_pairing:
+                workers_ready_for_pairing.remove(worker_id)
+            if worker_id in connected_workers: # Remove from main dict too if its websocket is bad
+                 # Check ws state again to be sure before deleting, in case it reconnected quickly
+                current_ws_state_in_dict = connected_workers[worker_id].get("websocket")
+                if not current_ws_state_in_dict or not hasattr(current_ws_state_in_dict, 'client_state') or current_ws_state_in_dict.client_state.value != 1 :
+                    del connected_workers[worker_id]
+                    print(f"Cleaned up stale worker '{worker_id}' from connected_workers during pairing attempt.")
+            continue # Skip this stale worker
 
-    temp_ready_list = list(workers_ready_for_pairing) # Iterate over a copy
-    for i in range(len(temp_ready_list)):
-        potential_a = temp_ready_list[i]
-        if potential_a in connected_workers and connected_workers[potential_a].get("stun_reported_udp_ip"):
-            for j in range(i + 1, len(temp_ready_list)):
-                potential_b = temp_ready_list[j]
-                if potential_b in connected_workers and connected_workers[potential_b].get("stun_reported_udp_ip"):
-                    peer_a_id = potential_a
-                    peer_b_id = potential_b
-                    break
-            if peer_a_id and peer_b_id: # Found a pair
-                break
-        else: # Clean up stale entry from original list
-            if potential_a in workers_ready_for_pairing:
-                 workers_ready_for_pairing.remove(potential_a)
-
+        # Worker is valid, try to find a peer for it
+        if peer_a_id is None:
+            peer_a_id = worker_id
+        elif peer_a_id != worker_id: # Found a distinct, valid second peer
+            peer_b_id = worker_id
+            break # Found a pair
 
     if peer_a_id and peer_b_id:
-        # Found a pair! Remove both from the ready list.
-        workers_ready_for_pairing.remove(peer_a_id)
-        workers_ready_for_pairing.remove(peer_b_id)
-        print(f"Rendezvous: Pairing Worker '{peer_a_id}' with Worker '{peer_b_id}'. Updated ready list: {workers_ready_for_pairing}")
+        # Selected pair: peer_a_id, peer_b_id
+        print(f"Rendezvous: Attempting to pair Worker '{peer_a_id}' with Worker '{peer_b_id}'.")
 
-        peer_a_data = connected_workers.get(peer_a_id)
+        peer_a_data = connected_workers.get(peer_a_id) # Re-fetch, in case of rapid changes (though less likely now)
         peer_b_data = connected_workers.get(peer_b_id)
 
-        if not (peer_a_data and peer_b_data and 
+        # Final check for data integrity and WebSocket state before sending offers
+        if not (peer_a_data and peer_b_data and
                 peer_a_data.get("stun_reported_udp_ip") and peer_a_data.get("stun_reported_udp_port") and
                 peer_b_data.get("stun_reported_udp_ip") and peer_b_data.get("stun_reported_udp_port") and
-                peer_a_data.get("websocket") and peer_b_data.get("websocket")):
-            print(f"Pairing Error: Data integrity issue for pairing {peer_a_id} and {peer_b_id}. One might have disconnected or lost info.")
-            # Re-add valid ones if they were prematurely removed, or let them re-register
+                peer_a_data.get("websocket") and hasattr(peer_a_data["websocket"], 'client_state') and peer_a_data["websocket"].client_state.value == 1 and
+                peer_b_data.get("websocket") and hasattr(peer_b_data["websocket"], 'client_state') and peer_b_data["websocket"].client_state.value == 1):
+            
+            print(f"Pairing Error: Post-selection data integrity or WebSocket issue for {peer_a_id} or {peer_b_id}. Aborting this pair.")
+            # Don't re-add to workers_ready_for_pairing here. If they are still valid, 
+            # they'll be picked up in a subsequent call or re-register.
+            # Cleanup if one of them is now definitively disconnected:
+            for p_id in [peer_a_id, peer_b_id]:
+                p_data = connected_workers.get(p_id)
+                if p_data and (not p_data.get("websocket") or not hasattr(p_data["websocket"], 'client_state') or p_data["websocket"].client_state.value != 1):
+                    if p_id in workers_ready_for_pairing: workers_ready_for_pairing.remove(p_id)
+                    if p_id in connected_workers: del connected_workers[p_id]
+                    print(f"Cleaned up disconnected peer '{p_id}' after failed pairing integrity check.")
             return
+
+        # If all checks passed, remove from ready list and send offers
+        if peer_a_id in workers_ready_for_pairing: workers_ready_for_pairing.remove(peer_a_id)
+        if peer_b_id in workers_ready_for_pairing: workers_ready_for_pairing.remove(peer_b_id)
+        print(f"Rendezvous: Removed '{peer_a_id}' and '{peer_b_id}' from ready_for_pairing. Updated list: {workers_ready_for_pairing}")
 
         peer_a_ws = peer_a_data["websocket"]
         peer_b_ws = peer_b_data["websocket"]
@@ -96,18 +127,13 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
 
         try:
             # Send B's info to A
-            if hasattr(peer_a_ws, 'client_state') and peer_a_ws.client_state.value == 1:
-                await peer_a_ws.send_text(json.dumps(offer_to_a_payload))
-                print(f"Rendezvous: Sent connection offer to Worker '{peer_a_id}' (for peer '{peer_b_id}').")
-            else:
-                print(f"Rendezvous: Worker '{peer_a_id}' WebSocket not open. Cannot send offer.")
+            # No need to check ws.client_state again due to comprehensive check above, but doesn't hurt.
+            await peer_a_ws.send_text(json.dumps(offer_to_a_payload))
+            print(f"Rendezvous: Sent connection offer to Worker '{peer_a_id}' (for peer '{peer_b_id}').")
 
             # Send A's info to B
-            if hasattr(peer_b_ws, 'client_state') and peer_b_ws.client_state.value == 1:
-                await peer_b_ws.send_text(json.dumps(offer_to_b_payload))
-                print(f"Rendezvous: Sent connection offer to Worker '{peer_b_id}' (for peer '{peer_a_id}').")
-            else:
-                print(f"Rendezvous: Worker '{peer_b_id}' WebSocket not open. Cannot send offer.")
+            await peer_b_ws.send_text(json.dumps(offer_to_b_payload))
+            print(f"Rendezvous: Sent connection offer to Worker '{peer_b_id}' (for peer '{peer_a_id}').")
         except Exception as e:
             print(f"Rendezvous: Error sending P2P connection offers: {e}")
     else:
@@ -128,7 +154,7 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
         if old_ws_data:
             old_ws = old_ws_data.get("websocket")
             if old_ws and hasattr(old_ws, 'client_state') and old_ws.client_state.value == 1:
-                 try: await old_ws.close(code=1000, reason="New connection from same worker ID")
+                 try: await old_ws.close(code=1012, reason="New connection from same worker ID / Service Restarting")
                  except Exception: pass
         if worker_id in workers_ready_for_pairing: 
             workers_ready_for_pairing.remove(worker_id)
@@ -197,7 +223,7 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
 
 @app.get("/")
 async def read_root():
-    return {"message": "Rendezvous Service is running."}
+    return {"message": "Rendezvous Service is running. Test."}
 
 @app.get("/debug/list_workers")
 async def list_workers():
