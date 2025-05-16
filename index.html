@@ -37,9 +37,9 @@
             <!-- Messages will appear here -->
         </div>
 
-        <div class="flex items-center gap-3 mb-8">
-            <input type="text" id="messageInput" placeholder="Type your message..." class="flex-grow p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
-            <button id="sendButton" class="bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold py-4 px-8 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+        <div class="flex flex-col sm:flex-row items-center gap-3 mb-8">
+            <input type="text" id="messageInput" placeholder="Type your message..." class="w-full sm:w-auto flex-grow p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
+            <button id="sendButton" type="button" class="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold py-4 px-8 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
                 Send
             </button>
         </div>

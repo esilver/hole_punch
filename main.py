@@ -285,6 +285,29 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     for ui_client_ws in list(ui_websocket_clients):
         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link attempt initiated with {peer_worker_id[:8]}...", "peer_id": peer_worker_id})))
 
+async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, peer_worker_id: str, max_wait_sec: float = 10.0, check_interval: float = 0.5):
+    """Safely initiate a UDP hole-punch once the local UDP listener becomes active.
+
+    This helps when a p2p_connection_offer arrives *before* we have finished
+    creating the asyncio UDP datagram endpoint (race condition). We poll for
+    the global ``p2p_udp_transport`` for up to ``max_wait_sec`` seconds.
+    """
+    global p2p_udp_transport, stop_signal_received, worker_id
+
+    waited = 0.0
+    while not stop_signal_received and waited < max_wait_sec:
+        if p2p_udp_transport:  # Listener is finally ready
+            await start_udp_hole_punch(peer_udp_ip, peer_udp_port, peer_worker_id)
+            return
+        await asyncio.sleep(check_interval)
+        waited += check_interval
+
+    # If we exit the loop we either exceeded the wait time or shutdown was requested.
+    print(
+        f"Worker '{worker_id}': Gave up waiting ({waited:.1f}s) for UDP listener to become active "
+        f"before initiating hole-punch to '{peer_worker_id}'."
+    )
+
 async def connect_to_rendezvous(rendezvous_ws_url: str):
     global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
     ip_echo_service_url = "https://api.ipify.org"
@@ -344,9 +367,8 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                             peer_port = message_data.get("peer_udp_port")
                             if peer_id and peer_ip and peer_port:
                                 print(f"Worker '{worker_id}': Received P2P offer for peer '{peer_id}' at {peer_ip}:{peer_port}")
-                                if udp_listener_active and our_stun_discovered_udp_ip:
-                                    asyncio.create_task(start_udp_hole_punch(peer_ip, int(peer_port), peer_id))
-                                else: print(f"Worker '{worker_id}': Cannot P2P, UDP listener/STUN info not ready.")
+                                # Always schedule an attempt, letting the helper wait until the listener is ready.
+                                asyncio.create_task(attempt_hole_punch_when_ready(peer_ip, int(peer_port), peer_id))
                         elif msg_type == "udp_endpoint_ack": print(f"Worker '{worker_id}': UDP Endpoint Ack: {message_data.get('status')}")
                         elif msg_type == "echo_response": print(f"Worker '{worker_id}': Echo Response: {message_data.get('processed_by_rendezvous')}")
                         else: print(f"Worker '{worker_id}': Unhandled message from Rendezvous: {msg_type}")
