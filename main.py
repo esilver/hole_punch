@@ -8,20 +8,110 @@ import http.server
 import socketserver
 import requests
 import json
+import socket # For UDP sockets
+# You will need a STUN client library. pystun3 is a common choice.
+# Add 'pystun3' to requirements.txt
+import stun # This will be from pystun3
+from typing import Optional
 
 # This worker no longer needs Flask for this step, it will be a dedicated WebSocket client.
 # If you need HTTP endpoints on the worker later, Flask can be re-added (e.g., in a separate thread).
 
 worker_id = str(uuid.uuid4())
 stop_signal_received = False
+# Global variable to store the UDP socket so it can be used later for P2P
+udp_socket: Optional[socket.socket] = None 
+discovered_udp_ip: Optional[str] = None
+discovered_udp_port: Optional[int] = None
+
+# Public STUN servers
+# Google's STUN servers are often reliable.
+DEFAULT_STUN_HOST = "stun.l.google.com"
+DEFAULT_STUN_PORT = 19302
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received
-    print(f"Shutdown signal ({signum}) received. Attempting to close WebSocket connection.")
+    print(f"Shutdown signal ({signum}) received. Worker '{worker_id}' attempting graceful shutdown.")
     stop_signal_received = True
+    if udp_socket:
+        try:
+            udp_socket.close()
+            print(f"Worker '{worker_id}': UDP socket closed.")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error closing UDP socket: {e}")
+
+async def discover_udp_endpoint_and_report(websocket_conn):
+    global udp_socket, discovered_udp_ip, discovered_udp_port
+    
+    if udp_socket is None:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp_socket.bind(("0.0.0.0", 0)) 
+            source_ip, source_port = udp_socket.getsockname()
+            print(f"Worker '{worker_id}': UDP socket created and bound to local {source_ip}:{source_port}")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error binding UDP socket: {e}. Cannot perform STUN discovery.")
+            if udp_socket:
+                udp_socket.close()
+                udp_socket = None
+            return
+
+    stun_host = os.environ.get("STUN_HOST", DEFAULT_STUN_HOST)
+    stun_port = int(os.environ.get("STUN_PORT", DEFAULT_STUN_PORT))
+
+    print(f"Worker '{worker_id}': Our main UDP socket is bound to local {udp_socket.getsockname()[0]}:{udp_socket.getsockname()[1]}")
+    print(f"Worker '{worker_id}': Attempting STUN discovery to {stun_host}:{stun_port} (pystun3 will use its own ephemeral client port)")
+    
+    try:
+        nat_type, external_ip, external_port = stun.get_ip_info(
+            stun_host=stun_host, 
+            stun_port=stun_port
+        )
+        print(f"Worker '{worker_id}': STUN discovery result: NAT Type={nat_type}, External IP={external_ip}, External Port={external_port}")
+
+        if external_ip and external_port:
+            discovered_udp_ip = external_ip
+            discovered_udp_port = external_port
+            
+            udp_endpoint_message = {
+                "type": "update_udp_endpoint",
+                "udp_ip": discovered_udp_ip,
+                "udp_port": discovered_udp_port
+            }
+            await websocket_conn.send(json.dumps(udp_endpoint_message))
+            print(f"Worker '{worker_id}': Sent discovered UDP endpoint ({discovered_udp_ip}:{discovered_udp_port}) to Rendezvous.")
+        else:
+            print(f"Worker '{worker_id}': STUN discovery failed to return external IP/Port.")
+
+    except socket.gaierror as e: 
+        print(f"Worker '{worker_id}': STUN host DNS resolution error: {e}")
+    except Exception as e: 
+        print(f"Worker '{worker_id}': Error during STUN discovery: {type(e).__name__} - {e}")
+    
+async def udp_listener_task():
+    global udp_socket, stop_signal_received
+    if not udp_socket:
+        print(f"Worker '{worker_id}': UDP socket not initialized. UDP listener cannot start.")
+        return
+
+    local_ip, local_port = udp_socket.getsockname()
+    print(f"Worker '{worker_id}': Starting UDP listener on {local_ip}:{local_port}...")
+    try:
+        while not stop_signal_received:
+            try:
+                await asyncio.sleep(60) 
+                if not stop_signal_received:
+                     print(f"Worker '{worker_id}': UDP socket still open on local {local_ip}:{local_port} (placeholder for listener)")
+
+            except Exception as e:
+                if not stop_signal_received: 
+                    print(f"Worker '{worker_id}': Error in placeholder UDP listener loop: {e}")
+                break 
+    finally:
+        print(f"Worker '{worker_id}': UDP listener task stopped.")
 
 async def connect_to_rendezvous(rendezvous_ws_url: str):
-    global stop_signal_received
+    global stop_signal_received, discovered_udp_ip, discovered_udp_port
     print(f"WORKER CONNECT_TO_RENDEZVOUS: Entered function for URL: {rendezvous_ws_url}. stop_signal_received={stop_signal_received}")
     print(f"Worker '{worker_id}' attempting to connect to Rendezvous: {rendezvous_ws_url}")
     
@@ -37,85 +127,46 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 ping_interval=ping_interval,
                 ping_timeout=ping_timeout,
             ) as websocket:
-                print(f"Worker '{worker_id}' connected to Rendezvous. Public IP:Port should be registered by Rendezvous.")
                 print(f"WORKER '{worker_id}' connected to Rendezvous. Type of websocket object: {type(websocket)}")
                 print(f"WORKER '{worker_id}' Attributes of websocket object: {dir(websocket)}")
+                print(f"Worker '{worker_id}' connected to Rendezvous via WebSocket.") # Clarified message
 
-                # Get self public IP and send to rendezvous service
                 try:
-                    print(f"Worker '{worker_id}' fetching its public IP from {ip_echo_service_url}...")
-                    response = requests.get(ip_echo_service_url, timeout=10)
+                    print(f"Worker '{worker_id}' fetching its HTTP-based public IP from {ip_echo_service_url}...")
+                    response = requests.get(ip_echo_service_url, timeout=10) # Synchronous call
                     response.raise_for_status()
-                    public_ip = response.text.strip()
-                    print(f"Worker '{worker_id}' identified public IP as: {public_ip}")
+                    http_public_ip = response.text.strip()
+                    print(f"Worker '{worker_id}' identified HTTP-based public IP as: {http_public_ip}")
                     await websocket.send(json.dumps({
-                        "type": "register_public_ip",
-                        "ip": public_ip
+                        "type": "register_public_ip", 
+                        "ip": http_public_ip
                     }))
-                    print(f"Worker '{worker_id}' sent public IP to Rendezvous.")
+                    print(f"Worker '{worker_id}' sent HTTP-based public IP to Rendezvous.")
                 except requests.exceptions.RequestException as e:
-                    print(f"Worker '{worker_id}': Error fetching/sending public IP: {e}. Will rely on Rendezvous observed IP.")
+                    print(f"Worker '{worker_id}': Error fetching/sending HTTP-based public IP: {e}.")
 
-                # NEW: Task to send periodic "echo_request" and "get_my_details"
-                async def send_test_messages():
-                    print(f"WORKER '{worker_id}': Starting send_test_messages task...")
-                    counter = 0
-                    try:
-                        while not stop_signal_received and websocket.state.name == "OPEN":
-                            print(f"WORKER '{worker_id}': send_test_messages loop, websocket.state={websocket.state.name}, counter={counter}")
-                            await asyncio.sleep(15) # Send a message every 15 seconds
-                            if websocket.state.name != "OPEN":
-                                print(f"WORKER '{worker_id}': send_test_messages - WebSocket no longer OPEN after sleep, before send. State: {websocket.state.name}. Exiting loop.")
-                                break
-                        
-                            counter += 1
-                            # Send an echo request
-                            echo_req_msg = {
-                                "type": "echo_request",
-                                "payload": f"Test message from {worker_id}, count: {counter}"
-                            }
-                            try:
-                                await websocket.send(json.dumps(echo_req_msg))
-                                print(f"Worker '{worker_id}' sent: {echo_req_msg['type']}. WebSocket state: {websocket.state.name}")
-                            except websockets.exceptions.ConnectionClosed: 
-                                print(f"WORKER '{worker_id}': send_test_messages - ConnectionClosed during echo_request send. Exiting loop.")
-                                break
+                await discover_udp_endpoint_and_report(websocket)
 
-                            if websocket.state.name != "OPEN":
-                                print(f"WORKER '{worker_id}': send_test_messages - WebSocket no longer OPEN after echo_request, before details_req. State: {websocket.state.name}. Exiting loop.")
-                                break
-                            await asyncio.sleep(2) # Small delay
-
-                            # Send a request for its own details
-                            details_req_msg = {"type": "get_my_details"}
-                            try:
-                                await websocket.send(json.dumps(details_req_msg))
-                                print(f"Worker '{worker_id}' sent: {details_req_msg['type']}. WebSocket state: {websocket.state.name}")
-                            except websockets.exceptions.ConnectionClosed: 
-                                print(f"WORKER '{worker_id}': send_test_messages - ConnectionClosed during details_req send. Exiting loop.")
-                                break
-                        print(f"WORKER '{worker_id}': send_test_messages loop finished. stop_signal={stop_signal_received}, websocket.state={websocket.state.name}")
-                    except AttributeError as ae:
-                        print(f"WORKER '{worker_id}': ATTRIBUTE ERROR in send_test_messages task: {ae}. Attributes: {dir(websocket)}")
-                    except Exception as e_task:
-                        print(f"WORKER '{worker_id}': EXCEPTION in send_test_messages task: {e_task}")
-                    finally:
-                        print(f"WORKER '{worker_id}': send_test_messages task finally block.")
+                # listener_task = None # TEMP COMMENT OUT
+                # if udp_socket and discovered_udp_ip and discovered_udp_port:
+                #     listener_task = asyncio.create_task(udp_listener_task()) # TEMP COMMENT OUT
                 
-                message_sender_task = asyncio.create_task(send_test_messages())
+                print(f"WORKER '{worker_id}': Entering main WebSocket receive loop...")
 
-                # Main receive loop
+                # Main receive loop for WebSocket messages from Rendezvous
                 while not stop_signal_received:
                     try:
-                        message_raw = await asyncio.wait_for(websocket.recv(), timeout=max(30.0, ping_interval + ping_timeout + 5))
-                        print(f"RAW Received from Rendezvous: {message_raw}")
+                        message_raw = await asyncio.wait_for(websocket.recv(), timeout=max(30.0, ping_interval + ping_timeout + 10))
+                        print(f"RAW Received from Rendezvous (WebSocket): {message_raw}")
                         try:
                             message_data = json.loads(message_raw)
                             msg_type = message_data.get("type")
-                            if msg_type == "echo_response":
+                            
+                            if msg_type == "udp_endpoint_ack":
+                                print(f"Received UDP endpoint ack from Rendezvous: {message_data.get('status')}")
+                            elif msg_type == "echo_response": 
                                 print(f"Echo Response from Rendezvous: {message_data.get('processed_by_rendezvous')}")
-                            elif msg_type == "my_details_response":
-                                print(f"My Details from Rendezvous: IP={message_data.get('registered_ip')}, Port={message_data.get('registered_port')}")
+                            # Add other P2P message handlers here in Step 3B
                             else:
                                 print(f"Received unhandled message type from Rendezvous: {msg_type}")
                         except json.JSONDecodeError:
@@ -126,26 +177,29 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                         print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed by server.")
                         break 
                 
-                message_sender_task.cancel()
-                try:
-                    await message_sender_task
-                except asyncio.CancelledError:
-                    print("Message sender task cancelled.")
+                print(f"WORKER '{worker_id}': Exited main WebSocket receive loop.")
 
+                # if listener_task: # TEMP COMMENT OUT
+                #     listener_task.cancel() # TEMP COMMENT OUT
+                #     try: # TEMP COMMENT OUT
+                #         await listener_task # TEMP COMMENT OUT
+                #     except asyncio.CancelledError: # TEMP COMMENT OUT
+                #         print(f"Worker '{worker_id}': UDP listener task cancelled.") # TEMP COMMENT OUT
+            
         except websockets.exceptions.ConnectionClosedOK:
             print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed gracefully by server.")
         except websockets.exceptions.InvalidURI:
             print(f"Worker '{worker_id}': Invalid Rendezvous WebSocket URI: {rendezvous_ws_url}. Exiting.")
-            return # Cannot recover from this
+            return 
         except ConnectionRefusedError:
             print(f"Worker '{worker_id}': Connection to Rendezvous refused. Retrying in 10 seconds...")
-        except Exception as e:
-            print(f"Worker '{worker_id}': Error connecting/communicating with Rendezvous: {e}. Retrying in 10 seconds...")
+        except Exception as e: 
+            print(f"Worker '{worker_id}': Error in WebSocket connect_to_rendezvous outer loop: {e}. Retrying in 10s...")
         
         if not stop_signal_received:
-            await asyncio.sleep(10) # Wait before retrying connection
+            await asyncio.sleep(10) 
         else:
-            break # Exit outer loop if stop signal was received
+            break 
 
     print(f"Worker '{worker_id}' has stopped WebSocket connection attempts.")
 
@@ -206,4 +260,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(f"Worker '{worker_id}' interrupted by user. Shutting down.")
     finally:
-        print(f"Worker '{worker_id}' main process finished.") 
+        print(f"Worker '{worker_id}' main process finished.")
+        if udp_socket: # Ensure UDP socket is closed on exit
+            udp_socket.close()
+            print(f"Worker '{worker_id}': UDP socket closed in __main__ finally block.") 
