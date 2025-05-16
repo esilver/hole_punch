@@ -1,0 +1,25 @@
+# Use an official Python runtime as a parent image
+FROM python:3.9-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file to the working directory
+COPY requirements.txt .
+
+# Install dependencies
+# --no-cache-dir reduces image size
+# --prefer-binary can speed up installs for packages with binary distributions
+RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
+
+# Copy the application code into the container
+COPY main.py .
+
+# Make port 8080 available (Cloud Run default)
+EXPOSE 8080
+ENV PORT 8080
+
+# Command to run the Uvicorn server for FastAPI
+# --host 0.0.0.0 makes it accessible from outside the container
+# --port $PORT uses the port specified by the environment variable (set by Cloud Run)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"] 

@@ -1,116 +1,192 @@
-# P2P Hole Punching with Cloud Run: Step 2 - Rendezvous Service & Worker Registration
+Okay, this is an exciting next step\! Now that we've proven your "worker" Cloud Run service can present a stable public IP (via Cloud NAT), let's build the system that allows workers to discover each other.
+
+This involves two main parts:
+
+1.  **Creating a Rendezvous Service:** This is a new, central service that workers will connect to. It will learn about each worker's public NAT endpoint (`IP:Port`).
+2.  **Modifying the Worker Service:** Your existing worker service will be updated to connect to this new Rendezvous service via WebSockets and register itself.
+
+This `README.md` will guide you through this. I've been extra careful with library versions and syntax, referencing current best practices.
 
 **Project ID:** `iceberg-eli`
+**Region:** `us-central1` (continuing from previous setup)
 
-## Objective
-This step builds upon Step 1. We will:
-1.  Create a **Rendezvous Service** using FastAPI and WebSockets, deployed on Cloud Run. This service will accept connections from workers.
-2.  Modify the **Worker Service** to connect to the Rendezvous Service via WebSocket upon startup.
-3.  The Rendezvous Service will log and store (in memory for this PoC) the public NAT IP address and source port of each connecting worker.
+-----
 
-This establishes the mechanism for workers to announce their presence and their network endpoint (as seen by the Rendezvous server) to a central point.
+## README - Step 2: Rendezvous Service and Worker Registration
 
-## Prerequisites
-* All prerequisites from Step 1 (Google Cloud SDK, Docker, enabled APIs).
-* Completion of Step 1, including the VPC, subnet, and Cloud NAT gateway (`ip-worker-nat`) setup. We will reuse these.
-* Familiarity with Python, FastAPI, and WebSockets is helpful.
+### Objective
 
-## Directory Structure (Recommended)
-To keep things organized, consider a structure like this for Step 2:
-iceberg-eli-p2p-project/├── step1_ip_observer/          # Files from your completed Step 1│   ├── main.py│   └── Dockerfile├── step2_rendezvous_registration/│   ├── rendezvous_service/       # NEW: For the Rendezvous service│   │   ├── main.py│   │   ├── requirements.txt│   │   └── Dockerfile│   └── worker_service/           # UPDATED: For the modified Worker service│       ├── main.py│       ├── requirements.txt│       ├── Dockerfile│       └── .env.example          # For local testing configuration└── README_step2.md               # This file
-## Part 1: Create the Rendezvous Service
+This step aims to:
 
-This service will listen for WebSocket connections from workers.
+1.  Create and deploy a **Rendezvous Service** on Cloud Run. This service will accept WebSocket connections from workers, observe their public NAT IP address and port, and keep track of active workers.
+2.  Modify the existing **Worker Service** (from Step 1) to:
+      * Generate a unique ID for itself upon startup.
+      * Connect to the Rendezvous Service via a WebSocket.
+      * Register itself by sending its unique ID.
+      * Maintain this WebSocket connection (with basic reconnection logic).
 
-**Location:** `step2_rendezvous_registration/rendezvous_service/`
+This lays the groundwork for peer discovery, which is essential for P2P hole punching.
 
-### 1. `rendezvous_service/requirements.txt`
-```txt
-fastapi~=0.111.0
-uvicorn[standard]~=0.29.0
-websockets~=12.0
-2. rendezvous_service/main.pyimport uvicorn
-import uuid
+### Prerequisites
+
+1.  **Completion of Step 1:** You must have successfully completed the previous step where you set up the Worker Service with Cloud NAT and verified its public IP observation. The VPC, subnet, Cloud Router, and Cloud NAT gateway (`ip-worker-nat`) should still be in place.
+2.  **gcloud SDK and Configuration:**
+      * `gcloud` installed and authenticated.
+      * Project set: `gcloud config set project iceberg-eli`
+      * Default region set (optional, but helps): `gcloud config set compute/region us-central1`
+3.  **APIs Enabled:** The same APIs from Step 1 should still be enabled:
+    ```bash
+    gcloud services enable \
+        cloudbuild.googleapis.com \
+        run.googleapis.com \
+        compute.googleapis.com \
+        artifactregistry.googleapis.com \
+        iam.googleapis.com
+    ```
+
+-----
+
+## Part 1: The Rendezvous Service
+
+This is a **NEW** service you will create.
+
+### 1.1. Define Shell Variables (for Rendezvous Service)
+
+```bash
+export PROJECT_ID="iceberg-eli"
+export REGION="us-central1"
+export AR_RENDEZVOUS_REPO_NAME="rendezvous-repo" # New Artifact Registry repo
+export RENDEZVOUS_SERVICE_NAME="rendezvous-service" # New Cloud Run service name
+export RENDEZVOUS_IMAGE_TAG_LATEST="latest"
+```
+
+### 1.2. Rendezvous Service Code
+
+Create a new directory for the Rendezvous service (e.g., `rendezvous_service_code`). Inside this directory, create the following files:
+
+**`rendezvous_service_code/main.py`:**
+
+```python
+import asyncio
+import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, Tuple
+import os
+import json
 
 app = FastAPI(title="Rendezvous Service")
 
-# In-memory store for connected workers.
-# Format: { "worker_id": {"public_ip": "x.x.x.x", "public_port": 12345, "websocket": WebSocket} }
-# For production, use a persistent store like Redis or Firestore.
+# In-memory storage for connected workers.
+# Format: {worker_id: {"public_ip": str, "public_port": int, "websocket": WebSocket}}
+# WARNING: This is for PoC only. Data will be lost if the service restarts or scales to zero.
+# For production, use an external store like Redis or Firestore.
 connected_workers: Dict[str, Dict] = {}
 
 @app.websocket("/ws/register/{worker_id}")
-async def websocket_endpoint(websocket: WebSocket, worker_id: str):
-    """
-    Handles WebSocket connections from workers for registration.
-    The worker_id is expected to be a unique identifier sent by the worker.
-    """
+async def websocket_register_worker(websocket: WebSocket, worker_id: str):
     await websocket.accept()
-    client_host = websocket.client.host  # This is the NAT public IP
-    client_port = websocket.client.port  # This is the NAT source port for this connection
-
-    # If worker_id is already connected, handle re-connection or deny
-    if worker_id in connected_workers:
-        print(f"Worker {worker_id} reconnected or attempted duplicate connection from {client_host}:{client_port}.")
-        # Optionally, close the old connection if it exists and is active
-        # old_ws = connected_workers[worker_id].get("websocket")
-        # if old_ws and old_ws.client_state == WebSocketState.CONNECTED:
-        #     await old_ws.close(code=1008, reason="New connection established")
+    client_host = websocket.client.host
+    client_port = websocket.client.port
     
+    print(f"Worker '{worker_id}' connecting from {client_host}:{client_port}")
+
+    if worker_id in connected_workers:
+        print(f"Worker '{worker_id}' re-connecting or duplicate ID detected.")
+        old_ws = connected_workers[worker_id].get("websocket")
+        if old_ws and hasattr(old_ws, 'client_state') and old_ws.client_state.value == 1: # WebSocketState.CONNECTED
+             try:
+                await old_ws.close(code=1000, reason="New connection from same worker ID")
+             except Exception:
+                pass 
+
     connected_workers[worker_id] = {
         "public_ip": client_host,
         "public_port": client_port,
-        "websocket": websocket  # Store the WebSocket object for potential future communication
+        "websocket": websocket 
     }
-    print(f"Worker '{worker_id}' connected from {client_host}:{client_port}. Total workers: {len(connected_workers)}")
-    print(f"Current worker details: { {k: {'ip': v['public_ip'], 'port': v['public_port']} for k,v in connected_workers.items()} }")
+    print(f"Worker '{worker_id}' registered with initial endpoint: {client_host}:{client_port}. Total workers: {len(connected_workers)}")
 
     try:
         while True:
-            # Keep the connection alive, listen for messages (optional for this step)
-            # For this PoC, we're mainly interested in the registration.
-            # In a full P2P setup, workers might send/receive signals here.
-            data = await websocket.receive_text() 
-            print(f"Received message from {worker_id} ({client_host}:{client_port}): {data}")
-            # Example: await websocket.send_text(f"Message received: {data}")
-            
-    except WebSocketDisconnect:
-        print(f"Worker '{worker_id}' from {client_host}:{client_port} disconnected.")
-    except Exception as e:
-        print(f"Error with worker '{worker_id}' ({client_host}:{client_port}): {e}")
-    finally:
-        if worker_id in connected_workers:
-            # Ensure the stored websocket is the one we are closing
-            if connected_workers[worker_id]["websocket"] == websocket:
-                 del connected_workers[worker_id]
-                 print(f"Worker '{worker_id}' removed. Total workers: {len(connected_workers)}")
+            raw_data = await websocket.receive_text()
+            print(f"Received raw message from '{worker_id}': {raw_data}")
+            try:
+                message = json.loads(raw_data)
+                msg_type = message.get("type")
 
+                if msg_type == "register_public_ip":
+                    new_ip = message.get("ip")
+                    if new_ip and worker_id in connected_workers: # Check worker_id still exists
+                        print(f"Worker '{worker_id}' self-reported public IP: {new_ip}. Updating from {connected_workers[worker_id]['public_ip']}.")
+                        connected_workers[worker_id]["public_ip"] = new_ip
+                    elif not new_ip:
+                        print(f"Worker '{worker_id}' sent register_public_ip message without an IP.")
+                    # else: worker might have disconnected before IP update processed
+                else:
+                    print(f"Worker '{worker_id}' sent unhandled message type: {msg_type}")
+
+            except json.JSONDecodeError:
+                print(f"Worker '{worker_id}' sent non-JSON message: {raw_data}")
+            except AttributeError: 
+                print(f"Worker '{worker_id}' sent malformed JSON message: {raw_data}")
+            except KeyError:
+                 print(f"Worker '{worker_id}' no longer in connected_workers dictionary, could not update IP.")
+
+    except WebSocketDisconnect:
+        print(f"Worker '{worker_id}' disconnected from {client_host}:{client_port}.")
+    except Exception as e:
+        print(f"Error with worker '{worker_id}': {e}")
+    finally:
+        if worker_id in connected_workers and connected_workers[worker_id]["websocket"] == websocket:
+            del connected_workers[worker_id]
+            print(f"Worker '{worker_id}' de-registered. Total workers: {len(connected_workers)}")
 
 @app.get("/")
 async def read_root():
     return {"message": "Rendezvous Service is running. Connect via WebSocket at /ws/register/{worker_id}"}
 
-@app.get("/peers")
-async def get_peers():
-    """
-    HTTP endpoint to view currently registered peers (their NAT IP:Port).
-    This is for observation and debugging.
-    """
-    # Return a simplified list without the WebSocket objects
-    peer_info = {
-        worker_id: {"public_ip": data["public_ip"], "public_port": data["public_port"]}
-        for worker_id, data in connected_workers.items()
-    }
-    return {"connected_workers": peer_info, "count": len(peer_info)}
+@app.get("/debug/list_workers")
+async def list_workers():
+    workers_info = {}
+    for worker_id, data_val in connected_workers.items():
+        ws_object = data_val["websocket"]
+        current_client_state_value = None
+        is_connected = False
+        if ws_object and hasattr(ws_object, 'client_state'):
+            current_client_state = ws_object.client_state
+            current_client_state_value = current_client_state.value
+            is_connected = (current_client_state_value == 1) # WebSocketState.CONNECTED.value
+            print(f"DEBUG: Worker {worker_id}, WebSocket object: {ws_object}, client_state enum: {current_client_state}, raw value: {current_client_state_value}")
+        else:
+            print(f"DEBUG: Worker {worker_id}, no WebSocket object or client_state found in data.")
+
+        workers_info[worker_id] = {
+            "public_ip": data_val["public_ip"],
+            "public_port": data_val["public_port"],
+            "connected": is_connected,
+            "raw_state": current_client_state_value
+        }
+    return {"connected_workers_count": len(workers_info), "workers": workers_info}
 
 if __name__ == "__main__":
-    # This is for local testing. Cloud Run will use the CMD in Dockerfile.
-    # Note: For local testing, ensure Uvicorn is run with --host 0.0.0.0
-    # Example: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    print("Starting Rendezvous Service locally on port 8000 (intended for Cloud Run deployment via Gunicorn/Uvicorn worker)")
-3. rendezvous_service/Dockerfile# Use an official Python runtime as a parent image
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+```
+
+**`rendezvous_service_code/requirements.txt`:**
+
+```
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0 
+# Using [standard] includes websockets and other useful dependencies for uvicorn.
+# Check for latest stable versions if deploying much later.
+```
+
+*(Searched May 15, 2025: FastAPI 0.111.0 and Uvicorn 0.29.0 are current. Adjust if necessary based on actual release dates when you implement.)*
+
+**`rendezvous_service_code/Dockerfile.rendezvous`:** (Note the specific Dockerfile name)
+
+```dockerfile
+# Use an official Python runtime as a parent image
 FROM python:3.9-slim
 
 # Set the working directory in the container
@@ -120,265 +196,375 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-cache-dir reduces image size
+# --prefer-binary can speed up installs for packages with binary distributions
+RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
 # Copy the application code into the container
 COPY main.py .
 
-# Expose the port the app runs on (FastAPI default via Uvicorn is 8000 or 80)
-# Cloud Run will set the PORT environment variable. Uvicorn will respect it.
-EXPOSE 8080 
-
-# Command to run the Uvicorn server
-# Uvicorn with Gunicorn is a common setup for production.
-# Cloud Run's default Gunicorn will use Uvicorn workers for FastAPI.
-# The PORT environment variable will be automatically picked up by Uvicorn.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
-4. Define Shell Variables for Rendezvous Serviceexport RENDEZVOUS_SERVICE_NAME="rendezvous-service"
-export RENDEZVOUS_AR_REPO_NAME="rendezvous-repo" # Or use the same repo as worker: ip-worker-repo
-
-# Ensure PROJECT_ID and REGION are still set from Step 1
-# export PROJECT_ID="iceberg-eli"
-# export REGION="us-central1"
-5. Build and Deploy the Rendezvous ServiceCreate Artifact Registry (if using a new one):gcloud artifacts repositories create $RENDEZVOUS_AR_REPO_NAME \
-    --project=$PROJECT_ID \
-    --repository-format=docker \
-    --location=$REGION \
-    --description="Docker repository for Rendezvous service"
-(Ensure Cloud Build service account has roles/artifactregistry.writer as in Step 1)Build and Push (from step2_rendezvous_registration/rendezvous_service/ directory):gcloud builds submit --region=$REGION --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${RENDEZVOUS_AR_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:latest
-Deploy to Cloud Run:gcloud run deploy $RENDEZVOUS_SERVICE_NAME \
-    --project=$PROJECT_ID \
-    --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${RENDEZVOUS_AR_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:latest \
-    --platform=managed \
-    --region=$REGION \
-    --allow-unauthenticated \
-    --cpu-boost # Good for services that need quick startup for WebSocket handshakes
-    # --session-affinity # Consider enabling this for WebSockets if clients might reconnect often
-    # Rendezvous service does NOT need VPC egress for this step.
-Note the URL of the deployed Rendezvous service (e.g., https://rendezvous-service-xxxx.a.run.app). You'll need this for the worker. Let's call this YOUR_RENDEZVOUS_SERVICE_URL.Part 2: Modify the Worker ServiceThis service will now connect to the Rendezvous service.Location: step2_rendezvous_registration/worker_service/(You can copy Dockerfile from Step 1 and modify main.py and add requirements.txt)1. worker_service/requirements.txtFlask~=3.0.3
-requests~=2.31.0
-gunicorn~=22.0.0
-websockets~=12.0 # For WebSocket client
-python-dotenv~=1.0.1 # For managing environment variables locally
-2. worker_service/.env.exampleCreate this file for local testing. Do not commit actual .env files with secrets.# For local testing: URL of your deployed Rendezvous Service (use wss:// for secure WebSockets)
-# Example: RENDEZVOUS_URL=wss://rendezvous-service-xxxx-uc.a.run.app/ws/register
-RENDEZVOUS_URL=
-3. worker_service/main.py (Updated)import os
-import requests
-import asyncio
-import websockets # WebSocket client library
-import uuid
-import threading
-import time
-from flask import Flask
-from dotenv import load_dotenv
-
-load_dotenv() # Load environment variables from .env file for local development
-
-app = Flask(__name__)
-
-IP_ECHO_SERVICE_URL = "[https://api.ipify.org](https://api.ipify.org)" 
-WORKER_ID = str(uuid.uuid4()) # Generate a unique ID for this worker instance
-
-# Global variable to store the Rendezvous Service URL
-# For Cloud Run, set this as an environment variable in the service configuration.
-# For local testing, it can be loaded from a .env file.
-RENDEZVOUS_URL_TEMPLATE = os.environ.get("RENDEZVOUS_URL") # e.g., wss://<your-rendezvous-url>/ws/register
-RENDEZVOUS_CONNECTION_URL = f"{RENDEZVOUS_URL_TEMPLATE}/{WORKER_ID}" if RENDEZVOUS_URL_TEMPLATE else None
-
-websocket_connection = None # To hold the active WebSocket connection object
-stop_websocket_thread = threading.Event()
-
-async def connect_to_rendezvous():
-    """
-    Connects to the Rendezvous service via WebSocket and keeps the connection alive.
-    """
-    global websocket_connection
-    if not RENDEZVOUS_CONNECTION_URL:
-        print("RENDEZVOUS_URL not set. Cannot connect to Rendezvous service.")
-        return
-
-    retry_delay = 5  # seconds
-    while not stop_websocket_thread.is_set():
-        try:
-            print(f"Worker '{WORKER_ID}' attempting to connect to Rendezvous: {RENDEZVOUS_CONNECTION_URL}")
-            async with websockets.connect(RENDEZVOUS_CONNECTION_URL) as websocket:
-                websocket_connection = websocket # Store the connection
-                print(f"Worker '{WORKER_ID}' connected to Rendezvous service.")
-                await websocket.send(f"Hello from worker {WORKER_ID}") # Optional: send an initial message
-
-                # Keep connection alive and listen for messages
-                while not stop_websocket_thread.is_set():
-                    try:
-                        # Add a timeout to periodically check stop_websocket_thread
-                        message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                        print(f"Worker '{WORKER_ID}' received message from Rendezvous: {message}")
-                        # Handle incoming messages from Rendezvous (for future steps)
-                    except asyncio.TimeoutError:
-                        continue # No message received, continue loop
-                    except websockets.exceptions.ConnectionClosed:
-                        print(f"Worker '{WORKER_ID}': Rendezvous connection closed.")
-                        break # Break inner loop to trigger reconnection
-            
-        except websockets.exceptions.InvalidURI:
-            print(f"Worker '{WORKER_ID}': Invalid Rendezvous URI: {RENDEZVOUS_CONNECTION_URL}. Please check the URL format (e.g. wss://).")
-            break # Stop trying if URI is invalid
-        except websockets.exceptions.ConnectionClosedError as e:
-            print(f"Worker '{WORKER_ID}': Connection to Rendezvous closed unexpectedly: {e}. Retrying in {retry_delay}s...")
-        except ConnectionRefusedError:
-            print(f"Worker '{WORKER_ID}': Connection to Rendezvous refused. Is the service running? Retrying in {retry_delay}s...")
-        except Exception as e:
-            print(f"Worker '{WORKER_ID}': Error connecting to Rendezvous - {type(e).__name__}: {e}. Retrying in {retry_delay}s...")
-        finally:
-            websocket_connection = None # Clear connection on disconnect/error
-            if not stop_websocket_thread.is_set():
-                 await asyncio.sleep(retry_delay)
-                 retry_delay = min(retry_delay * 2, 60) # Exponential backoff up to 60s
-
-def run_websocket_client_in_thread():
-    """
-    Runs the asyncio event loop for the WebSocket client in a separate thread.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(connect_to_rendezvous())
-    finally:
-        loop.close()
-
-@app.before_request
-def start_websocket_client():
-    # This ensures the WebSocket client thread is started when the first request comes in,
-    # or you could start it directly when the Flask app initializes if preferred.
-    # Using a global flag to ensure it only starts once.
-    if not hasattr(app, 'websocket_thread_started') and RENDEZVOUS_CONNECTION_URL:
-        print("Initializing WebSocket client thread for Rendezvous connection...")
-        stop_websocket_thread.clear()
-        thread = threading.Thread(target=run_websocket_client_in_thread, daemon=True)
-        thread.start()
-        app.websocket_thread_started = True
-        print("WebSocket client thread started.")
-    elif not RENDEZVOUS_CONNECTION_URL:
-         print("RENDEZVOUS_URL not configured. WebSocket client not started.")
-
-
-@app.route('/')
-def get_my_public_ip_and_status():
-    """
-    Same as Step 1, but also shows Rendezvous connection status.
-    """
-    nat_ip_info = "Could not retrieve NAT IP."
-    try:
-        response = requests.get(IP_ECHO_SERVICE_URL, timeout=5)
-        response.raise_for_status()
-        public_ip = response.text.strip()
-        nat_ip_info = f"Observed NAT Public IP (via {IP_ECHO_SERVICE_URL}): {public_ip}"
-        print(nat_ip_info)
-    except requests.exceptions.RequestException as e:
-        nat_ip_info = f"Error getting NAT IP: {e}"
-        print(nat_ip_info)
-
-    rendezvous_status = "Rendezvous client not configured (RENDEZVOUS_URL not set)."
-    if RENDEZVOUS_CONNECTION_URL:
-        if websocket_connection and websocket_connection.open:
-            rendezvous_status = f"Connected to Rendezvous as Worker ID '{WORKER_ID}'."
-        else:
-            rendezvous_status = f"Attempting to connect to Rendezvous as Worker ID '{WORKER_ID}' (currently disconnected)."
-    
-    return f"Worker ID: {WORKER_ID}<br>{nat_ip_info}<br>{rendezvous_status}", 200
-
-# Teardown logic for Cloud Run (though SIGTERM handling can be complex with threads)
-# For a more robust shutdown, consider signal handling if long-running tasks in thread.
-# This is a simplified approach.
-def on_shutdown():
-    print("Worker service shutting down. Stopping WebSocket thread.")
-    stop_websocket_thread.set()
-    # Give the thread a moment to close connections if possible
-    # In a real app, you might join the thread with a timeout.
-
-if __name__ == "__main__":
-    if not os.environ.get("K_SERVICE"): # Local execution
-        # For local testing, ensure RENDEZVOUS_URL is in your .env file
-        # e.g., RENDEZVOUS_URL=ws://localhost:8000/ws/register (if rendezvous is local)
-        # or RENDEZVOUS_URL=wss://<your-deployed-rendezvous-url>/ws/register
-        if RENDEZVOUS_CONNECTION_URL:
-            print(f"Local: Worker '{WORKER_ID}' will attempt to connect to: {RENDEZVOUS_CONNECTION_URL}")
-            start_websocket_client() # Start client immediately for local dev
-        else:
-            print("Local: RENDEZVOUS_URL not found in .env file. WebSocket client not started.")
-        
-        port = int(os.environ.get("PORT", 8080))
-        app.run(host='0.0.0.0', port=port, debug=True)
-    else:
-        # When on Cloud Run, Gunicorn runs the app.
-        # The @app.before_request will trigger the WebSocket client thread.
-        # Consider more robust ways to manage background tasks in production Cloud Run.
-        pass
-
-# Note: For Cloud Run, background threads started outside of request scope
-# need "CPU always allocated" if they must run continuously.
-# For this PoC, the thread starts on first request. If the instance idles
-# and CPU is not allocated, the WebSocket connection might drop and only
-# re-establish on a new incoming request that wakes up the instance.
-4. worker_service/Dockerfile(Can be the same as Step 1, just ensure requirements.txt is copied and installed)# Use an official Python runtime as a parent image
-FROM python:3.9-slim
-
-# Set the working directory in the container
-WORKDIR /app
-
-# Copy the requirements file to the working directory
-COPY requirements.txt .
-
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the application code into the container
-COPY main.py .
-
-# Expose the port the app runs on
+# Make port 8080 available (Cloud Run default)
 EXPOSE 8080
-
-# Define environment variable
 ENV PORT 8080
 
-# Run the web server using Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
-5. Define Shell Variables for Worker Service# PROJECT_ID and REGION should still be set
-# WORKER_SERVICE_NAME is 'ip-worker-service' from Step 1
-export WORKER_SERVICE_NAME="ip-worker-service" 
-export WORKER_AR_REPO_NAME="ip-worker-repo" # From Step 1
+# Command to run the Uvicorn server for FastAPI
+# --host 0.0.0.0 makes it accessible from outside the container
+# --port $PORT uses the port specified by the environment variable (set by Cloud Run)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
 
-# **IMPORTANT**: Set this to the URL of your deployed Rendezvous Service
-# Example: export YOUR_RENDEZVOUS_SERVICE_URL="wss://rendezvous-service-abcdef-uc.a.run.app/ws/register"
-# Ensure you use wss:// for secure WebSockets if your Rendezvous service is on HTTPS (Cloud Run default)
-export YOUR_RENDEZVOUS_SERVICE_URL="YOUR_ACTUAL_DEPLOYED_RENDEZVOUS_SERVICE_URL_ENDING_WITH_/ws/register" 
-Replace YOUR_ACTUAL_DEPLOYED_RENDEZVOUS_SERVICE_URL_ENDING_WITH_/ws/register with the actual URL. Make sure it includes the /ws/register path but not the {worker_id} part, as the worker code appends its own ID.6. Rebuild and Redeploy the Worker ServiceBuild and Push (from step2_rendezvous_registration/worker_service/ directory):gcloud builds submit --region=$REGION --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${WORKER_AR_REPO_NAME}/${WORKER_SERVICE_NAME}:step2
-(Using a new tag step2 to differentiate from the Step 1 image)Redeploy to Cloud Run with the new environment variable:gcloud run deploy $WORKER_SERVICE_NAME \
-    --project=$PROJECT_ID \
-    --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${WORKER_AR_REPO_NAME}/${WORKER_SERVICE_NAME}:step2 \
-    --platform=managed \
-    --region=$REGION \
-    --allow-unauthenticated \
-    --vpc-egress=all-traffic \
-    --network=$VPC_NETWORK_NAME \
-    --subnet=$SUBNET_NAME \
-    --set-env-vars="RENDEZVOUS_URL=${YOUR_RENDEZVOUS_SERVICE_URL}" \
-    --cpu-always-allocated # Recommended for persistent WebSocket client
-    # --max-instances=2 # Deploy at least two workers to see multiple registrations
---set-env-vars: This is crucial for passing the Rendezvous service URL to the worker.--cpu-always-allocated: Important if you want the WebSocket client in the worker to run continuously in the background. Without it, the Cloud Run instance might idle, and the WebSocket connection could drop until a new HTTP request wakes the instance.Part 3: Test and VerifyCheck Rendezvous Service Logs:Go to Google Cloud Console -> Cloud Run -> Select rendezvous-service.View its logs. You should see messages like:Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' connected from <NAT_PUBLIC_IP>:<NAT_SOURCE_PORT>. Total workers: 1Current worker details: { ... }The <NAT_PUBLIC_IP> should be one of the IPs of your ip-worker-nat Cloud NAT gateway.The <NAT_SOURCE_PORT> is the ephemeral port used by the NAT for this specific worker's connection.Access Rendezvous Service /peers Endpoint:Open https://<your-rendezvous-service-url>/peers in a browser.You should see a JSON response listing the connected workers and their observed public_ip and public_port.Check Worker Service Logs:Go to Google Cloud Console -> Cloud Run -> Select ip-worker-service.View its logs. You should see messages like:Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' attempting to connect to Rendezvous: wss://...Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' connected to Rendezvous service.Access Worker Service Endpoint:Open the URL of your ip-worker-service.The output should now include its Worker ID and status of its connection to the Rendezvous service.Scale Workers (Optional):If you deployed the worker service with --max-instances=2 or more (or manually scale it), you should see multiple distinct worker IDs registering with the Rendezvous service, potentially from the same NAT IP but different source ports.Part 4: Cleanup (Optional)To avoid ongoing charges, delete the created resources:# Delete Worker Service (ip-worker-service)
-gcloud run services delete $WORKER_SERVICE_NAME --project=$PROJECT_ID --platform=managed --region=$REGION --quiet
+### 1.3. Build and Deploy the Rendezvous Service
 
-# Delete Rendezvous Service
-gcloud run services delete $RENDEZVOUS_SERVICE_NAME --project=$PROJECT_ID --platform=managed --region=$REGION --quiet
+1.  **Create Artifact Registry Repository (if you haven't for this service):**
 
-# Delete Artifact Registry Repositories (if you created a new one for rendezvous)
-# gcloud artifacts repositories delete $WORKER_AR_REPO_NAME --project=$PROJECT_ID --location=$REGION --quiet
-# gcloud artifacts repositories delete $RENDEZVOUS_AR_REPO_NAME --project=$PROJECT_ID --location=$REGION --quiet
+    ```bash
+    gcloud artifacts repositories create $AR_RENDEZVOUS_REPO_NAME \
+        --project=$PROJECT_ID \
+        --repository-format=docker \
+        --location=$REGION \
+        --description="Docker repository for Rendezvous Service"
+    ```
 
-# Networking resources from Step 1 (Cloud NAT, Router, Subnet, VPC) can be deleted if no longer needed.
-# Refer to Step 1 cleanup, but be cautious if other services use them.
-# gcloud compute nats delete ip-worker-nat --router=ip-worker-router --project=$PROJECT_ID --region=$REGION --quiet
-# gcloud compute routers delete ip-worker-router --project=$PROJECT_ID --region=$REGION --quiet
-# gcloud compute networks subnets delete ip-worker-subnet --project=$PROJECT_ID --region=$REGION --quiet
-# gcloud compute networks delete ip-worker-vpc --project=$PROJECT_ID --quiet
-This step is more involved, but it sets
+    *(Ensure the Cloud Build service account has `roles/artifactregistry.writer` as done in Step 1. The command was `export PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)'); gcloud projects add-iam-policy-binding $PROJECT_ID --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" --role="roles/artifactregistry.writer"`)*
+
+2.  **Build and Push Image (from inside `rendezvous_service_code` directory):**
+
+    ```bash
+    # Ensure you are in the 'rendezvous_service_code' directory
+    cd path/to/your/rendezvous_service_code 
+
+    # Option 1: Using Cloud Build (recommended for CI/CD)
+    # Temporarily rename Dockerfile.rendezvous to Dockerfile for Cloud Build, then rename back
+    mv Dockerfile.rendezvous Dockerfile
+    gcloud builds submit --region=$REGION \
+        --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_LATEST} .
+    mv Dockerfile Dockerfile.rendezvous
+
+    # Option 2: Using local Docker (e.g., Docker Desktop)
+    # If building on a non-amd64 machine (e.g., Apple M1/M2/M3), specify platform for Cloud Run compatibility:
+    # docker buildx build --platform linux/amd64 -f Dockerfile.rendezvous -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_LATEST} . --load
+    # Otherwise, for amd64 machines:
+    # docker build -f Dockerfile.rendezvous -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_LATEST} .
+    # docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_LATEST}
+    ```
+
+    *The `gcloud builds submit` command implicitly uses `Dockerfile` in the current directory. If your file is named `Dockerfile.rendezvous`, you either rename it for the build or use a `cloudbuild.yaml` to specify the Dockerfile name (not covered here). For local Docker builds, use the `-f` flag.* 
+
+3.  **Deploy to Cloud Run:**
+    The Rendezvous service needs to be publicly accessible.
+
+    ```bash
+    gcloud run deploy $RENDEZVOUS_SERVICE_NAME \
+        --project=$PROJECT_ID \
+        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_LATEST} \
+        --platform=managed \
+        --region=$REGION \
+        --allow-unauthenticated \
+        --session-affinity # Enable session affinity for WebSockets (good practice)
+                           # --min-instances=1 # Optional: consider for production to reduce cold starts
+    ```
+
+      * `--session-affinity`: Helps ensure that subsequent requests from the same client (important for WebSocket re-establishment or related HTTP calls) are routed to the same Cloud Run instance, if you scale the Rendezvous service.
+      * Note the URL of the deployed Rendezvous Service. You'll need it for the worker.
+
+-----
+
+## Part 2: Modified Worker Service
+
+Now, we modify your existing `ip-worker-service` (from the `holepunch` directory in your provided files) to connect to the Rendezvous service.
+
+### 2.1. Define Shell Variables (for Worker Service - some are from Step 1)
+
+```bash
+export PROJECT_ID="iceberg-eli"
+export REGION="us-central1"
+export AR_WORKER_REPO_NAME="ip-worker-repo" # Existing Artifact Registry repo from Step 1
+export WORKER_SERVICE_NAME="ip-worker-service" # Existing Cloud Run service from Step 1
+export WORKER_IMAGE_TAG_V2="v2" # New version tag for the worker image
+
+# You'll need the URL of the deployed Rendezvous Service from Part 1.3
+# Example: export RENDEZVOUS_SERVICE_URL="https://rendezvous-service-xxxx-uc.a.run.app" 
+# SET THIS MANUALLY AFTER DEPLOYING RENDEZVOUS SERVICE:
+export RENDEZVOUS_SERVICE_URL="YOUR_RENDEZVOUS_SERVICE_URL_HERE" 
+```
+
+**ACTION: Replace `YOUR_RENDEZVOUS_SERVICE_URL_HERE` with the actual URL after deploying the Rendezvous service.**
+
+### 2.2. Worker Service Code Updates
+
+Modify the files in your original `holepunch` directory (or a copy).
+
+**`holepunch/main.py` (Modified Worker):**
+
+```python
+import asyncio
+import os
+import uuid
+import websockets # Using the 'websockets' library
+import signal # For graceful shutdown
+import threading # For health check server
+import http.server # For health check server
+import socketserver # For health check server
+import requests # For ipify.org
+import json # For WebSocket messages
+
+# This worker primarily functions as a WebSocket client.
+# A minimal HTTP server is run in a background thread for Cloud Run health checks.
+
+worker_id = str(uuid.uuid4())
+stop_signal_received = False
+
+def handle_shutdown_signal(signum, frame):
+    global stop_signal_received
+    print(f"Shutdown signal ({signum}) received. Attempting to close WebSocket connection.")
+    stop_signal_received = True
+
+async def connect_to_rendezvous(rendezvous_ws_url: str):
+    global stop_signal_received
+    print(f"WORKER CONNECT_TO_RENDEZVOUS: Entered function for URL: {rendezvous_ws_url}. stop_signal_received={stop_signal_received}")
+    print(f"Worker '{worker_id}' attempting to connect to Rendezvous: {rendezvous_ws_url}")
+    
+    ip_echo_service_url = "https://api.ipify.org"
+    # Default ping interval (seconds), can be overridden by environment variable
+    ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
+    ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
+
+    while not stop_signal_received:
+        try:
+            async with websockets.connect(
+                rendezvous_ws_url,
+                ping_interval=ping_interval, # Send pings to keep connection alive
+                ping_timeout=ping_timeout
+            ) as websocket:
+                print(f"Worker '{worker_id}' connected to Rendezvous.")
+
+                try:
+                    print(f"Worker '{worker_id}' fetching its public IP from {ip_echo_service_url}...")
+                    response = requests.get(ip_echo_service_url, timeout=10)
+                    response.raise_for_status()
+                    public_ip = response.text.strip()
+                    print(f"Worker '{worker_id}' identified public IP as: {public_ip}")
+                    await websocket.send(json.dumps({
+                        "type": "register_public_ip",
+                        "ip": public_ip
+                    }))
+                    print(f"Worker '{worker_id}' sent public IP to Rendezvous.")
+                except requests.exceptions.RequestException as e:
+                    print(f"Worker '{worker_id}': Error fetching/sending public IP: {e}. Will rely on Rendezvous observed IP.")
+
+                while not stop_signal_received:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=max(30.0, ping_interval + ping_timeout + 5))
+                        print(f"Received message from Rendezvous: {message}")
+                    except asyncio.TimeoutError:
+                        # No message received, pings are handling keepalive.
+                        pass 
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed by server.")
+                        break 
+
+        except websockets.exceptions.ConnectionClosedOK:
+            print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed gracefully by server.")
+        except websockets.exceptions.InvalidURI:
+            print(f"Worker '{worker_id}': Invalid Rendezvous WebSocket URI: {rendezvous_ws_url}. Exiting.")
+            return 
+        except ConnectionRefusedError:
+            print(f"Worker '{worker_id}': Connection to Rendezvous refused. Retrying in 10 seconds...")
+        except Exception as e: # Catch other websocket errors like handshake timeouts
+            print(f"Worker '{worker_id}': Error connecting/communicating with Rendezvous: {e}. Retrying in 10 seconds...")
+        
+        if not stop_signal_received:
+            await asyncio.sleep(10) 
+        else:
+            break 
+
+    print(f"Worker '{worker_id}' has stopped WebSocket connection attempts.")
+
+# Minimal health-check HTTP server (as per Update 2025-05-16)
+def start_healthcheck_http_server():
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self): self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, format, *args): return
+    port = int(os.environ.get("PORT", 8080))
+    httpd = socketserver.TCPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"Health-check HTTP server listening on 0.0.0.0:{port}")
+
+start_healthcheck_http_server()
+print("HEALTHCHECK SERVER STARTED --- WORKER MAIN SCRIPT CONTINUING...")
+
+if __name__ == "__main__":
+    print("WORKER SCRIPT: Inside __main__ block.")
+    rendezvous_base_url = os.environ.get("RENDEZVOUS_SERVICE_URL")
+    if not rendezvous_base_url:
+        print("Error: RENDEZVOUS_SERVICE_URL environment variable not set. Exiting.")
+        exit(1)
+
+    if rendezvous_base_url.startswith("http://"):
+        rendezvous_ws_url_constructed = rendezvous_base_url.replace("http://", "ws://", 1)
+    elif rendezvous_base_url.startswith("https://"):
+        rendezvous_ws_url_constructed = rendezvous_base_url.replace("https://", "wss://", 1)
+    else:
+        rendezvous_ws_url_constructed = rendezvous_base_url 
+
+    full_rendezvous_ws_url = f"{rendezvous_ws_url_constructed}/ws/register/{worker_id}"
+    print(f"WORKER SCRIPT: About to call asyncio.run(connect_to_rendezvous) for URL: {full_rendezvous_ws_url}")
+    
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+
+    try:
+        asyncio.run(connect_to_rendezvous(full_rendezvous_ws_url))
+    except KeyboardInterrupt:
+        print(f"Worker '{worker_id}' interrupted by user. Shutting down.")
+    finally:
+        print(f"Worker '{worker_id}' main process finished.")
+```
+
+**`holepunch/requirements.txt` (Worker):**
+
+```
+websockets>=12.0
+requests>=2.0.0 # For ipify.org
+```
+
+*(Note: `requests` was re-added. Original comment about Flask removal is still valid.)*
+
+**`holepunch/Dockerfile.worker`:** (Note the specific Dockerfile name)
+
+```dockerfile
+# Use an official Python runtime as a parent image
+FROM python:3.9-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file
+COPY requirements.txt .
+
+# Install dependencies
+RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
+
+# Copy the application code
+COPY main.py .
+
+# This worker doesn't run a Gunicorn server anymore; it runs the main.py script directly.
+# No EXPOSE needed if it's only an outbound client.
+# Using -u for unbuffered Python output, ensuring logs appear promptly in Cloud Run.
+CMD ["python", "-u", "main.py"]
+```
+
+**Update (2025-05-16): Cloud Run health-check compatibility**  
+Cloud Run expects every service revision to start an HTTP server that listens on the port provided in the `PORT` environment variable (default `8080`).  
+Because our worker is a long-running WebSocket _client_ with no HTTP endpoints, Cloud Run would mark the revision unhealthy. To satisfy the default health-check we now start a **minimal background HTTP server** inside `main.py`. It responds with `200 OK` to any path and has negligible overhead. This tiny server is implemented with Python's standard `http.server` in a daemon thread and does **not** interfere with the worker's WebSocket logic.
+
+You can see this in the top of the new `main.py` (look for `start_healthcheck_http_server()`).
+
+### 2.3. Build and Re-deploy the Worker Service
+
+1.  **Build and Push Worker Image (from inside `holepunch` directory):**
+
+    ```bash
+    # Ensure you are in the 'holepunch' directory (project root for this service)
+    # cd path/to/your/holepunch 
+
+    # Option 1: Using Cloud Build (recommended for CI/CD)
+    # Temporarily rename Dockerfile.worker to Dockerfile for Cloud Build, then rename back
+    mv Dockerfile.worker Dockerfile
+    gcloud builds submit --region=$REGION \
+        --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V2} .
+    mv Dockerfile Dockerfile.worker
+
+    # Option 2: Using local Docker (e.g., Docker Desktop)
+    # If building on a non-amd64 machine (e.g., Apple M1/M2/M3), specify platform for Cloud Run compatibility:
+    # docker buildx build --platform linux/amd64 -f Dockerfile.worker -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V2} . --load
+    # Otherwise, for amd64 machines:
+    # docker build -f Dockerfile.worker -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V2} .
+    # docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V2}
+    ```
+    *(Note: `AR_WORKER_REPO_NAME` is `ip-worker-repo` from Step 1. Ensure it exists. Use a new tag like `:v3`, `:v4` for subsequent builds.)*
+
+2.  **Re-deploy the Worker Service to Cloud Run:**
+    This updates your existing `ip-worker-service`. Crucially, we add the `RENDEZVOUS_SERVICE_URL` environment variable.
+    **Remember to set `RENDEZVOUS_SERVICE_URL` in your shell first, from Part 2.1\!**
+
+    ```bash
+    if [ -z "$RENDEZVOUS_SERVICE_URL" ] || [ "$RENDEZVOUS_SERVICE_URL" == "YOUR_RENDEZVOUS_SERVICE_URL_HERE" ]; then
+        echo "Error: RENDEZVOUS_SERVICE_URL is not set. Please set it to the URL of your deployed Rendezvous service."
+        exit 1
+    fi
+
+    gcloud run deploy $WORKER_SERVICE_NAME \
+        --project=$PROJECT_ID \
+        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V2} \
+        --platform=managed \
+        --region=$REGION \
+        --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_SERVICE_URL}" \
+        # To update/add multiple env vars, including for WebSocket pings:
+        # --update-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_SERVICE_URL},PING_INTERVAL_SEC=25,PING_TIMEOUT_SEC=25" \
+        --vpc-egress=all-traffic \
+        --network=$VPC_NETWORK_NAME \ # From Step 1: ip-worker-vpc
+        --subnet=$SUBNET_NAME \       # From Step 1: ip-worker-subnet
+        --max-instances=2 # Example: deploy 2 worker instances to see them both register
+                          # Keep other settings like CPU allocation as default or adjust as needed.
+                          # Allow unauthenticated is not needed as this service doesn't serve inbound HTTP now.
+                          # If you removed the Flask server, you might want to configure a startup CPU boost
+                          # or set min-instances to 1 if you want it always running,
+                          # but for this PoC, on-demand startup is fine.
+    ```
+
+      * The `--allow-unauthenticated` flag is removed as this worker no longer serves HTTP traffic. It only makes outbound connections.
+      * Ensure the VPC and Subnet names (`$VPC_NETWORK_NAME`, `$SUBNET_NAME`) are the same as those used in Step 1 for Cloud NAT.
+
+-----
+
+## Part 3: Verification
+
+1.  **Check Rendezvous Service Logs:**
+
+      * Go to Google Cloud Console -> Cloud Run -> Select `rendezvous-service`.
+      * View its logs. You should see messages like:
+        `Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' connecting from <INITIAL_IP>:<INITIAL_PORT>`
+        `Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' registered with initial endpoint: <INITIAL_IP>:<INITIAL_PORT>. Total workers: X`
+        `Received raw message from 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx': {"type": "register_public_ip", "ip": "<ACTUAL_PUBLIC_NAT_IP>"}`
+        `Worker 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' self-reported public IP: <ACTUAL_PUBLIC_NAT_IP>. Updating from <INITIAL_IP>.`
+      * The `<ACTUAL_PUBLIC_NAT_IP>` should be one of the IPs of your `ip-worker-nat` Cloud NAT gateway.
+      * When calling `/debug/list_workers`, you might see `DEBUG: Worker xxxxxxxx..., client_state raw value: 1` (or similar for `WebSocketState.CONNECTED`).
+
+2.  **Check Worker Service Logs:**
+      * (`CMD ["python", "-u", "main.py"]` in `Dockerfile.worker` helps ensure logs appear promptly.)
+      * Go to Google Cloud Console -> Cloud Run -> Select `ip-worker-service`.
+      * View its logs. Each worker instance should log:
+        `HEALTHCHECK SERVER STARTED --- WORKER MAIN SCRIPT CONTINUING...`
+        `WORKER SCRIPT: Inside __main__ block.`
+        `WORKER SCRIPT: About to call asyncio.run(connect_to_rendezvous) for URL: wss://<your-rendezvous-url>/ws/register/<worker_id>`
+        `WORKER CONNECT_TO_RENDEZVOUS: Entered function for URL: ...`
+        `Worker '...' attempting to connect to Rendezvous: ...`
+        (Potentially some connection timeout/retry messages)
+        `Worker '...' connected to Rendezvous.`
+        `Worker '...' fetching its public IP from https://api.ipify.org...`
+        `Worker '...' identified public IP as: <ACTUAL_PUBLIC_NAT_IP>`
+        `Worker '...' sent public IP to Rendezvous.`
+
+3.  **Use the Rendezvous Debug Endpoint (Optional but Recommended):**
+
+      * If you deployed the Rendezvous service and it's running with `--allow-unauthenticated`, open its public URL in a browser and navigate to `/debug/list_workers`.
+      * Example: `https://rendezvous-service-xxxx-uc.a.run.app/debug/list_workers`
+      * This should show a JSON list of registered workers, e.g.:
+        ```json
+        {
+          "connected_workers_count": 1,
+          "workers": {
+            "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx": {
+              "public_ip": "<ACTUAL_PUBLIC_NAT_IP>",
+              "public_port": <WORKER_INITIALLY_OBSERVED_PORT>,
+              "connected": true,
+              "raw_state": 1 
+            }
+          }
+        }
+        ```
+      * `public_ip` should be the self-reported external NAT IP.
+      * `connected` should be `true` if the WebSocket is active (derived from `raw_state == 1`).
+
+-----

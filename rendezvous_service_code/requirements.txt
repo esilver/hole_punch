@@ -1,0 +1,4 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0 
+# Using [standard] includes websockets and other useful dependencies for uvicorn.
+# Check for latest stable versions if deploying much later. 
