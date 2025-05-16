@@ -93,7 +93,6 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
                 progress_msg = f"Benchmark Send: Sent {i+1}/{num_chunks} chunks ({bytes_sent / 1024:.2f} KB)..."
                 print(f"Worker '{worker_id}': {progress_msg}")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
-            await asyncio.sleep(0.001) # Tiny sleep to yield control, prevent overwhelming the loop/network too fast
         else: # If loop completed without break
             # Send benchmark end marker
             end_payload = {"type": "benchmark_end", "total_chunks": num_chunks, "from_worker_id": worker_id}
