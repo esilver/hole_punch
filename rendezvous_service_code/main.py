@@ -15,6 +15,7 @@ connected_workers: Dict[str, Dict] = {}
 
 @app.websocket("/ws/register/{worker_id}")
 async def websocket_register_worker(websocket: WebSocket, worker_id: str):
+    print(f"RENDEZVOUS_DEBUG: Attempting to register worker '{worker_id}'. Scope: {websocket.scope}")
     await websocket.accept()
     client_host = websocket.client.host
     client_port = websocket.client.port
@@ -50,12 +51,41 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
 
                 if msg_type == "register_public_ip":
                     new_ip = message.get("ip")
-                    if new_ip:
+                    if new_ip and worker_id in connected_workers: # Check worker_id still exists
                         print(f"Worker '{worker_id}' self-reported public IP: {new_ip}. Updating from {connected_workers[worker_id]['public_ip']}.")
                         connected_workers[worker_id]["public_ip"] = new_ip
-                    else:
+                    elif not new_ip:
                         print(f"Worker '{worker_id}' sent register_public_ip message without an IP.")
-                # Add other message type handlers here if needed in the future
+                    # else: worker might have disconnected before IP update processed
+                
+                # NEW: Handle an "echo_request" from the worker
+                elif msg_type == "echo_request":
+                    payload = message.get("payload", "")
+                    response_payload_dict = {
+                        "type": "echo_response",
+                        "original_payload": payload,
+                        "processed_by_rendezvous": f"Rendezvous processed: '{payload.upper()}' for worker {worker_id}"
+                    }
+                    await websocket.send_text(json.dumps(response_payload_dict))
+                    print(f"Sent echo_response back to worker '{worker_id}'")
+
+                # NEW: Handle a "get_my_details" request from the worker
+                elif msg_type == "get_my_details":
+                    if worker_id in connected_workers:
+                        details = connected_workers[worker_id]
+                        response_payload_dict = {
+                            "type": "my_details_response",
+                            "worker_id": worker_id,
+                            "registered_ip": details["public_ip"],
+                            "registered_port": details["public_port"],
+                            "message": "These are your details as seen by the Rendezvous service."
+                        }
+                        await websocket.send_text(json.dumps(response_payload_dict))
+                        print(f"Sent 'my_details_response' back to worker '{worker_id}'")
+                    else:
+                        # Should not happen if WebSocket is active for this worker_id
+                        await websocket.send_text(json.dumps({"type": "error", "message": "Could not find your details."}))
+                
                 else:
                     print(f"Worker '{worker_id}' sent unhandled message type: {msg_type}")
 

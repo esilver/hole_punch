@@ -53,11 +53,20 @@ This is a **NEW** service you will create.
 ### 1.1. Define Shell Variables (for Rendezvous Service)
 
 ```bash
-export PROJECT_ID="iceberg-eli"
+# Set your Project ID and Region if not already set
+# export PROJECT_ID="your-gcp-project-id"
+# export REGION="your-gcp-region" # e.g., us-central1
+
+# Dynamically get Project ID and set Region (example for us-central1)
+export PROJECT_ID=$(gcloud config get-value project)
 export REGION="us-central1"
+
 export AR_RENDEZVOUS_REPO_NAME="rendezvous-repo" # New Artifact Registry repo
 export RENDEZVOUS_SERVICE_NAME="rendezvous-service" # New Cloud Run service name
-export RENDEZVOUS_IMAGE_TAG_LATEST="latest"
+export RENDEZVOUS_IMAGE_TAG_LATEST="latest" # Or your preferred tag
+
+# Verify variables (optional)
+# echo "PROJECT_ID: $PROJECT_ID, REGION: $REGION"
 ```
 
 ### 1.2. Rendezvous Service Code
@@ -276,19 +285,28 @@ Now, we modify your existing `ip-worker-service` (from the `holepunch` directory
 ### 2.1. Define Shell Variables (for Worker Service - some are from Step 1)
 
 ```bash
-export PROJECT_ID="iceberg-eli"
-export REGION="us-central1"
+# Ensure PROJECT_ID and REGION are set (as in Part 1.1)
+# export PROJECT_ID=$(gcloud config get-value project)
+# export REGION="us-central1"
+
 export AR_WORKER_REPO_NAME="ip-worker-repo" # Existing Artifact Registry repo from Step 1
 export WORKER_SERVICE_NAME="ip-worker-service" # Existing Cloud Run service from Step 1
-export WORKER_IMAGE_TAG_V2="v2" # New version tag for the worker image
+export WORKER_IMAGE_TAG_V2="v2" # Or a newer tag like v3, v4, etc. for new worker image versions
 
-# You'll need the URL of the deployed Rendezvous Service from Part 1.3
-# Example: export RENDEZVOUS_SERVICE_URL="https://rendezvous-service-xxxx-uc.a.run.app" 
-# SET THIS MANUALLY AFTER DEPLOYING RENDEZVOUS SERVICE:
-export RENDEZVOUS_SERVICE_URL="YOUR_RENDEZVOUS_SERVICE_URL_HERE" 
+# You will need the URL of the deployed Rendezvous Service from Part 1.3.
+# Option 1: Set it manually after noting it from Rendezvous deployment output.
+# export RENDEZVOUS_SERVICE_URL="YOUR_RENDEZVOUS_SERVICE_URL_HERE"
+
+# Option 2: Dynamically fetch the Rendezvous Service URL (if already deployed and variables are set):
+# Ensure $RENDEZVOUS_SERVICE_NAME, $REGION, and $PROJECT_ID are correctly set.
+# export RENDEZVOUS_SERVICE_URL=$(gcloud run services describe $RENDEZVOUS_SERVICE_NAME --platform managed --region $REGION --project $PROJECT_ID --format 'value(status.url)')
+
+# IMPORTANT: Before deploying the worker, ensure RENDEZVOUS_SERVICE_URL is set correctly.
+# You can verify by echoing it:
+# echo "Rendezvous URL for Worker: $RENDEZVOUS_SERVICE_URL"
 ```
 
-**ACTION: Replace `YOUR_RENDEZVOUS_SERVICE_URL_HERE` with the actual URL after deploying the Rendezvous service.**
+**ACTION: Replace `YOUR_RENDEZVOUS_SERVICE_URL_HERE` with the actual URL after deploying the Rendezvous service, or ensure the dynamic fetch command works.**
 
 ### 2.2. Worker Service Code Updates
 

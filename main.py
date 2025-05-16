@@ -26,15 +26,20 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
     print(f"Worker '{worker_id}' attempting to connect to Rendezvous: {rendezvous_ws_url}")
     
     ip_echo_service_url = "https://api.ipify.org"
+    # Default ping interval (seconds), can be overridden by environment variable
+    ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
+    ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
 
     while not stop_signal_received:
         try:
             async with websockets.connect(
                 rendezvous_ws_url,
-                ping_interval=float(os.environ.get("PING_INTERVAL_SEC", "25")),
-                ping_timeout=float(os.environ.get("PING_TIMEOUT_SEC", "25")),
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
             ) as websocket:
                 print(f"Worker '{worker_id}' connected to Rendezvous. Public IP:Port should be registered by Rendezvous.")
+                print(f"WORKER '{worker_id}' connected to Rendezvous. Type of websocket object: {type(websocket)}")
+                print(f"WORKER '{worker_id}' Attributes of websocket object: {dir(websocket)}")
 
                 # Get self public IP and send to rendezvous service
                 try:
@@ -51,21 +56,81 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 except requests.exceptions.RequestException as e:
                     print(f"Worker '{worker_id}': Error fetching/sending public IP: {e}. Will rely on Rendezvous observed IP.")
 
-                # Keep the connection alive and listen for messages from Rendezvous
-                # (e.g., instructions to connect to a peer in a later step)
+                # NEW: Task to send periodic "echo_request" and "get_my_details"
+                async def send_test_messages():
+                    print(f"WORKER '{worker_id}': Starting send_test_messages task...")
+                    counter = 0
+                    try:
+                        while not stop_signal_received and websocket.state.name == "OPEN":
+                            print(f"WORKER '{worker_id}': send_test_messages loop, websocket.state={websocket.state.name}, counter={counter}")
+                            await asyncio.sleep(15) # Send a message every 15 seconds
+                            if websocket.state.name != "OPEN":
+                                print(f"WORKER '{worker_id}': send_test_messages - WebSocket no longer OPEN after sleep, before send. State: {websocket.state.name}. Exiting loop.")
+                                break
+                        
+                            counter += 1
+                            # Send an echo request
+                            echo_req_msg = {
+                                "type": "echo_request",
+                                "payload": f"Test message from {worker_id}, count: {counter}"
+                            }
+                            try:
+                                await websocket.send(json.dumps(echo_req_msg))
+                                print(f"Worker '{worker_id}' sent: {echo_req_msg['type']}. WebSocket state: {websocket.state.name}")
+                            except websockets.exceptions.ConnectionClosed: 
+                                print(f"WORKER '{worker_id}': send_test_messages - ConnectionClosed during echo_request send. Exiting loop.")
+                                break
+
+                            if websocket.state.name != "OPEN":
+                                print(f"WORKER '{worker_id}': send_test_messages - WebSocket no longer OPEN after echo_request, before details_req. State: {websocket.state.name}. Exiting loop.")
+                                break
+                            await asyncio.sleep(2) # Small delay
+
+                            # Send a request for its own details
+                            details_req_msg = {"type": "get_my_details"}
+                            try:
+                                await websocket.send(json.dumps(details_req_msg))
+                                print(f"Worker '{worker_id}' sent: {details_req_msg['type']}. WebSocket state: {websocket.state.name}")
+                            except websockets.exceptions.ConnectionClosed: 
+                                print(f"WORKER '{worker_id}': send_test_messages - ConnectionClosed during details_req send. Exiting loop.")
+                                break
+                        print(f"WORKER '{worker_id}': send_test_messages loop finished. stop_signal={stop_signal_received}, websocket.state={websocket.state.name}")
+                    except AttributeError as ae:
+                        print(f"WORKER '{worker_id}': ATTRIBUTE ERROR in send_test_messages task: {ae}. Attributes: {dir(websocket)}")
+                    except Exception as e_task:
+                        print(f"WORKER '{worker_id}': EXCEPTION in send_test_messages task: {e_task}")
+                    finally:
+                        print(f"WORKER '{worker_id}': send_test_messages task finally block.")
+                
+                message_sender_task = asyncio.create_task(send_test_messages())
+
+                # Main receive loop
                 while not stop_signal_received:
                     try:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=30.0) # Keepalive/timeout
-                        print(f"Received message from Rendezvous: {message}")
+                        message_raw = await asyncio.wait_for(websocket.recv(), timeout=max(30.0, ping_interval + ping_timeout + 5))
+                        print(f"RAW Received from Rendezvous: {message_raw}")
+                        try:
+                            message_data = json.loads(message_raw)
+                            msg_type = message_data.get("type")
+                            if msg_type == "echo_response":
+                                print(f"Echo Response from Rendezvous: {message_data.get('processed_by_rendezvous')}")
+                            elif msg_type == "my_details_response":
+                                print(f"My Details from Rendezvous: IP={message_data.get('registered_ip')}, Port={message_data.get('registered_port')}")
+                            else:
+                                print(f"Received unhandled message type from Rendezvous: {msg_type}")
+                        except json.JSONDecodeError:
+                            print(f"Received non-JSON message from Rendezvous: {message_raw}")
                     except asyncio.TimeoutError:
-                        # No message received, send a ping to keep connection alive if supported by server
-                        # Or just continue to show the connection is active on the client side
-                        # print(f"Worker '{worker_id}' still connected, no message in 30s.")
-                        # await websocket.ping() # Requires server to handle pongs
                         pass 
                     except websockets.exceptions.ConnectionClosed:
                         print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed by server.")
-                        break # Break inner loop to attempt reconnection
+                        break 
+                
+                message_sender_task.cancel()
+                try:
+                    await message_sender_task
+                except asyncio.CancelledError:
+                    print("Message sender task cancelled.")
 
         except websockets.exceptions.ConnectionClosedOK:
             print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed gracefully by server.")
