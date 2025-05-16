@@ -1,0 +1,751 @@
+## README - Step 3 (Part B): Peer-to-Peer UDP Connection Attempt
+
+### Objective
+
+This part details the modifications needed to:
+
+1.  Enable the **Rendezvous Service** to actively introduce two registered workers that have valid UDP endpoints, instructing them to attempt a P2P UDP connection with each other.
+2.  Update the **Worker Service** to:
+      * Handle connection initiation instructions (a "p2p\_connection\_offer") from the Rendezvous service.
+      * Implement the client-side logic for UDP hole punching:
+          * Upon receiving an offer, simultaneously start sending UDP packets ("pings") to the peer's specified `NAT_IP:NAT_UDP_Port`.
+          * Actively listen on its own STUN-discovered UDP endpoint (via the `P2PUDPProtocol` listening on `INTERNAL_UDP_PORT`) for incoming UDP packets from the peer.
+      * Log the success or failure of direct UDP packet exchange.
+
+### Prerequisites
+
+1.  **Completion of Step 3A:** Your Rendezvous Service and Worker Service must be successfully deployed and configured as per your `plann_step3a.md`. This means:
+      * Workers are creating UDP sockets (the `udp_socket` global in `holepunch/main.py` is used for STUN).
+      * Workers are using STUN (via `pystun3`) to discover their public UDP `NAT_IP:NAT_UDP_Port` (`discovered_udp_ip`, `discovered_udp_port`).
+      * Workers are reporting these UDP endpoints to the Rendezvous service via the `update_udp_endpoint` WebSocket message.
+      * The Rendezvous service (`rendezvous_service_code/main.py`) stores these UDP endpoints (`stun_reported_udp_ip`, `stun_reported_udp_port`) and they are visible via the `/debug/list_workers` endpoint.
+      * The worker service (`holepunch/main.py`) has the placeholder `udp_listener_task`.
+2.  **At least two instances** of your Worker Service should be deployable/running.
+3.  All previous project setup (`iceberg-eli`, `us-central1` region, networking, Cloud NAT with EIM enabled) remains the same.
+
+-----
+
+## Part 3B.1: Modifications to Rendezvous Service
+
+The Rendezvous service will proactively try to pair workers that have registered UDP endpoints.
+
+### 3B.1.1. Shell Variables (Rendezvous Service)
+
+```bash
+export PROJECT_ID="iceberg-eli" # Should be set from gcloud config
+export REGION="us-central1"   # Should be set from gcloud config
+
+export AR_RENDEZVOUS_REPO_NAME="rendezvous-repo" # As defined in plann_step3a.md
+export RENDEZVOUS_SERVICE_NAME="rendezvous-service" # As defined in plann_step3a.md
+export RENDEZVOUS_IMAGE_TAG_V3="v_step3b" # New version tag
+```
+
+### 3B.1.2. Rendezvous Service Code (`rendezvous_service_code/main.py`) Updates
+
+The existing `plann_step3a.md` version of `rendezvous_service_code/main.py` already has the correct structure in `connected_workers` to store `stun_reported_udp_ip` and `stun_reported_udp_port`. We'll add the pairing logic.
+
+```python
+import asyncio
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict, Optional, List # Added List
+import os
+import json
+
+app = FastAPI(title="Rendezvous Service")
+
+# connected_workers structure from your Step 3A implementation:
+# { worker_id: { 
+#    "public_ip": str, "public_port": int, # From WebSocket connection (or self-reported HTTP IP)
+#    "websocket": WebSocket,
+#    "udp_ip": Optional[str], "udp_port": Optional[int] # Renamed in debug output, let's align to "stun_reported_udp_ip"
+# }}
+# Let's ensure keys are consistent:
+# "websocket_observed_ip", "websocket_observed_port"
+# "http_reported_public_ip" (if you send it)
+# "stun_reported_udp_ip", "stun_reported_udp_port"
+connected_workers: Dict[str, Dict] = {}
+
+# List of worker_ids that have reported UDP info and are waiting for a peer
+workers_ready_for_pairing: List[str] = []
+
+async def attempt_to_pair_workers(newly_ready_worker_id: str):
+    global workers_ready_for_pairing, connected_workers
+
+    initiator_data = connected_workers.get(newly_ready_worker_id)
+    # Check using the keys from your current plann_step3a.md debug output
+    if not initiator_data or not initiator_data.get("stun_reported_udp_ip") or not initiator_data.get("stun_reported_udp_port"):
+        print(f"Pairing: Initiator '{newly_ready_worker_id}' does not have STUN UDP info. Cannot pair.")
+        if newly_ready_worker_id in workers_ready_for_pairing:
+            workers_ready_for_pairing.remove(newly_ready_worker_id)
+        return
+
+    # Ensure newly_ready_worker_id is in the list if it's valid and not already being processed
+    if newly_ready_worker_id not in workers_ready_for_pairing:
+        workers_ready_for_pairing.append(newly_ready_worker_id)
+        print(f"Rendezvous: Worker '{newly_ready_worker_id}' added to ready_for_pairing list ({len(workers_ready_for_pairing)} waiting).")
+
+    if len(workers_ready_for_pairing) < 2:
+        print(f"Rendezvous: Not enough workers ready for pairing ({len(workers_ready_for_pairing)} waiting).")
+        return
+
+    # Take the first two distinct workers from the list
+    peer_a_id = workers_ready_for_pairing.pop(0)
+    peer_b_id = None
+    for potential_peer in workers_ready_for_pairing: # Find a different one
+        if potential_peer != peer_a_id:
+            peer_b_id = potential_peer
+            workers_ready_for_pairing.remove(peer_b_id)
+            break
+    
+    if not peer_b_id: # Could not find a distinct second peer
+        workers_ready_for_pairing.insert(0, peer_a_id) # Put peer_a_id back
+        print(f"Rendezvous: Could not find a distinct second peer for '{peer_a_id}'. It remains in ready list.")
+        return
+
+    peer_a_data = connected_workers.get(peer_a_id)
+    peer_b_data = connected_workers.get(peer_b_id)
+
+    # Final check before sending offers
+    if not (peer_a_data and peer_b_data and 
+            peer_a_data.get("stun_reported_udp_ip") and peer_a_data.get("stun_reported_udp_port") and
+            peer_b_data.get("stun_reported_udp_ip") and peer_b_data.get("stun_reported_udp_port")):
+        print(f"Pairing Error: Data integrity issue for pairing {peer_a_id} and {peer_b_id}. One might have disconnected or lost UDP info.")
+        # Re-add them if they are still valid and individually have UDP info
+        if peer_a_data and peer_a_data.get("stun_reported_udp_ip") and peer_a_id not in workers_ready_for_pairing:
+            workers_ready_for_pairing.append(peer_a_id)
+        if peer_b_data and peer_b_data.get("stun_reported_udp_ip") and peer_b_id not in workers_ready_for_pairing:
+            workers_ready_for_pairing.append(peer_b_id)
+        return
+
+    peer_a_ws = peer_a_data.get("websocket")
+    peer_b_ws = peer_b_data.get("websocket")
+
+    if not (peer_a_ws and hasattr(peer_a_ws, 'client_state') and peer_a_ws.client_state.value == 1 and \
+            peer_b_ws and hasattr(peer_b_ws, 'client_state') and peer_b_ws.client_state.value == 1):
+        print(f"Pairing Error: WebSocket for {peer_a_id} or {peer_b_id} is not connected.")
+        # Re-add to ready list if their data is otherwise fine
+        if peer_a_data.get("stun_reported_udp_ip") and peer_a_id not in workers_ready_for_pairing: workers_ready_for_pairing.append(peer_a_id)
+        if peer_b_data.get("stun_reported_udp_ip") and peer_b_id not in workers_ready_for_pairing: workers_ready_for_pairing.append(peer_b_id)
+        return
+
+
+    # Offer B's details to A
+    offer_to_a_payload = {
+        "type": "p2p_connection_offer",
+        "peer_worker_id": peer_b_id,
+        "peer_udp_ip": peer_b_data["stun_reported_udp_ip"],
+        "peer_udp_port": peer_b_data["stun_reported_udp_port"]
+    }
+    # Offer A's details to B
+    offer_to_b_payload = {
+        "type": "p2p_connection_offer",
+        "peer_worker_id": peer_a_id,
+        "peer_udp_ip": peer_a_data["stun_reported_udp_ip"],
+        "peer_udp_port": peer_a_data["stun_reported_udp_port"]
+    }
+
+    try:
+        print(f"Rendezvous: Attempting to pair Worker '{peer_a_id}' with Worker '{peer_b_id}'")
+        await peer_a_ws.send_text(json.dumps(offer_to_a_payload))
+        print(f"Rendezvous: Sent P2P offer to Worker '{peer_a_id}' (for peer '{peer_b_id}').")
+        await peer_b_ws.send_text(json.dumps(offer_to_b_payload))
+        print(f"Rendezvous: Sent P2P offer to Worker '{peer_b_id}' (for peer '{peer_a_id}').")
+    except Exception as e:
+        print(f"Rendezvous: Error sending P2P connection offers: {e}")
+        # If sending fails, workers won't be paired. Add them back to the list if they are still valid.
+        if peer_a_id not in workers_ready_for_pairing and connected_workers.get(peer_a_id, {}).get("stun_reported_udp_ip"):
+            workers_ready_for_pairing.append(peer_a_id)
+        if peer_b_id not in workers_ready_for_pairing and connected_workers.get(peer_b_id, {}).get("stun_reported_udp_ip"):
+            workers_ready_for_pairing.append(peer_b_id)
+
+
+@app.websocket("/ws/register/{worker_id}")
+async def websocket_register_worker(websocket: WebSocket, worker_id: str):
+    global connected_workers, workers_ready_for_pairing
+    await websocket.accept()
+    # Using keys consistent with plann_step3a.md's Rendezvous main.py for initial registration
+    client_host = websocket.client.host 
+    client_port = websocket.client.port 
+    
+    print(f"Worker '{worker_id}' connecting from WebSocket endpoint: {client_host}:{client_port}")
+
+    if worker_id in connected_workers:
+        print(f"Worker '{worker_id}' re-connecting or duplicate ID detected.")
+        old_ws_data = connected_workers.get(worker_id)
+        if old_ws_data:
+            old_ws = old_ws_data.get("websocket")
+            if old_ws and hasattr(old_ws, 'client_state') and old_ws.client_state.value == 1: # WebSocketState.CONNECTED
+                 try:
+                    await old_ws.close(code=1000, reason="New connection from same worker ID")
+                 except Exception: pass
+        if worker_id in workers_ready_for_pairing:
+            workers_ready_for_pairing.remove(worker_id)
+
+
+    connected_workers[worker_id] = {
+        "public_ip": client_host, # This is the initially observed IP for the WebSocket
+        "public_port": client_port, # This is the initially observed port for the WebSocket
+        "websocket": websocket,
+        "stun_reported_udp_ip": None, 
+        "stun_reported_udp_port": None,
+        "http_reported_public_ip": None # For the IP from ipify if used
+    }
+    print(f"Worker '{worker_id}' registered. WebSocket EP: {client_host}:{client_port}. Total connected: {len(connected_workers)}")
+
+    try:
+        while True: 
+            raw_data = await websocket.receive_text()
+            print(f"Rendezvous: Received raw message from '{worker_id}': {raw_data}")
+            try:
+                message = json.loads(raw_data)
+                msg_type = message.get("type")
+
+                if msg_type == "register_public_ip": # Worker's self-discovered HTTP/general public IP
+                    new_ip = message.get("ip")
+                    if new_ip and worker_id in connected_workers:
+                        connected_workers[worker_id]["http_reported_public_ip"] = new_ip 
+                        print(f"Worker '{worker_id}' reported HTTP-based public IP: {new_ip}")
+                
+                elif msg_type == "update_udp_endpoint": # This is the STUN-discovered UDP IP/Port
+                    udp_ip = message.get("udp_ip")
+                    udp_port = message.get("udp_port")
+                    if udp_ip and udp_port and worker_id in connected_workers:
+                        connected_workers[worker_id]["stun_reported_udp_ip"] = udp_ip
+                        connected_workers[worker_id]["stun_reported_udp_port"] = int(udp_port)
+                        print(f"Worker '{worker_id}' updated STUN UDP endpoint to: {udp_ip}:{udp_port}")
+                        await websocket.send_text(json.dumps({"type": "udp_endpoint_ack", "status": "success"}))
+                        
+                        # Attempt to pair this worker
+                        await attempt_to_pair_workers(worker_id)
+                    else:
+                        await websocket.send_text(json.dumps({"type": "udp_endpoint_ack", "status": "error", "detail": "Missing IP or Port from worker"}))
+                
+                elif msg_type == "echo_request": # From previous gist if kept
+                    payload = message.get("payload", "")
+                    await websocket.send_text(json.dumps({
+                        "type": "echo_response", 
+                        "original_payload": payload, 
+                        "processed_by_rendezvous": f"Echo from Rendezvous: {payload.upper()}"
+                    }))
+                
+                elif msg_type == "get_my_details": # From previous gist if kept
+                     if worker_id in connected_workers:
+                        details = connected_workers[worker_id]
+                        await websocket.send_text(json.dumps({
+                            "type": "my_details_response", "worker_id": worker_id,
+                            "websocket_ip": details.get("public_ip"), "websocket_port": details.get("public_port"),
+                            "http_ip": details.get("http_reported_public_ip"),
+                            "stun_udp_ip": details.get("stun_reported_udp_ip"), "stun_udp_port": details.get("stun_reported_udp_port"),
+                        }))
+                else:
+                    print(f"Rendezvous: Worker '{worker_id}' sent unhandled message type: {msg_type}")
+
+            except json.JSONDecodeError: print(f"Rendezvous: Worker '{worker_id}' sent non-JSON message: {raw_data}")
+            except AttributeError: print(f"Rendezvous: Worker '{worker_id}' sent malformed JSON message: {raw_data}")
+            except KeyError: print(f"Rendezvous: Worker '{worker_id}' no longer in connected_workers dict during message processing.")
+
+    except WebSocketDisconnect:
+        print(f"Worker '{worker_id}' disconnected from WebSocket EP: {client_host}:{client_port}.")
+    except Exception as e:
+        print(f"Error with worker '{worker_id}' WebSocket: {type(e).__name__} - {e}")
+    finally:
+        if worker_id in connected_workers and connected_workers[worker_id].get("websocket") == websocket:
+            del connected_workers[worker_id]
+            print(f"Worker '{worker_id}' de-registered. Total connected: {len(connected_workers)}")
+        if worker_id in workers_ready_for_pairing:
+            workers_ready_for_pairing.remove(worker_id)
+            print(f"Worker '{worker_id}' removed from ready_for_pairing list due to disconnect/error.")
+
+@app.get("/")
+async def read_root():
+    return {"message": "Rendezvous Service is running. Check /debug/list_workers"}
+
+@app.get("/debug/list_workers")
+async def list_workers():
+    # Uses keys consistent with how they are stored in connected_workers
+    # and how plann_step3a.md's rendezvous debug output was structured.
+    _workers_info = {}
+    for _worker_id, _data in list(connected_workers.items()):
+        _ws = _data.get("websocket")
+        _is_connected = _ws and hasattr(_ws, 'client_state') and _ws.client_state.value == 1
+        _workers_info[_worker_id] = {
+            "initial_websocket_ip": _data.get("public_ip"), 
+            "initial_websocket_port": _data.get("public_port"),
+            "http_reported_public_ip": _data.get("http_reported_public_ip"),
+            "stun_reported_udp_ip": _data.get("stun_reported_udp_ip"),
+            "stun_reported_udp_port": _data.get("stun_reported_udp_port"),
+            "websocket_is_connected": _is_connected
+        }
+    return {"active_websocket_connections": len(connected_workers), "workers_ready_for_pairing_count": len(workers_ready_for_pairing), "workers_details": _workers_info}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+```
+
+### 3B.1.3. Rendezvous Service `requirements.txt` and `Dockerfile.rendezvous`
+
+No changes needed from Step 3A (which matches your `rendezvous_service_code/requirements.txt` and `Dockerfile.rendezvous` in the `repomix-output.xml`).
+
+### 3B.1.4. Build and Re-deploy the Rendezvous Service
+
+1.  **Build Image:**
+    ```bash
+    # cd rendezvous_service_code 
+    # (Ensure Dockerfile.rendezvous is named Dockerfile, or use -f / --dockerfile)
+    gcloud builds submit --region=$REGION \
+        --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_V3} . \
+        --dockerfile=Dockerfile.rendezvous
+    ```
+2.  **Re-deploy Rendezvous Service:**
+    ```bash
+    gcloud run deploy $RENDEZVOUS_SERVICE_NAME \
+        --project=$PROJECT_ID \
+        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG_V3} \
+        --platform=managed --region=$REGION --allow-unauthenticated --session-affinity \
+        --min-instances=1 
+    ```
+
+-----
+
+## Part 3B.2: Modifications to Worker Service
+
+The Worker (`holepunch/main.py` in your `repomix-output.xml`) needs to:
+
+  * Properly initialize and use an asyncio-compatible UDP listener (`P2PUDPProtocol`).
+  * Handle the incoming `p2p_connection_offer` from the Rendezvous service.
+  * Implement the `attempt_udp_hole_punch` function to send UDP pings.
+
+### 3B.2.1. Shell Variables (Worker Service)
+
+```bash
+export PROJECT_ID="iceberg-eli" # Should be set
+export REGION="us-central1"   # Should be set
+
+export AR_WORKER_REPO_NAME="ip-worker-repo" # From your plann_step3a.md
+export WORKER_SERVICE_NAME="ip-worker-service" # From your plann_step3a.md
+export WORKER_IMAGE_TAG_V4="v_step3b" # New version tag
+
+# RENDEZVOUS_SERVICE_URL, STUN_HOST, STUN_PORT should be set from Step 3A
+# export RENDEZVOUS_SERVICE_URL="https://rendezvous-service-xxxx-uc.a.run.app" 
+export INTERNAL_UDP_PORT_ENV_VAR_VALUE="8081" # Define the internal port worker listens on
+```
+
+### 3B.2.2. Worker Service Code (`holepunch/main.py`) Updates
+
+This integrates the `P2PUDPProtocol` and the hole-punching logic.
+
+```python
+import asyncio
+import os
+import uuid
+import websockets
+import signal
+import threading
+import http.server
+import socketserver
+import requests # Still used for ipify
+import json
+import socket
+import stun # pystun3
+from typing import Optional, Tuple
+
+# --- Global Variables (matching your existing holepunch/main.py structure) ---
+worker_id = str(uuid.uuid4())
+stop_signal_received = False
+# udp_socket was used for STUN in 3A, let's rename for clarity or manage scope
+# For P2P, the listener will have its own transport, and sending might use that or a new socket.
+# Let's manage one main UDP socket/transport for P2P listening and sending.
+p2p_udp_transport: Optional[asyncio.DatagramTransport] = None
+# STUN discovered external endpoint for *our* UDP listener
+our_stun_discovered_udp_ip: Optional[str] = None
+our_stun_discovered_udp_port: Optional[int] = None
+
+DEFAULT_STUN_HOST = "stun.l.google.com" # As in your plann_step3a.md
+DEFAULT_STUN_PORT = 19302             # As in your plann_step3a.md
+INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "8081")) # Port our UDP listener binds to
+
+# --- Signal Handler (minor update to include p2p_udp_transport) ---
+def handle_shutdown_signal(signum, frame):
+    global stop_signal_received, p2p_udp_transport
+    print(f"Shutdown signal ({signum}) received. Worker '{worker_id}' attempting graceful shutdown.")
+    stop_signal_received = True
+    if p2p_udp_transport:
+        try:
+            p2p_udp_transport.close()
+            print(f"Worker '{worker_id}': P2P UDP transport closed.")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error closing P2P UDP transport: {e}")
+
+# --- Asyncio Datagram Protocol for P2P UDP Listener (from previous Step 3B plan) ---
+class P2PUDPProtocol(asyncio.DatagramProtocol):
+    def __init__(self, worker_id_val: str):
+        self.worker_id = worker_id_val
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
+
+    def connection_made(self, transport: asyncio.DatagramTransport):
+        global p2p_udp_transport # Store the transport globally for sending
+        self.transport = transport
+        p2p_udp_transport = transport 
+        local_addr = transport.get_extra_info('sockname')
+        print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT}). Ready for P2P UDP packets.")
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        message = data.decode(errors='ignore')
+        print(f"Worker '{self.worker_id}': == UDP Packet Received from {addr}: '{message}' ==")
+        # Simple PING/PONG logic
+        if message.startswith("P2P_PING_FROM_"):
+            peer_id_part = message.split("P2P_PING_FROM_")[1].split("_NUM_")[0]
+            print(f"Worker '{self.worker_id}': !!! P2P UDP Ping received from peer (likely {peer_id_part} via {addr}) !!!")
+            try:
+                response_message = f"P2P_PONG_FROM_{self.worker_id}_TO_{peer_id_part}".encode()
+                self.transport.sendto(response_message, addr) # Send PONG back to the sender's address
+                print(f"Worker '{self.worker_id}': Sent UDP PONG to {addr}")
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error sending UDP PONG: {e}")
+        elif message.startswith("P2P_PONG_FROM_"):
+            print(f"Worker '{self.worker_id}': !!! P2P UDP Pong received from {addr} !!!")
+
+    def error_received(self, exc: Exception):
+        print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
+
+    def connection_lost(self, exc: Optional[Exception]):
+        global p2p_udp_transport
+        print(f"Worker '{self.worker_id}': P2P UDP listener connection lost: {exc if exc else 'Closed normally'}")
+        if self.transport == p2p_udp_transport:
+            p2p_udp_transport = None # Clear global ref
+
+# --- STUN Discovery (adapting your existing `discover_udp_endpoint_and_report` from plann_step3a.md/repomix) ---
+async def discover_and_report_stun_udp_endpoint(websocket_conn):
+    global our_stun_discovered_udp_ip, our_stun_discovered_udp_port, worker_id
+    
+    # For STUN discovery, we need a socket bound to *some* local port.
+    # pystun3's get_ip_info can take source_ip and source_port for the local socket.
+    # If source_port is 0, it binds to an ephemeral port.
+    # This discovered external mapping is what we report.
+    # Our actual P2P listener will be on INTERNAL_UDP_PORT.
+    
+    temp_stun_socket_for_discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        temp_stun_socket_for_discovery.bind(("0.0.0.0", 0)) # Bind to an ephemeral local port for STUN query
+        local_stun_query_port = temp_stun_socket_for_discovery.getsockname()[1]
+
+        stun_host = os.environ.get("STUN_HOST", DEFAULT_STUN_HOST)
+        stun_port = int(os.environ.get("STUN_PORT", DEFAULT_STUN_PORT))
+        
+        print(f"Worker '{worker_id}': Attempting STUN discovery via {stun_host}:{stun_port} using temp local UDP port {local_stun_query_port}.")
+        
+        # pystun3.get_ip_info creates its own socket internally for the query if source_ip/port are not the actual socket.
+        # Or, it can use the one provided by source_port if you pass the socket itself via `sock` (not standard in pystun3 CLI version).
+        # The `source_port` parameter to `stun.get_ip_info` tells it which local port to use for the STUN binding request.
+        nat_type, external_ip, external_port = stun.get_ip_info(
+            source_ip="0.0.0.0", # Tells pystun3 to pick an interface
+            source_port=local_stun_query_port, # The local port from which the STUN request will be sent
+            stun_host=stun_host, 
+            stun_port=stun_port
+        )
+        print(f"Worker '{worker_id}': STUN discovery result: NAT Type='{nat_type}', External IP='{external_ip}', External Port={external_port}")
+
+        if external_ip and external_port:
+            our_stun_discovered_udp_ip = external_ip
+            our_stun_discovered_udp_port = external_port
+            
+            await websocket_conn.send(json.dumps({
+                "type": "update_udp_endpoint", # Message type Rendezvous expects
+                "udp_ip": our_stun_discovered_udp_ip,
+                "udp_port": our_stun_discovered_udp_port
+            }))
+            print(f"Worker '{worker_id}': Sent STUN-discovered UDP endpoint ({our_stun_discovered_udp_ip}:{our_stun_discovered_udp_port}) to Rendezvous.")
+            return True
+        else:
+            print(f"Worker '{worker_id}': STUN discovery failed to return valid external IP/Port.")
+            return False
+    except stun.StunError as e: # Catch specific pystun3 error
+        print(f"Worker '{worker_id}': STUN error during discovery: {e}")
+        return False
+    except socket.gaierror as e: 
+        print(f"Worker '{worker_id}': STUN host DNS resolution error: {e}")
+        return False
+    except Exception as e:
+        print(f"Worker '{worker_id}': General error during STUN discovery: {type(e).__name__} - {e}")
+        return False
+    finally:
+        if temp_stun_socket_for_discovery:
+            temp_stun_socket_for_discovery.close()
+            print(f"Worker '{worker_id}': Temp STUN UDP socket closed.")
+
+# --- UDP Hole Punching Logic ---
+async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker_id: str):
+    global worker_id, stop_signal_received, p2p_udp_transport, our_stun_discovered_udp_ip, INTERNAL_UDP_PORT
+    
+    if not p2p_udp_transport: # Check if our main UDP listener's transport is active
+        print(f"Worker '{worker_id}': P2P UDP listener transport not available. Cannot effectively send P2P pings.")
+        return
+
+    print(f"Worker '{worker_id}': Starting UDP hole punch sequence towards peer '{peer_worker_id}' at {peer_udp_ip}:{peer_udp_port}")
+    print(f"Worker '{worker_id}': My STUN-discovered public UDP endpoint is {our_stun_discovered_udp_ip}:{our_stun_discovered_udp_port}")
+    print(f"Worker '{worker_id}': My internal P2P UDP listener is on port {INTERNAL_UDP_PORT}")
+
+    target_addr = (peer_udp_ip, peer_udp_port)
+
+    # Send a burst of packets to try and establish the NAT mapping ("punch the hole")
+    # The listener (P2PUDPProtocol) is already active and should receive replies or pings from the peer.
+    for i in range(1, 6): # Send 5 pings
+        if stop_signal_received: break
+        try:
+            message_content = f"P2P_PING_FROM_{worker_id}_NUM_{i}"
+            message_bytes = message_content.encode()
+            
+            p2p_udp_transport.sendto(message_bytes, target_addr) # Use the listener's transport to send
+
+            print(f"Worker '{worker_id}': Sent UDP PING {i} ('{message_content}') to {target_addr} via listener transport.")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error sending UDP PING {i}: {e}")
+        await asyncio.sleep(0.75) # Stagger pings a bit
+    
+    print(f"Worker '{worker_id}': Finished UDP PING burst for hole punching to '{peer_worker_id}'. Now relying on listener.")
+
+# --- Main WebSocket Connection Logic (adapting your existing connect_to_rendezvous) ---
+async def connect_to_rendezvous(rendezvous_ws_url: str):
+    global stop_signal_received, our_stun_discovered_udp_ip, our_stun_discovered_udp_port, p2p_udp_transport, INTERNAL_UDP_PORT
+    
+    # Existing ip_echo_service_url and ping settings from your current main.py
+    ip_echo_service_url = "https://api.ipify.org"
+    ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
+    ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
+    
+    # Ensure any previous UDP transport is cleared before a new connection attempt
+    if p2p_udp_transport:
+        p2p_udp_transport.close()
+        p2p_udp_transport = None
+
+    while not stop_signal_received:
+        current_udp_listener_task = None
+        try:
+            async with websockets.connect(
+                rendezvous_ws_url,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+            ) as websocket:
+                print(f"Worker '{worker_id}' connected to Rendezvous via WebSocket.")
+
+                # 1. Report HTTP-based public IP (optional, as in your current code)
+                try:
+                    # ... (Your existing requests.get(ip_echo_service_url) logic) ...
+                    response = requests.get(ip_echo_service_url, timeout=10)
+                    response.raise_for_status()
+                    http_public_ip = response.text.strip()
+                    await websocket.send(json.dumps({"type": "register_public_ip", "ip": http_public_ip}))
+                    print(f"Worker '{worker_id}' sent HTTP-based public IP ({http_public_ip}) to Rendezvous.")
+                except Exception as e:
+                    print(f"Worker '{worker_id}': Error fetching/sending HTTP-based public IP: {e}.")
+
+                # 2. Discover and report STUN UDP endpoint
+                stun_success = await discover_and_report_stun_udp_endpoint(websocket)
+
+                # 3. If STUN was successful, start the asyncio UDP listener on INTERNAL_UDP_PORT
+                if stun_success and not p2p_udp_transport: # Start listener only if STUN worked and not already running
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # The transport is stored in p2p_udp_transport by P2PUDPProtocol.connection_made
+                        _transport, _protocol = await loop.create_datagram_endpoint(
+                            lambda: P2PUDPProtocol(worker_id),
+                            local_addr=('0.0.0.0', INTERNAL_UDP_PORT) 
+                        )
+                        # Give a moment for connection_made to set p2p_udp_transport
+                        await asyncio.sleep(0.1) 
+                        if p2p_udp_transport:
+                             print(f"Worker '{worker_id}': Asyncio P2P UDP listener started on 0.0.0.0:{INTERNAL_UDP_PORT}.")
+                        else:
+                             print(f"Worker '{worker_id}': Asyncio P2P UDP listener transport NOT SET after create_datagram_endpoint.")
+                    except Exception as e:
+                        print(f"Worker '{worker_id}': Failed to start asyncio P2P UDP listener on port {INTERNAL_UDP_PORT}: {type(e).__name__} - {e}")
+                
+                # Main WebSocket receive loop
+                while not stop_signal_received:
+                    try:
+                        message_raw = await asyncio.wait_for(websocket.recv(), timeout=max(30.0, ping_interval + ping_timeout + 10))
+                        print(f"Worker '{worker_id}': RAW Received from Rendezvous (WebSocket): {message_raw}")
+                        try:
+                            message_data = json.loads(message_raw)
+                            msg_type = message_data.get("type")
+                            
+                            if msg_type == "udp_endpoint_ack":
+                                print(f"Worker '{worker_id}': Received UDP endpoint ack from Rendezvous: {message_data.get('status')}")
+                            elif msg_type == "echo_response": # From your previous gists
+                                print(f"Worker '{worker_id}': Echo Response from Rendezvous: {message_data.get('processed_by_rendezvous')}")
+                            elif msg_type == "my_details_response": # From your previous gists
+                                print(f"Worker '{worker_id}': My Details from Rendezvous: IP={message_data.get('stun_udp_ip')}, Port={message_data.get('stun_udp_port')}")
+                            
+                            # NEW: Handle P2P connection offer from Rendezvous
+                            elif msg_type == "p2p_connection_offer":
+                                peer_id = message_data.get("peer_worker_id")
+                                peer_ip = message_data.get("peer_udp_ip") # This is STUN-discovered external IP of peer
+                                peer_port = message_data.get("peer_udp_port") # STUN-discovered external Port of peer
+                                
+                                if peer_id and peer_ip and peer_port:
+                                    print(f"Worker '{worker_id}': Received P2P connection offer for peer '{peer_id}' at UDP endpoint {peer_ip}:{peer_port}")
+                                    if p2p_udp_transport and our_stun_discovered_udp_ip: # Ensure our UDP setup is ready
+                                        print(f"Worker '{worker_id}': My UDP Listener active & STUN info present. Starting hole punch task.")
+                                        asyncio.create_task(start_udp_hole_punch(peer_ip, int(peer_port), peer_id))
+                                    else:
+                                        print(f"Worker '{worker_id}': Cannot initiate P2P: My UDP listener not active or STUN discovery incomplete.")
+                                else:
+                                    print(f"Worker '{worker_id}': Received incomplete P2P connection offer: {message_data}")
+                            else:
+                                print(f"Worker '{worker_id}': Received unhandled message type '{msg_type}' from Rendezvous.")
+                        except json.JSONDecodeError:
+                            print(f"Worker '{worker_id}': Received non-JSON message from Rendezvous: {message_raw}")
+                    except asyncio.TimeoutError:
+                        pass # Normal due to recv timeout, pings handle keepalive
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed by server during recv loop.")
+                        break 
+                
+        except websockets.exceptions.ConnectionClosedOK:
+            print(f"Worker '{worker_id}': Rendezvous WebSocket connection closed gracefully by server.")
+        except websockets.exceptions.InvalidURI:
+            print(f"Worker '{worker_id}': Invalid Rendezvous WebSocket URI: {rendezvous_ws_url}. Exiting.")
+            if p2p_udp_transport: p2p_udp_transport.close(); p2p_udp_transport = None # Clean up transport
+            return 
+        except ConnectionRefusedError:
+            print(f"Worker '{worker_id}': Connection to Rendezvous refused. Retrying in 10 seconds...")
+        except Exception as e: 
+            print(f"Worker '{worker_id}': Error in WebSocket connect_to_rendezvous outer loop: {type(e).__name__} - {e}. Retrying in 10s...")
+        
+        finally: # Cleanup for this specific WebSocket connection attempt
+            if p2p_udp_transport:
+                print(f"Worker '{worker_id}': Closing P2P UDP transport in connect_to_rendezvous finally block (after WebSocket attempt).")
+                p2p_udp_transport.close()
+                p2p_udp_transport = None
+        
+        if not stop_signal_received:
+            await asyncio.sleep(10) 
+        else:
+            break 
+
+    print(f"Worker '{worker_id}' has stopped WebSocket connection attempts.")
+
+# --- Health Check Server (unchanged from your current main.py) ---
+def start_healthcheck_http_server():
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self): self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, format, *args): return
+    port = int(os.environ.get("PORT", 8080))
+    httpd = socketserver.TCPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"Health-check HTTP server listening on 0.0.0.0:{port}")
+
+start_healthcheck_http_server() # This is already in your main.py
+
+# --- __main__ block (adapting your existing main.py __main__) ---
+if __name__ == "__main__":
+    print(f"WORKER SCRIPT (ID: {worker_id}): Starting main process.")
+    
+    rendezvous_base_url_env = os.environ.get("RENDEZVOUS_SERVICE_URL")
+    if not rendezvous_base_url_env:
+        print("CRITICAL ERROR: RENDEZVOUS_SERVICE_URL environment variable not set. Exiting worker.")
+        exit(1)
+
+    # Construct WebSocket URL (consistent with your main.py)
+    if rendezvous_base_url_env.startswith("http://"):
+        ws_url_constructed = rendezvous_base_url_env.replace("http://", "ws://", 1)
+    elif rendezvous_base_url_env.startswith("https://"):
+        ws_url_constructed = rendezvous_base_url_env.replace("https://", "wss://", 1)
+    else: # Assuming a raw domain:port that might be for local testing
+        print(f"Warning: Rendezvous URL '{rendezvous_base_url_env}' lacks http/https scheme. Prepending 'ws://' as a default guess for local or non-SSL.")
+        ws_url_constructed = "ws://" + rendezvous_base_url_env 
+    full_rendezvous_ws_url = f"{ws_url_constructed}/ws/register/{worker_id}"
+    
+    print(f"Worker '{worker_id}': Configured to connect to Rendezvous at: {full_rendezvous_ws_url}")
+    
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+
+    try:
+        asyncio.run(connect_to_rendezvous(full_rendezvous_ws_url))
+    except KeyboardInterrupt:
+        print(f"Worker '{worker_id}' interrupted by user (KeyboardInterrupt).")
+        stop_signal_received = True # Ensure loops terminate
+    except Exception as e_main:
+        print(f"Worker '{worker_id}' CRITICAL ERROR in main asyncio.run: {type(e_main).__name__} - {e_main}")
+    finally:
+        print(f"Worker '{worker_id}' main process exiting. stop_signal_received={stop_signal_received}")
+        # Final cleanup of the UDP transport if it was somehow left open
+        if p2p_udp_transport and not p2p_udp_transport.is_closing():
+            print(f"Worker '{worker_id}': Performing final close of P2P UDP transport in __main__ finally.")
+            p2p_udp_transport.close()
+```
+
+### 3B.2.3. Worker Service `requirements.txt` (`holepunch/requirements.txt`)
+
+This remains the same as your `plann_step3a.md` and current `requirements.txt`:
+
+```
+websockets>=12.0
+requests>=2.0.0 
+pystun3>=1.1.6 
+```
+
+### 3B.2.4. Worker Service `Dockerfile.worker` (`holepunch/Dockerfile.worker`)
+
+No changes needed from your current `Dockerfile.worker` (which should have `CMD ["python", "-u", "main.py"]`).
+
+### 3B.2.5. Build and Re-deploy the Worker Service
+
+1.  **Build Image (from `holepunch` directory):**
+    *(Use your existing build commands from `plann_step3a.md`, just update the image tag)*
+    ```bash
+    # cd path/to/holepunch
+    # (Ensure Dockerfile.worker is named Dockerfile or use -f with docker build/buildx or --dockerfile with gcloud)
+    gcloud builds submit --region=$REGION \
+        --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V4} . \
+        --dockerfile=Dockerfile.worker 
+    ```
+2.  **Re-deploy Worker Service (MINIMUM 2 INSTANCES):**
+    ```bash
+    gcloud run deploy $WORKER_SERVICE_NAME \
+        --project=$PROJECT_ID \
+        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG_V4} \
+        --platform=managed \
+        --region=$REGION \
+        --update-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_SERVICE_URL},STUN_HOST=${STUN_HOST:-stun.l.google.com},STUN_PORT=${STUN_PORT:-19302},INTERNAL_UDP_PORT=${INTERNAL_UDP_PORT_ENV_VAR_VALUE}" \
+        --vpc-egress=all-traffic \
+        --network=ip-worker-vpc \
+        --subnet=ip-worker-subnet \
+        --min-instances=2 \
+        --max-instances=2 \
+        --cpu-boost # Consider enabling CPU boost for potentially faster network I/O and task scheduling
+        # --concurrency=10 # Default is 80. For primarily network I/O bound tasks like this, higher might be okay,
+                           # but for 2 instances and simple PING/PONG, default is likely fine.
+    ```
+      * Added `INTERNAL_UDP_PORT` environment variable. Set to `8081` by the shell variable.
+      * Set `--min-instances=2` and `--max-instances=2` to ensure you have two workers for P2P.
+      * `--cpu-boost` can help with the responsiveness needed for hole punching.
+
+-----
+
+## Part 3B.3: Verification
+
+1.  **Deploy/Update both services:** Rendezvous (`v_step3b` tag) first, then ensure at least two instances of Worker (`v_step3b` tag for worker, or `WORKER_IMAGE_TAG_V4`) are running.
+2.  **Monitor Rendezvous Service Logs:**
+      * Confirm both workers connect and register their STUN-discovered UDP endpoints.
+      * Look for logs indicating it's pairing workers and sending `p2p_connection_offer` messages to both.
+3.  **Monitor Worker A's Logs & Worker B's Logs:**
+      * STUN success, UDP listener started on internal port (e.g., 8081).
+      * WebSocket connection and UDP endpoint registration acknowledged by Rendezvous.
+      * Receiving `p2p_connection_offer` for its peer from Rendezvous.
+      * Logs from `attempt_udp_hole_punch`: `Sent UDP PING X to Peer_NAT_IP:Peer_NAT_Port`.
+      * **CRUCIAL SUCCESS LOG (on both workers, for packets from the other):**
+        `Worker '...' == UDP Packet Received from Peer_NAT_IP:Peer_NAT_Source_Port: 'P2P_PING_FROM_peer-id_NUM_Y'`
+        `Worker '...' !!! P2P UDP Ping received from peer ... !!!`
+        `Worker '...' Sent UDP PONG to Peer_NAT_IP:Peer_NAT_Source_Port`
+        And subsequently:
+        `Worker '...' == UDP Packet Received from Peer_NAT_IP:Peer_NAT_Source_Port: 'P2P_PONG_FROM_peer-id_TO_own-id'`
+        `Worker '...' !!! P2P UDP Pong received from Peer_NAT_IP:Peer_NAT_Source_Port !!!`
+
+**What "Success" for Step 3B Looks Like:**
+If both Worker A and Worker B log that they have *received UDP PINGs and PONGs directly from each other's public NAT IP addresses*, then UDP hole punching has been successful\!
+
+This refined plan for Step 3B should align well with your existing codebase from Step 3A and guide you through implementing and verifying direct P2P UDP communication.

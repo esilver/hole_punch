@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>P2P UDP Chat - Worker: <span id="workerIdSpan"></span></title>
+    <style>
+        body { font-family: sans-serif; margin: 10px; background-color: #f4f4f4; }
+        #chatbox { width: 95%; height: 300px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; background-color: #fff; margin-bottom: 10px; }
+        #messageInput { width: 80%; padding: 10px; margin-right: 5px; border: 1px solid #ccc; }
+        #sendButton { padding: 10px; background-color: #5cb85c; color: white; border: none; cursor: pointer; }
+        #sendButton:hover { background-color: #4cae4c; }
+        .message { margin-bottom: 5px; padding: 5px; border-radius: 3px; }
+        .local { background-color: #d1e7dd; text-align: right; margin-left: 20%; }
+        .peer { background-color: #f8d7da; text-align: left; margin-right: 20%;}
+        .system { background-color: #e2e3e5; color: #555; font-style: italic; font-size: 0.9em;}
+        #status { margin-top: 10px; font-size: 0.9em; color: #777; }
+        #peerInfo { margin-top: 5px; font-size: 0.9em; color: #337ab7; }
+    </style>
+</head>
+<body>
+    <h1>P2P UDP Chat - Worker: <span id="workerIdSpan"></span></h1>
+    <div id="status">Connecting to local worker backend...</div>
+    <div id="peerInfo">Peer: Not connected</div>
+    <div id="chatbox"></div>
+    <input type="text" id="messageInput" placeholder="Type message..."/>
+    <button id="sendButton">Send</button>
+
+    <script>
+        const workerIdSpan = document.getElementById('workerIdSpan');
+        const chatbox = document.getElementById('chatbox');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const statusDiv = document.getElementById('status');
+        const peerInfoDiv = document.getElementById('peerInfo');
+
+        let localUiSocket = null;
+        let myWorkerId = "Unknown"; // Will be updated by backend
+
+        function addMessage(text, type = "system", sender = "") {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', type);
+            if (type === 'local' || type === 'peer') {
+                 messageDiv.textContent = `${sender}: ${text}`;
+            } else {
+                 messageDiv.textContent = text;
+            }
+            chatbox.appendChild(messageDiv);
+            chatbox.scrollTop = chatbox.scrollHeight; // Auto-scroll
+        }
+
+        function connectToLocalBackend() {
+            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const localWsUrl = `${wsProtocol}//${window.location.host}/ui_ws`; 
+            
+            addMessage(`Attempting to connect to local UI WebSocket at ${localWsUrl}`, "system");
+            localUiSocket = new WebSocket(localWsUrl);
+
+            localUiSocket.onopen = function(event) {
+                statusDiv.textContent = "Connected to local worker backend. Waiting for P2P link...";
+                addMessage("Connection to local worker backend established.", "system");
+                localUiSocket.send(JSON.stringify({type: "ui_client_hello"}));
+            };
+
+            localUiSocket.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log("Message from local worker backend:", data);
+                    if (data.type === "init_info") {
+                        myWorkerId = data.worker_id;
+                        workerIdSpan.textContent = myWorkerId.substring(0,8) + "...";
+                        addMessage(`Worker ID: ${myWorkerId}`, "system");
+                         if(data.p2p_peer_id) {
+                            peerInfoDiv.textContent = `P2P Connected to Peer: ${data.p2p_peer_id.substring(0,8)}...`;
+                            statusDiv.textContent = "P2P Link Active.";
+                        }
+                    } else if (data.type === "p2p_message_received") {
+                        addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
+                    } else if (data.type === "p2p_status_update") {
+                        addMessage(`P2P Status: ${data.message}`, "system");
+                        if (data.peer_id) {
+                            peerInfoDiv.textContent = `P2P Connected to Peer: ${data.peer_id.substring(0,8)}...`;
+                            statusDiv.textContent = "P2P Link Active.";
+                        } else {
+                             peerInfoDiv.textContent = "Peer: Not connected";
+                             if (!data.message.toLowerCase().includes("lost")) {
+                                statusDiv.textContent = "P2P Link Inactive.";
+                             }
+                        }
+                    } else if (data.type === "error") {
+                        addMessage(`Error from backend: ${data.message}`, "system");
+                    }
+                } catch (e) {
+                    addMessage("Received non-JSON message from backend: " + event.data, "system");
+                }
+            };
+
+            localUiSocket.onclose = function(event) {
+                statusDiv.textContent = "Disconnected from local worker backend. Attempting to reconnect...";
+                addMessage("Connection to local worker backend closed. Retrying in 5s...", "system");
+                setTimeout(connectToLocalBackend, 5000);
+            };
+
+            localUiSocket.onerror = function(error) {
+                statusDiv.textContent = "Error connecting to local worker backend.";
+                addMessage("WebSocket error with local worker backend: " + error.message, "system");
+                console.error("WebSocket Error: ", error);
+            };
+        }
+
+        sendButton.onclick = function() {
+            const messageText = messageInput.value;
+            if (messageText && localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({
+                    type: "send_p2p_message",
+                    content: messageText
+                }));
+                addMessage(messageText, "local", "Me (" + (myWorkerId ? myWorkerId.substring(0,8)+"..." : "") + ")");
+                messageInput.value = '';
+            } else {
+                addMessage("Cannot send message. Not connected to local backend or message is empty.", "system");
+            }
+        };
+        
+        messageInput.addEventListener("keypress", function(event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                sendButton.click();
+            }
+        });
+
+        connectToLocalBackend();
+    </script>
+</body>
+</html> 
