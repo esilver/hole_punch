@@ -14,6 +14,8 @@
         .system { background-color: #e2e3e5; color: #555; font-style: italic; font-size: 0.9em;}
         #status { margin-top: 10px; font-size: 0.9em; color: #777; }
         #peerInfo { margin-top: 5px; font-size: 0.9em; color: #337ab7; }
+        #benchmarkSection { margin-top: 20px; padding: 10px; border: 1px solid #ddd; background-color: #e9ecef; }
+        #benchmarkStatus { margin-top: 5px; font-size: 0.9em; color: #198754; }
     </style>
 </head>
 <body>
@@ -24,6 +26,14 @@
     <input type="text" id="messageInput" placeholder="Type message..."/>
     <button id="sendButton">Send</button>
 
+    <div id="benchmarkSection">
+        <h3>P2P UDP Throughput Benchmark</h3>
+        <label for="benchmarkSize">Data Size (KB):</label>
+        <input type="number" id="benchmarkSize" value="1024" min="1"/>
+        <button id="startBenchmarkButton">Start Benchmark Send</button>
+        <div id="benchmarkStatus">Benchmark status will appear here.</div>
+    </div>
+
     <script>
         const workerIdSpan = document.getElementById('workerIdSpan');
         const chatbox = document.getElementById('chatbox');
@@ -31,6 +41,9 @@
         const sendButton = document.getElementById('sendButton');
         const statusDiv = document.getElementById('status');
         const peerInfoDiv = document.getElementById('peerInfo');
+        const benchmarkSizeInput = document.getElementById('benchmarkSize');
+        const startBenchmarkButton = document.getElementById('startBenchmarkButton');
+        const benchmarkStatusDiv = document.getElementById('benchmarkStatus');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown"; // Will be updated by backend
@@ -71,6 +84,7 @@
                          if(data.p2p_peer_id) {
                             peerInfoDiv.textContent = `P2P Connected to Peer: ${data.p2p_peer_id.substring(0,8)}...`;
                             statusDiv.textContent = "P2P Link Active.";
+                            startBenchmarkButton.disabled = false; // Enable benchmark when P2P is active
                         }
                     } else if (data.type === "p2p_message_received") {
                         addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
@@ -79,12 +93,17 @@
                         if (data.peer_id) {
                             peerInfoDiv.textContent = `P2P Connected to Peer: ${data.peer_id.substring(0,8)}...`;
                             statusDiv.textContent = "P2P Link Active.";
+                            startBenchmarkButton.disabled = false; // Enable benchmark when P2P is active
                         } else {
                              peerInfoDiv.textContent = "Peer: Not connected";
                              if (!data.message.toLowerCase().includes("lost")) {
                                 statusDiv.textContent = "P2P Link Inactive.";
                              }
+                             startBenchmarkButton.disabled = true; // Disable benchmark if no P2P
                         }
+                    } else if (data.type === "benchmark_status") { // NEW: Handle benchmark status messages
+                        benchmarkStatusDiv.textContent = data.message;
+                        addMessage(`Benchmark: ${data.message}`, "system");
                     } else if (data.type === "error") {
                         addMessage(`Error from backend: ${data.message}`, "system");
                     }
@@ -96,6 +115,7 @@
             localUiSocket.onclose = function(event) {
                 statusDiv.textContent = "Disconnected from local worker backend. Attempting to reconnect...";
                 addMessage("Connection to local worker backend closed. Retrying in 5s...", "system");
+                startBenchmarkButton.disabled = true; // Disable on disconnect
                 setTimeout(connectToLocalBackend, 5000);
             };
 
@@ -120,6 +140,26 @@
             }
         };
         
+        startBenchmarkButton.onclick = function() {
+            const sizeKb = parseInt(benchmarkSizeInput.value, 10);
+            if (isNaN(sizeKb) || sizeKb <= 0) {
+                addMessage("Invalid benchmark data size.", "system");
+                benchmarkStatusDiv.textContent = "Invalid data size for benchmark.";
+                return;
+            }
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({
+                    type: "start_benchmark_send",
+                    size_kb: sizeKb
+                }));
+                benchmarkStatusDiv.textContent = `Benchmark initiated to send ${sizeKb} KB...`;
+                addMessage(`Benchmark: Initiated send of ${sizeKb} KB.`, "system");
+            } else {
+                addMessage("Cannot start benchmark. Not connected to local backend.", "system");
+                benchmarkStatusDiv.textContent = "Not connected to local backend.";
+            }
+        };
+
         messageInput.addEventListener("keypress", function(event) {
             if (event.key === "Enter") {
                 event.preventDefault();
