@@ -1,0 +1,5 @@
+requests~=2.31.0
+websockets~=12.0
+# Using ~= for patch and minor version compatibility
+# Example: ~=12.0 means >=12.0, <13.0.0
+aiohttp~=3.9.1 
