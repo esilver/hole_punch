@@ -2,6 +2,7 @@ import asyncio
 import os
 import uuid
 import websockets # For Rendezvous client AND UI server
+import aiohttp
 import signal
 import threading
 import http.server 
@@ -36,6 +37,17 @@ ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
 # Benchmark related globals
 benchmark_sessions: Dict[str, Dict] = {} # Key: peer_addr_str, Value: {received_bytes, received_chunks, start_time, total_chunks (from sender)}
 BENCHMARK_CHUNK_SIZE = 1024 # 1KB
+BENCHMARK_FILE_URL = os.environ.get("BENCHMARK_GCS_URL")
+
+async def download_benchmark_file() -> bytes:
+    """Download the benchmark file from GCS asynchronously."""
+    if not BENCHMARK_FILE_URL:
+        raise RuntimeError("BENCHMARK_GCS_URL environment variable not set")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(BENCHMARK_FILE_URL) as resp:
+            resp.raise_for_status()
+            return await resp.read()
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received, p2p_udp_transport
@@ -60,21 +72,43 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
     elif path == "/health": return (200, [("Content-Type", "text/plain")], b"OK")
     else: return (404, [("Content-Type", "text/plain")], b"Not Found")
 
-async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int, ui_ws: websockets.WebSocketServerProtocol):
+
+async def benchmark_send_udp_data(target_ip: str, target_port: int, _size_kb: int, ui_ws: websockets.WebSocketServerProtocol):
+    """Download a file from GCS and send it to the peer over UDP."""
     global worker_id, p2p_udp_transport
+
     if not (p2p_udp_transport and current_p2p_peer_addr):
         err_msg = "P2P UDP transport or peer address not available for benchmark."
         print(f"Worker '{worker_id}': {err_msg}")
         await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
         return
 
-    print(f"Worker '{worker_id}': Starting P2P UDP Benchmark: Sending {size_kb}KB to {target_ip}:{target_port}")
-    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmark Send: Starting to send {size_kb}KB..."}))
+    if not BENCHMARK_FILE_URL:
+        err_msg = "BENCHMARK_GCS_URL not set."
+        print(f"Worker '{worker_id}': {err_msg}")
+        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": err_msg}))
+        return
 
-    num_chunks = size_kb
-    dummy_chunk_content = b'B' * (BENCHMARK_CHUNK_SIZE - 50) # Approx to leave room for JSON overhead
-    dummy_chunk_b64 = base64.b64encode(dummy_chunk_content).decode('ascii')
-    
+    print(f"Worker '{worker_id}': Starting benchmark download from {BENCHMARK_FILE_URL}")
+    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Downloading benchmark file..."}))
+
+    start_download = time.monotonic()
+    try:
+        file_bytes = await download_benchmark_file()
+    except Exception as e:
+        err_msg = f"Download failed: {type(e).__name__} - {e}"
+        print(f"Worker '{worker_id}': {err_msg}")
+        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": err_msg}))
+        return
+    download_time = time.monotonic() - start_download
+    file_size_kb = len(file_bytes) / 1024
+    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Downloaded {file_size_kb/1024:.2f} MB in {download_time:.2f}s"}))
+
+    num_chunks = (len(file_bytes) + BENCHMARK_CHUNK_SIZE - 1) // BENCHMARK_CHUNK_SIZE
+
+    print(f"Worker '{worker_id}': Sending {len(file_bytes)} bytes in {num_chunks} chunks to {target_ip}:{target_port}")
+    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Starting UDP send of {file_size_kb/1024:.2f} MB..."}))
+
     start_time = time.monotonic()
     bytes_sent = 0
 
@@ -84,17 +118,17 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
                 print(f"Worker '{worker_id}': Benchmark send cancelled (stop_signal or UI disconnected).")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark send cancelled."}))
                 break
-            
-            payload = {"type": "benchmark_chunk", "seq": i, "payload": dummy_chunk_b64, "from_worker_id": worker_id}
+
+            chunk = file_bytes[i * BENCHMARK_CHUNK_SIZE : (i + 1) * BENCHMARK_CHUNK_SIZE]
+            payload = {"type": "benchmark_chunk", "seq": i, "payload": base64.b64encode(chunk).decode('ascii'), "from_worker_id": worker_id}
             data_to_send = json.dumps(payload).encode()
             p2p_udp_transport.sendto(data_to_send, (target_ip, target_port))
             bytes_sent += len(data_to_send)
-            if (i + 1) % (num_chunks // 10 if num_chunks >=10 else 1) == 0: # Update UI every 10% or each chunk
+            if (i + 1) % (num_chunks // 10 if num_chunks >= 10 else 1) == 0:
                 progress_msg = f"Benchmark Send: Sent {i+1}/{num_chunks} chunks ({bytes_sent / 1024:.2f} KB)..."
                 print(f"Worker '{worker_id}': {progress_msg}")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
-        else: # If loop completed without break
-            # Send benchmark end marker
+        else:
             end_payload = {"type": "benchmark_end", "total_chunks": num_chunks, "from_worker_id": worker_id}
             p2p_udp_transport.sendto(json.dumps(end_payload).encode(), (target_ip, target_port))
             print(f"Worker '{worker_id}': Sent benchmark_end marker to {target_ip}:{target_port}")
@@ -102,7 +136,10 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
             end_time = time.monotonic()
             duration = end_time - start_time
             throughput_kbps = (bytes_sent / 1024) / duration if duration > 0 else 0
-            final_msg = f"Benchmark Send Complete: Sent {bytes_sent / 1024:.2f} KB in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
+            final_msg = (
+                f"Benchmark Send Complete: {file_size_kb/1024:.2f} MB sent in {duration:.2f}s (download {download_time:.2f}s)." \
+                f" Throughput: {throughput_kbps:.2f} KB/s"
+            )
             print(f"Worker '{worker_id}': {final_msg}")
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": final_msg}))
 
@@ -111,7 +148,6 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
         print(f"Worker '{worker_id}': {error_msg}")
         if not ui_ws.closed:
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {error_msg}"}))
-
 async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, path: str):
     global ui_websocket_clients, worker_id, current_p2p_peer_id, p2p_udp_transport, current_p2p_peer_addr
     ui_websocket_clients.add(websocket)
