@@ -21,19 +21,18 @@ workers_ready_for_pairing: List[str] = []
 async def attempt_to_pair_workers(newly_ready_worker_id: str):
     global workers_ready_for_pairing, connected_workers
 
-    # Ensure the worker trying to pair is valid and has WebSocket
     newly_ready_worker_data = connected_workers.get(newly_ready_worker_id)
-    if not (newly_ready_worker_data and newly_ready_worker_data.get("stun_reported_udp_ip") and 
-            newly_ready_worker_data.get("websocket") and 
-            hasattr(newly_ready_worker_data["websocket"], 'client_state') and 
+    if not (newly_ready_worker_data and
+            newly_ready_worker_data.get("websocket") and
+            hasattr(newly_ready_worker_data["websocket"], 'client_state') and
             newly_ready_worker_data["websocket"].client_state.value == 1):
-        print(f"Pairing: Newly ready worker '{newly_ready_worker_id}' is not valid, lacks UDP info, or WebSocket is disconnected. Cannot initiate pairing.")
+        print(f"Pairing: Newly ready worker '{newly_ready_worker_id}' is not valid or WebSocket is disconnected. Cannot initiate pairing.")
         if newly_ready_worker_id in workers_ready_for_pairing:
             workers_ready_for_pairing.remove(newly_ready_worker_id)
         # Also ensure it's removed from connected_workers if its WebSocket is truly gone or invalid
-        if newly_ready_worker_id in connected_workers and (not newly_ready_worker_data or not newly_ready_worker_data.get("websocket") or 
-                                                        not hasattr(newly_ready_worker_data.get("websocket"), 'client_state') or
-                                                        newly_ready_worker_data.get("websocket").client_state.value != 1):
+        if newly_ready_worker_id in connected_workers and (not newly_ready_worker_data or not newly_ready_worker_data.get("websocket") or
+                                                            not hasattr(newly_ready_worker_data.get("websocket"), 'client_state') or
+                                                            newly_ready_worker_data.get("websocket").client_state.value != 1):
             del connected_workers[newly_ready_worker_id]
             print(f"Cleaned up disconnected newly_ready_worker_id '{newly_ready_worker_id}' from connected_workers.")
         return
@@ -61,8 +60,6 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
     extra_candidates = [wid for wid, wdata in connected_workers.items()
                         if wid not in workers_ready_for_pairing
                         and wid != newly_ready_worker_id
-                        and wdata.get("stun_reported_udp_ip")
-                        and wdata.get("stun_reported_udp_port")
                         and wdata.get("websocket")
                         and hasattr(wdata["websocket"], 'client_state')
                         and wdata["websocket"].client_state.value == 1]
@@ -74,9 +71,9 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
     for worker_id in candidate_ids:
         worker_data = connected_workers.get(worker_id)
         # Check if worker is still valid and its WebSocket is connected
-        if not (worker_data and worker_data.get("stun_reported_udp_ip") and 
-                worker_data.get("websocket") and 
-                hasattr(worker_data["websocket"], 'client_state') and 
+        if not (worker_data and
+                worker_data.get("websocket") and
+                hasattr(worker_data["websocket"], 'client_state') and
                 worker_data["websocket"].client_state.value == 1):
             
             print(f"Pairing: Worker '{worker_id}' in ready_list is stale or disconnected. Removing.")
@@ -106,8 +103,6 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
 
         # Final check for data integrity and WebSocket state before sending offers
         if not (peer_a_data and peer_b_data and
-                peer_a_data.get("stun_reported_udp_ip") and peer_a_data.get("stun_reported_udp_port") and
-                peer_b_data.get("stun_reported_udp_ip") and peer_b_data.get("stun_reported_udp_port") and
                 peer_a_data.get("websocket") and hasattr(peer_a_data["websocket"], 'client_state') and peer_a_data["websocket"].client_state.value == 1 and
                 peer_b_data.get("websocket") and hasattr(peer_b_data["websocket"], 'client_state') and peer_b_data["websocket"].client_state.value == 1):
             
@@ -131,17 +126,17 @@ async def attempt_to_pair_workers(newly_ready_worker_id: str):
         peer_a_ws = peer_a_data["websocket"]
         peer_b_ws = peer_b_data["websocket"]
 
-        offer_to_b_payload = { 
+        offer_to_b_payload = {
             "type": "p2p_connection_offer",
             "peer_worker_id": peer_a_id,
-            "peer_udp_ip": peer_a_data["stun_reported_udp_ip"],
-            "peer_udp_port": peer_a_data["stun_reported_udp_port"]
+            "peer_tcp_ip": peer_a_data.get("websocket_observed_ip"),
+            "peer_tcp_port": peer_a_data.get("websocket_observed_port")
         }
-        offer_to_a_payload = { 
+        offer_to_a_payload = {
             "type": "p2p_connection_offer",
             "peer_worker_id": peer_b_id,
-            "peer_udp_ip": peer_b_data["stun_reported_udp_ip"],
-            "peer_udp_port": peer_b_data["stun_reported_udp_port"]
+            "peer_tcp_ip": peer_b_data.get("websocket_observed_ip"),
+            "peer_tcp_port": peer_b_data.get("websocket_observed_port")
         }
 
         try:
@@ -179,14 +174,15 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
             workers_ready_for_pairing.remove(worker_id)
 
     connected_workers[worker_id] = {
-        "websocket_observed_ip": client_host, 
-        "websocket_observed_port": client_port, 
+        "websocket_observed_ip": client_host,
+        "websocket_observed_port": client_port,
         "websocket": websocket,
-        "stun_reported_udp_ip": None, 
+        "stun_reported_udp_ip": None,
         "stun_reported_udp_port": None,
         "http_reported_public_ip": None # Field for general public IP
     }
     print(f"Worker '{worker_id}' registered. WebSocket EP: {client_host}:{client_port}. Total: {len(connected_workers)}")
+    await attempt_to_pair_workers(worker_id)
 
     try:
         while True: 

@@ -21,6 +21,7 @@ import base64 # For encoding benchmark payload
 worker_id = str(uuid.uuid4())
 stop_signal_received = False
 p2p_udp_transport: Optional[asyncio.DatagramTransport] = None
+p2p_tcp_server: Optional[asyncio.AbstractServer] = None
 our_stun_discovered_udp_ip: Optional[str] = None
 our_stun_discovered_udp_port: Optional[int] = None
 current_p2p_peer_id: Optional[str] = None
@@ -29,6 +30,7 @@ current_p2p_peer_addr: Optional[Tuple[str, int]] = None
 DEFAULT_STUN_HOST = os.environ.get("STUN_HOST", "stun.l.google.com")
 DEFAULT_STUN_PORT = int(os.environ.get("STUN_PORT", "19302"))
 INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "8081"))
+INTERNAL_TCP_PORT = int(os.environ.get("INTERNAL_TCP_PORT", "8082"))
 HTTP_PORT_FOR_UI = int(os.environ.get("PORT", 8080))
 
 ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
@@ -38,12 +40,18 @@ benchmark_sessions: Dict[str, Dict] = {} # Key: peer_addr_str, Value: {received_
 BENCHMARK_CHUNK_SIZE = 1024 # 1KB
 
 def handle_shutdown_signal(signum, frame):
-    global stop_signal_received, p2p_udp_transport
+    global stop_signal_received, p2p_udp_transport, p2p_tcp_server
     print(f"Shutdown signal ({signum}) received. Worker '{worker_id}' attempting graceful shutdown.")
     stop_signal_received = True
     if p2p_udp_transport:
         try: p2p_udp_transport.close(); print(f"Worker '{worker_id}': P2P UDP transport closed.")
         except Exception as e: print(f"Worker '{worker_id}': Error closing P2P UDP transport: {e}")
+    if p2p_tcp_server:
+        try:
+            p2p_tcp_server.close()
+            print(f"Worker '{worker_id}': P2P TCP server closed.")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error closing P2P TCP server: {e}")
     for ws_client in list(ui_websocket_clients):
         asyncio.create_task(ws_client.close(reason="Server shutting down"))
 
@@ -214,10 +222,54 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
         except json.JSONDecodeError: print(f"Worker '{self.worker_id}': Received non-JSON UDP packet from {addr}: {message_str}")
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
-    def connection_lost(self, exc: Optional[Exception]): 
+    def connection_lost(self, exc: Optional[Exception]):
         global p2p_udp_transport
         print(f"Worker '{self.worker_id}': P2P UDP listener connection lost: {exc if exc else 'Closed normally'}")
         if self.transport == p2p_udp_transport: p2p_udp_transport = None
+
+# --- TCP Hole Punching Helpers ---
+
+async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    addr = writer.get_extra_info('peername')
+    data = await reader.read(1024)
+    message = data.decode(errors='ignore')
+    print(f"Worker '{worker_id}': Received TCP data from {addr}: {message}")
+    writer.close()
+    await writer.wait_closed()
+
+async def start_tcp_listener():
+    global p2p_tcp_server, worker_id
+    if p2p_tcp_server:
+        return
+    p2p_tcp_server = await asyncio.start_server(handle_tcp_client, '0.0.0.0', INTERNAL_TCP_PORT)
+    addr = p2p_tcp_server.sockets[0].getsockname()
+    print(f"Worker '{worker_id}': P2P TCP listener active on {addr}.")
+
+async def start_tcp_hole_punch(peer_ip: str, peer_port: int, peer_worker_id: str):
+    global current_p2p_peer_id, current_p2p_peer_addr, worker_id
+    current_p2p_peer_id = peer_worker_id
+    current_p2p_peer_addr = (peer_ip, peer_port)
+    print(f"Worker '{worker_id}': Attempting TCP hole punch to '{peer_worker_id}' at {current_p2p_peer_addr}")
+    try:
+        reader, writer = await asyncio.open_connection(peer_ip, peer_port)
+        writer.write(f"HELLO_FROM_{worker_id}".encode())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        print(f"Worker '{worker_id}': TCP hole punch attempt sent to {peer_worker_id}.")
+    except Exception as e:
+        print(f"Worker '{worker_id}': TCP hole punch connection error: {e}")
+
+async def attempt_tcp_hole_punch_when_ready(peer_ip: str, peer_port: int, peer_worker_id: str, max_wait_sec: float = 10.0, check_interval: float = 0.5):
+    global p2p_tcp_server, stop_signal_received
+    waited = 0.0
+    while not stop_signal_received and waited < max_wait_sec:
+        if p2p_tcp_server:
+            await start_tcp_hole_punch(peer_ip, peer_port, peer_worker_id)
+            return
+        await asyncio.sleep(check_interval)
+        waited += check_interval
+    print(f"Worker '{worker_id}': Gave up waiting ({waited:.1f}s) for TCP listener before hole punching '{peer_worker_id}'.")
 
 async def discover_and_report_stun_udp_endpoint(websocket_conn_to_rendezvous):
     global our_stun_discovered_udp_ip, our_stun_discovered_udp_port, worker_id, INTERNAL_UDP_PORT
@@ -309,12 +361,13 @@ async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, pe
     )
 
 async def connect_to_rendezvous(rendezvous_ws_url: str):
-    global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
+    global stop_signal_received, p2p_udp_transport, p2p_tcp_server, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
     ip_echo_service_url = "https://api.ipify.org"
     ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
     ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
     STUN_RECHECK_INTERVAL = float(os.environ.get("STUN_RECHECK_INTERVAL_SEC", "300")) # Default 5 minutes
     udp_listener_active = False
+    tcp_listener_active = False
     loop = asyncio.get_running_loop()
     last_stun_recheck_time = 0.0 # Initialize
 
@@ -354,6 +407,13 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                         udp_listener_active = True
                     except Exception as e_udp_listen:
                         print(f"Worker '{worker_id}': Failed to create P2P UDP datagram endpoint on 0.0.0.0:{INTERNAL_UDP_PORT}: {e_udp_listen}")
+
+                if not tcp_listener_active:
+                    try:
+                        await start_tcp_listener()
+                        tcp_listener_active = True
+                    except Exception as e_tcp_listen:
+                        print(f"Worker '{worker_id}': Failed to start TCP listener on 0.0.0.0:{INTERNAL_TCP_PORT}: {e_tcp_listen}")
                 
                 while not stop_signal_received:
                     try:
@@ -363,12 +423,11 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                         msg_type = message_data.get("type")
                         if msg_type == "p2p_connection_offer":
                             peer_id = message_data.get("peer_worker_id")
-                            peer_ip = message_data.get("peer_udp_ip")
-                            peer_port = message_data.get("peer_udp_port")
+                            peer_ip = message_data.get("peer_tcp_ip")
+                            peer_port = message_data.get("peer_tcp_port")
                             if peer_id and peer_ip and peer_port:
                                 print(f"Worker '{worker_id}': Received P2P offer for peer '{peer_id}' at {peer_ip}:{peer_port}")
-                                # Always schedule an attempt, letting the helper wait until the listener is ready.
-                                asyncio.create_task(attempt_hole_punch_when_ready(peer_ip, int(peer_port), peer_id))
+                                asyncio.create_task(attempt_tcp_hole_punch_when_ready(peer_ip, int(peer_port), peer_id))
                         elif msg_type == "udp_endpoint_ack": print(f"Worker '{worker_id}': UDP Endpoint Ack: {message_data.get('status')}")
                         elif msg_type == "echo_response": print(f"Worker '{worker_id}': Echo Response: {message_data.get('processed_by_rendezvous')}")
                         else: print(f"Worker '{worker_id}': Unhandled message from Rendezvous: {msg_type}")
@@ -415,13 +474,17 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
         finally: 
-            if p2p_listener_transport_local_ref: 
+            if p2p_listener_transport_local_ref:
                 print(f"Worker '{worker_id}': Closing local P2P UDP transport (asyncio wrapper) from this WS session.")
                 p2p_listener_transport_local_ref.close()
                 # If this transport was the global one, clear the global reference
                 if p2p_udp_transport == p2p_listener_transport_local_ref:
                     p2p_udp_transport = None
                 udp_listener_active = False # Allow re-creation of transport on next connection
+            if p2p_tcp_server:
+                p2p_tcp_server.close()
+                p2p_tcp_server = None
+                tcp_listener_active = False
         if not stop_signal_received: await asyncio.sleep(10)
         else: break
 
@@ -462,6 +525,12 @@ async def main_async_orchestrator():
                 print(f"Worker '{worker_id}': P2P UDP transport closed from main_async_orchestrator finally.")
             except Exception as e_close_transport:
                 print(f"Worker '{worker_id}': Error closing P2P UDP transport in main_async_orchestrator: {e_close_transport}")
+        if p2p_tcp_server:
+            try:
+                p2p_tcp_server.close()
+                print(f"Worker '{worker_id}': P2P TCP server closed from main_async_orchestrator finally.")
+            except Exception as e_close_tcp:
+                print(f"Worker '{worker_id}': Error closing P2P TCP server in main_async_orchestrator: {e_close_tcp}")
 
 if __name__ == "__main__":
     print(f"WORKER SCRIPT (ID: {worker_id}): Initializing...")
