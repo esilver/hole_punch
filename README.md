@@ -21,6 +21,7 @@ export RENDEZVOUS_IMAGE_TAG="v_ip_update"
 export AR_WORKER_REPO_NAME="ip-worker-repo"
 export WORKER_SERVICE_NAME="ip-worker-service"
 export WORKER_IMAGE_TAG="v_ip_update"
+export BENCHMARK_CHUNK_SIZE="8192" # Default chunk size for benchmark
 ```
 
 ## Build Rendezvous Service
@@ -80,7 +81,7 @@ gcloud run deploy ${WORKER_SERVICE_NAME} \
   --region ${REGION} \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_URL},STUN_HOST=stun.l.google.com,STUN_PORT=19302,INTERNAL_UDP_PORT=8081,PING_INTERVAL_SEC=25,PING_TIMEOUT_SEC=25,BENCHMARK_GCS_URL=${BENCHMARK_GCS_URL}" \
+  --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_URL},STUN_HOST=stun.l.google.com,STUN_PORT=19302,INTERNAL_UDP_PORT=8081,PING_INTERVAL_SEC=25,PING_TIMEOUT_SEC=25,BENCHMARK_GCS_URL=${BENCHMARK_GCS_URL},BENCHMARK_CHUNK_SIZE=${BENCHMARK_CHUNK_SIZE}" \
   --vpc-egress=all-traffic \
   --network=ip-worker-vpc \
   --subnet=ip-worker-subnet \

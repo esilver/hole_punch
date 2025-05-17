@@ -36,7 +36,7 @@ ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
 
 # Benchmark related globals
 benchmark_sessions: Dict[str, Dict] = {} # Key: peer_addr_str, Value: {received_bytes, received_chunks, start_time, total_chunks (from sender)}
-BENCHMARK_CHUNK_SIZE = 1024 # 1KB
+BENCHMARK_CHUNK_SIZE = int(os.environ.get("BENCHMARK_CHUNK_SIZE", "1024")) # Read from env, default 1KB
 BENCHMARK_FILE_URL = os.environ.get("BENCHMARK_GCS_URL")
 
 async def download_benchmark_file() -> bytes:
@@ -120,17 +120,19 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, _size_kb: in
                 break
 
             chunk = file_bytes[i * BENCHMARK_CHUNK_SIZE : (i + 1) * BENCHMARK_CHUNK_SIZE]
-            payload = {"type": "benchmark_chunk", "seq": i, "payload": base64.b64encode(chunk).decode('ascii'), "from_worker_id": worker_id}
-            data_to_send = json.dumps(payload).encode()
-            p2p_udp_transport.sendto(data_to_send, (target_ip, target_port))
-            bytes_sent += len(data_to_send)
+            # Binary packet: 4-byte big-endian sequence number + raw chunk bytes
+            seq_header = i.to_bytes(4, "big")
+            packet = seq_header + chunk
+            p2p_udp_transport.sendto(packet, (target_ip, target_port))
+            bytes_sent += len(packet)
             if (i + 1) % (num_chunks // 10 if num_chunks >= 10 else 1) == 0:
                 progress_msg = f"Benchmark Send: Sent {i+1}/{num_chunks} chunks ({bytes_sent / 1024:.2f} KB)..."
                 print(f"Worker '{worker_id}': {progress_msg}")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
         else:
-            end_payload = {"type": "benchmark_end", "total_chunks": num_chunks, "from_worker_id": worker_id}
-            p2p_udp_transport.sendto(json.dumps(end_payload).encode(), (target_ip, target_port))
+            # Send 0xFFFFFFFF as a 4-byte sequence to mark end of transfer
+            end_marker = (0xFFFFFFFF).to_bytes(4, "big")
+            p2p_udp_transport.sendto(end_marker, (target_ip, target_port))
             print(f"Worker '{worker_id}': Sent benchmark_end marker to {target_ip}:{target_port}")
 
             end_time = time.monotonic()
@@ -199,56 +201,101 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT}).")
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
         global current_p2p_peer_addr, current_p2p_peer_id, benchmark_sessions
-        # print(f"Worker '{self.worker_id}': ENTERED datagram_received from {addr}. Raw data length: {len(data)}") # Too verbose for every packet
-        message_str = data.decode(errors='ignore')
+        # Attempt to treat packet as JSON first; if that fails, fall back to binary benchmark handling
         try:
+            message_str = data.decode()
             p2p_message = json.loads(message_str)
-            msg_type = p2p_message.get("type")
-            from_id = p2p_message.get("from_worker_id")
+            is_json = True
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            is_json = False
 
-            if from_id and current_p2p_peer_id and from_id != current_p2p_peer_id:
-                print(f"Worker '{self.worker_id}': WARNING - Received P2P message from '{from_id}' but current peer is '{current_p2p_peer_id}'. Addr: {addr}")
-            elif not from_id and msg_type not in ["benchmark_chunk", "benchmark_end"]: # Benchmark chunks might not have from_id if an old client is used.
-                print(f"Worker '{self.worker_id}': WARNING - Received P2P message of type '{msg_type}' without 'from_worker_id'. Addr: {addr}")
-
-            if msg_type == "chat_message":
-                content = p2p_message.get("content")
-                print(f"Worker '{self.worker_id}': Received P2P chat from '{from_id}' (expected: '{current_p2p_peer_id}'): '{content}'")
-                for ui_client_ws in list(ui_websocket_clients): 
-                    # print(f"WORKER '{self.worker_id}': Attempting to send to UI client: {ui_client_ws.remote_address}") # Too verbose
-                    asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_message_received", "from_peer_id": from_id, "content": content}))) 
-            elif msg_type == "p2p_test_data": # Legacy, can remove if benchmark uses benchmark_chunk
-                test_data_content = p2p_message.get("data")
-                print(f"Worker '{self.worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
-            elif msg_type == "benchmark_chunk": # NEW
-                seq = p2p_message.get("seq", -1)
-                payload_b64 = p2p_message.get("payload", "")
-                # payload_bytes = base64.b64decode(payload_b64) # Not strictly needed to decode on receiver for throughput test
-                peer_addr_str = str(addr)
-                if peer_addr_str not in benchmark_sessions:
-                    benchmark_sessions[peer_addr_str] = {"received_bytes": 0, "received_chunks": 0, "start_time": time.monotonic(), "total_chunks": -1, "from_worker_id": from_id}
-                session = benchmark_sessions[peer_addr_str]
-                session["received_bytes"] += len(message_str) # Approx size of JSON string
-                session["received_chunks"] += 1
-                if session["received_chunks"] % 100 == 0: # Log progress periodically
-                    print(f"Worker '{self.worker_id}': Benchmark data received from {from_id}@{peer_addr_str}: {session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB")
-            elif msg_type == "benchmark_end": # NEW
-                total_chunks_sent = p2p_message.get("total_chunks", 0)
-                peer_addr_str = str(addr)
+        if not is_json:
+            # Binary benchmark path – first 4 bytes = sequence number (big-endian)
+            if len(data) < 4:
+                return  # Ignore too-short packets
+            seq = int.from_bytes(data[:4], "big")
+            peer_addr_str = str(addr)
+            if seq == 0xFFFFFFFF:  # End marker
                 if peer_addr_str in benchmark_sessions:
                     session = benchmark_sessions[peer_addr_str]
-                    session["total_chunks"] = total_chunks_sent
+                    session["total_chunks"] = session["received_chunks"]
                     duration = time.monotonic() - session["start_time"]
                     throughput_kbps = (session["received_bytes"] / 1024) / duration if duration > 0 else 0
-                    status_msg = f"Benchmark Receive from {session['from_worker_id']} Complete: Received {session['received_chunks']}/{total_chunks_sent} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
+                    status_msg = (
+                        f"Benchmark Receive from {session.get('from_worker_id', 'peer')} Complete: "
+                        f"Received {session['received_chunks']} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. "
+                        f"Throughput: {throughput_kbps:.2f} KB/s"
+                    )
                     print(f"Worker '{self.worker_id}': {status_msg}")
                     for ui_client_ws in list(ui_websocket_clients):
                         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "benchmark_status", "message": status_msg})))
-                    del benchmark_sessions[peer_addr_str] # Clear session
-                else:
-                    print(f"Worker '{self.worker_id}': Received benchmark_end from unknown session/peer {addr}")     
-            elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
-        except json.JSONDecodeError: print(f"Worker '{self.worker_id}': Received non-JSON UDP packet from {addr}: {message_str}")
+                    del benchmark_sessions[peer_addr_str]
+                return
+
+            # Regular chunk packet
+            if peer_addr_str not in benchmark_sessions:
+                benchmark_sessions[peer_addr_str] = {
+                    "received_bytes": 0,
+                    "received_chunks": 0,
+                    "start_time": time.monotonic(),
+                    "from_worker_id": current_p2p_peer_id,
+                }
+            session = benchmark_sessions[peer_addr_str]
+            session["received_bytes"] += len(data)
+            session["received_chunks"] += 1
+            if session["received_chunks"] % 100 == 0:
+                print(
+                    f"Worker '{self.worker_id}': Benchmark data received from peer@{peer_addr_str}: "
+                    f"{session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB"
+                )
+            return  # Binary packet handled – stop here
+
+        # ==== Existing JSON handling path below (runs only if is_json is True) ====
+        msg_type = p2p_message.get("type")
+        from_id = p2p_message.get("from_worker_id")
+
+        if from_id and current_p2p_peer_id and from_id != current_p2p_peer_id:
+            print(f"Worker '{self.worker_id}': WARNING - Received P2P message from '{from_id}' but current peer is '{current_p2p_peer_id}'. Addr: {addr}")
+        elif not from_id and msg_type not in ["benchmark_chunk", "benchmark_end"]: # Benchmark chunks might not have from_id if an old client is used.
+            print(f"Worker '{self.worker_id}': WARNING - Received P2P message of type '{msg_type}' without 'from_worker_id'. Addr: {addr}")
+
+        if msg_type == "chat_message":
+            content = p2p_message.get("content")
+            print(f"Worker '{self.worker_id}': Received P2P chat from '{from_id}' (expected: '{current_p2p_peer_id}'): '{content}'")
+            for ui_client_ws in list(ui_websocket_clients): 
+                # print(f"WORKER '{self.worker_id}': Attempting to send to UI client: {ui_client_ws.remote_address}") # Too verbose
+                asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_message_received", "from_peer_id": from_id, "content": content}))) 
+        elif msg_type == "p2p_test_data": # Legacy, can remove if benchmark uses benchmark_chunk
+            test_data_content = p2p_message.get("data")
+            print(f"Worker '{self.worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
+        elif msg_type == "benchmark_chunk": # NEW
+            seq = p2p_message.get("seq", -1)
+            payload_b64 = p2p_message.get("payload", "")
+            # payload_bytes = base64.b64decode(payload_b64) # Not strictly needed to decode on receiver for throughput test
+            peer_addr_str = str(addr)
+            if peer_addr_str not in benchmark_sessions:
+                benchmark_sessions[peer_addr_str] = {"received_bytes": 0, "received_chunks": 0, "start_time": time.monotonic(), "total_chunks": -1, "from_worker_id": from_id}
+            session = benchmark_sessions[peer_addr_str]
+            session["received_bytes"] += len(message_str) # Approx size of JSON string
+            session["received_chunks"] += 1
+            if session["received_chunks"] % 100 == 0: # Log progress periodically
+                print(f"Worker '{self.worker_id}': Benchmark data received from {from_id}@{peer_addr_str}: {session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB")
+        elif msg_type == "benchmark_end": # NEW
+            total_chunks_sent = p2p_message.get("total_chunks", 0)
+            peer_addr_str = str(addr)
+            if peer_addr_str in benchmark_sessions:
+                session = benchmark_sessions[peer_addr_str]
+                session["total_chunks"] = total_chunks_sent
+                duration = time.monotonic() - session["start_time"]
+                throughput_kbps = (session["received_bytes"] / 1024) / duration if duration > 0 else 0
+                status_msg = f"Benchmark Receive from {session['from_worker_id']} Complete: Received {session['received_chunks']}/{total_chunks_sent} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
+                print(f"Worker '{self.worker_id}': {status_msg}")
+                for ui_client_ws in list(ui_websocket_clients):
+                    asyncio.create_task(ui_client_ws.send(json.dumps({"type": "benchmark_status", "message": status_msg})))
+                del benchmark_sessions[peer_addr_str] # Clear session
+            else:
+                print(f"Worker '{self.worker_id}': Received benchmark_end from unknown session/peer {addr}")     
+        elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
     def connection_lost(self, exc: Optional[Exception]): 
         global p2p_udp_transport
