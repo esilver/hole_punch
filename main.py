@@ -11,6 +11,7 @@ import requests
 import json
 import socket
 import stun # pystun3
+import sys # Added for sys.exit()
 from typing import Optional, Tuple, Set, Dict
 from pathlib import Path
 from websockets.server import serve as websockets_serve
@@ -21,6 +22,7 @@ import base64 # For encoding benchmark payload
 # --- Global Variables ---
 worker_id = str(uuid.uuid4())
 stop_signal_received = False
+active_rendezvous_websocket: Optional[websockets.WebSocketClientProtocol] = None # Added for explicit deregister
 p2p_udp_transport: Optional[asyncio.DatagramTransport] = None
 our_stun_discovered_udp_ip: Optional[str] = None
 our_stun_discovered_udp_port: Optional[int] = None
@@ -150,8 +152,9 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, _size_kb: in
         print(f"Worker '{worker_id}': {error_msg}")
         if not ui_ws.closed:
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {error_msg}"}))
+
 async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, path: str):
-    global ui_websocket_clients, worker_id, current_p2p_peer_id, p2p_udp_transport, current_p2p_peer_addr
+    global ui_websocket_clients, worker_id, current_p2p_peer_id, p2p_udp_transport, current_p2p_peer_addr, active_rendezvous_websocket
     ui_websocket_clients.add(websocket)
     print(f"Worker '{worker_id}': UI WebSocket client connected from {websocket.remote_address}")
     try:
@@ -180,6 +183,58 @@ async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, pa
                         asyncio.create_task(benchmark_send_udp_data(current_p2p_peer_addr[0], current_p2p_peer_addr[1], size_kb, websocket))
                     else:
                         await websocket.send(json.dumps({"type": "benchmark_status", "message": "Error: No P2P peer to start benchmark with."}))
+                elif msg_type == "restart_worker_request":
+                    print(f"Worker '{worker_id}': Received restart_worker_request from UI. Attempting explicit deregistration.")
+                    
+                    # Attempt to explicitly deregister from Rendezvous
+                    if active_rendezvous_websocket:
+                        try:
+                            deregister_payload = json.dumps({"type": "explicit_deregister", "worker_id": worker_id})
+                            await asyncio.wait_for(active_rendezvous_websocket.send(deregister_payload), timeout=2.0)
+                            print(f"Worker '{worker_id}': Sent explicit_deregister to Rendezvous.")
+                        except asyncio.TimeoutError:
+                            print(f"Worker '{worker_id}': Timeout sending explicit_deregister to Rendezvous.")
+                        except Exception as e_dereg:
+                            print(f"Worker '{worker_id}': Error sending explicit_deregister: {e_dereg}")
+                    else:
+                        print(f"Worker '{worker_id}': No active Rendezvous WebSocket to send explicit_deregister.")
+
+                    # Proceed with UI notification and shutdown
+                    await websocket.send(json.dumps({"type": "system_message", "message": "Worker is restarting..."}))
+                    await websocket.close(code=1000, reason="Worker restarting")
+                    asyncio.create_task(delayed_exit(1))
+                elif msg_type == "redo_stun_request":
+                    # UI requests redoing STUN discovery and re-registering with the Rendezvous
+                    if active_rendezvous_websocket:
+                        # First, close existing UDP listener (releasing port) if present
+                        if p2p_udp_transport:
+                            try:
+                                p2p_udp_transport.close()
+                                p2p_udp_transport = None
+                                print(f"Worker '{worker_id}': Closed existing UDP listener prior to STUN re-discovery.")
+                            except Exception as e_close_udp:
+                                print(f"Worker '{worker_id}': Error closing UDP transport before STUN re-discovery: {e_close_udp}")
+                                await websocket.send(json.dumps({"type": "error", "message": f"Could not close existing UDP listener: {type(e_close_udp).__name__} - {e_close_udp}"}))
+                        try:
+                            stun_success = await discover_and_report_stun_udp_endpoint(active_rendezvous_websocket)
+                            if stun_success:
+                                await websocket.send(json.dumps({"type": "system_message", "message": "STUN re-discovery successful and endpoint re-registered with Rendezvous."}))
+                            else:
+                                await websocket.send(json.dumps({"type": "error", "message": "STUN re-discovery failed. Check backend logs for details."}))
+                        except Exception as e_stun:
+                            await websocket.send(json.dumps({"type": "error", "message": f"Error during STUN re-discovery: {type(e_stun).__name__} - {e_stun}"}))
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": "No active connection to Rendezvous service. Cannot re-register."}))
+
+                    # Notify UI client that this connection will close to allow reconnection
+                    try:
+                        await websocket.send(json.dumps({"type": "system_message", "message": "STUN re-discovery process finished. Closing UI WebSocket to refresh state…"}))
+                    except Exception:
+                        pass  # Ignore if can't send (e.g., already closing)
+                    try:
+                        await websocket.close(code=1000, reason="STUN rediscovery complete – please reconnect")
+                    except Exception:
+                        pass
             except json.JSONDecodeError: print(f"Worker '{worker_id}': UI WebSocket received non-JSON: {message_raw}")
             except Exception as e_ui_msg: print(f"Worker '{worker_id}': Error processing UI WebSocket message: {e_ui_msg}")
     except websockets.exceptions.ConnectionClosed: print(f"Worker '{worker_id}': UI WebSocket client {websocket.remote_address} disconnected.")
@@ -187,6 +242,11 @@ async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, pa
     finally:
         ui_websocket_clients.remove(websocket)
         print(f"Worker '{worker_id}': UI WebSocket client {websocket.remote_address} removed.")
+
+async def delayed_exit(delay_seconds: float):
+    await asyncio.sleep(delay_seconds)
+    print(f"Worker '{worker_id}': Executing delayed exit (forcing process termination).")
+    os._exit(0)  # Forcefully terminate the process to let Cloud Run restart the container
 
 class P2PUDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, worker_id_val: str):
@@ -392,7 +452,7 @@ async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, pe
     )
 
 async def connect_to_rendezvous(rendezvous_ws_url: str):
-    global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
+    global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port, active_rendezvous_websocket
     ip_echo_service_url = "https://api.ipify.org"
     ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
     ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
@@ -403,12 +463,14 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
 
     while not stop_signal_received:
         p2p_listener_transport_local_ref = None
+        active_rendezvous_websocket = None # Ensure it's None before attempting connection
         try:
             # Ensure explicit proxy=None to avoid automatic system proxy usage (websockets v15.0+ behavior)
             async with websockets.connect(rendezvous_ws_url, 
                                         ping_interval=ping_interval, 
                                         ping_timeout=ping_timeout,
                                         proxy=None) as ws_to_rendezvous:
+                active_rendezvous_websocket = ws_to_rendezvous # Set active connection
                 print(f"Worker '{worker_id}' connected to Rendezvous Service.")
                 try:
                     response = requests.get(ip_echo_service_url, timeout=10)
@@ -498,6 +560,7 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
         finally: 
+            active_rendezvous_websocket = None # Clear active connection on exit/error
             if p2p_listener_transport_local_ref: 
                 print(f"Worker '{worker_id}': Closing local P2P UDP transport (asyncio wrapper) from this WS session.")
                 p2p_listener_transport_local_ref.close()

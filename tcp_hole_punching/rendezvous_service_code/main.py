@@ -197,24 +197,19 @@ async def list_tcp_workers():
 
 @app.get("/discover_tcp_port")
 async def discover_tcp_port(request: Request):
-    """Endpoint used by workers to learn which NAT port their outbound connection is using.
-
-    It simply returns the client's apparent IP and *source* TCP port as observed by this
-    rendezvous instance. Workers can use this data to discover whether Cloud NAT preserves
-    their chosen source port or rewrites it. This is analogous to a very small subset of
-    STUN functionality, specialised for TCP.
-    """
     client = request.client
     if client is None:
-        return {"error": "Could not determine client address."}
+        logger.error("Port Discovery: Could not determine client address.")
+        # Return a 500 error or a clear JSON error response
+        return {"error": "Could not determine client address."}, 500
 
     client_ip, client_port = client.host, client.port
     logger.info(
-        "Port discovery request from %s:%s", client_ip, client_port
+        "Port discovery request from %s:%s (This is the IP:port as seen by Rendezvous)", client_ip, client_port
     )
     return {
-        "your_ip": client_ip,
-        "your_mapped_port": client_port,
+        "public_ip_seen_by_rendezvous": client_ip,
+        "port_seen_by_rendezvous": client_port,
     }
 
 if __name__ == "__main__":

@@ -6,14 +6,17 @@ import json
 import logging # <<< Added
 import os
 import signal
+import socket # NEW: For SO_REUSEPORT
 import sys # Added for sys.version_info
 import threading
 import uuid
 from typing import Any, Dict, Optional, List # Added List for type hinting
+import errno
 
 import requests # type: ignore
 import websockets # type: ignore
 import aiohttp # NEW: For async HTTP requests
+# import stun # REMOVED: For STUN-based NAT discovery (pip install pystun3)
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -33,13 +36,19 @@ WS_OPEN_TIMEOUT = float(os.getenv("WS_OPEN_TIMEOUT", "15.0"))
 WS_RECV_TIMEOUT = float(os.getenv("WS_RECV_TIMEOUT", "120.0"))
 LISTENER_READY_TIMEOUT = float(os.getenv("LISTENER_READY_TIMEOUT", "15.0"))
 P2P_MSG_TIMEOUT = float(os.getenv("P2P_MSG_TIMEOUT", "10.0"))
-EXTERNAL_ECHO_SERVER_HOST = os.getenv("EXTERNAL_ECHO_SERVER_HOST") # NEW
-EXTERNAL_ECHO_SERVER_PORT = int(os.getenv("EXTERNAL_ECHO_SERVER_PORT", "12345")) # NEW
-ECHO_CONNECT_TIMEOUT = float(os.getenv("ECHO_CONNECT_TIMEOUT", "20.0")) # NEW
-ECHO_READ_TIMEOUT = float(os.getenv("ECHO_READ_TIMEOUT", "20.0")) # NEW
-
+# STUN_HOST = os.getenv("STUN_HOST") # REMOVED: STUN server host
+# STUN_PORT = int(os.getenv("STUN_PORT", "3478")) # REMOVED: STUN server port
+# STUN_TIMEOUT = float(os.getenv("STUN_TIMEOUT", "10.0")) # REMOVED: Timeout for STUN query
+EXTERNAL_ECHO_SERVER_HOST = os.getenv("EXTERNAL_ECHO_SERVER_HOST") # REINSTATED
+EXTERNAL_ECHO_SERVER_PORT = int(os.getenv("EXTERNAL_ECHO_SERVER_PORT", "8080")) # REINSTATED (defaulted to 8080, was 12345)
+ECHO_CONNECT_TIMEOUT = float(os.getenv("ECHO_CONNECT_TIMEOUT", "20.0")) # REINSTATED
+ECHO_READ_TIMEOUT = float(os.getenv("ECHO_READ_TIMEOUT", "20.0")) # REINSTATED
 
 STOP_EVENT = asyncio.Event()
+
+# P2P connection retry parameters (override with env-vars if you like)
+P2P_CONNECT_MAX_RETRIES = int(os.getenv("P2P_CONNECT_MAX_RETRIES", "6"))  # total dial attempts
+P2P_RETRY_DELAY = float(os.getenv("P2P_RETRY_DELAY", "5.0"))              # seconds between attempts
 
 # ────────────────────── TCP helpers ──────────────────────
 async def handle_peer_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, role: str) -> None:
@@ -82,11 +91,42 @@ async def handle_peer_connection(reader: asyncio.StreamReader, writer: asyncio.S
 
 async def tcp_listener_task(ready_event: asyncio.Event) -> None:
     server: Optional[asyncio.AbstractServer] = None
+    # --- Manually create socket for SO_REUSEPORT --- 
+    listener_socket: Optional[socket.socket] = None
     try:
+        listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEPORT allows multiple sockets to bind to the same IP address and port.
+        # This is crucial if we want our outgoing P2P connection to also originate
+        # from INTERNAL_TCP_PORT while this listener is active.
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                logger.info(f"Worker {WORKER_ID} [TCP Server]: SO_REUSEPORT set on listener socket.")
+            except OSError as e_reuseport:
+                # Some systems might not support SO_REUSEPORT even if defined (e.g. Windows)
+                logger.warning(f"Worker {WORKER_ID} [TCP Server]: Failed to set SO_REUSEPORT: {e_reuseport}. TCP P2P from same port might fail.")
+        else:
+            logger.warning(f"Worker {WORKER_ID} [TCP Server]: SO_REUSEPORT not available on this system. TCP P2P from same port might fail.")
+        
+        try:
+            listener_socket.bind(("0.0.0.0", INTERNAL_TCP_PORT))
+        except OSError as e_bind:
+            if e_bind.errno == errno.EADDRINUSE:
+                logger.warning(
+                    f"Worker {WORKER_ID} [TCP Server]: Port {INTERNAL_TCP_PORT} already in use. "
+                    "Proceeding without server socket (client-only mode)."
+                )
+                ready_event.set()
+                return  # Skip starting the listener, stay alive for outbound dial
+            else:
+                raise
+        # The backlog for listen() is handled by asyncio.start_server if not specified via sock.listen() before passing.
+        # asyncio.start_server will call listen() on the passed socket if it hasn't been called.
+
         server = await asyncio.start_server(
             lambda r, w: handle_peer_connection(r, w, "server"),
-            "0.0.0.0",
-            INTERNAL_TCP_PORT
+            sock=listener_socket # Pass the pre-bound and option-set socket
         )
         if server.sockets:
             server_addr = server.sockets[0].getsockname()
@@ -107,52 +147,73 @@ async def tcp_listener_task(ready_event: asyncio.Event) -> None:
         logger.exception(f"Worker {WORKER_ID} [TCP Server]: Critical error.")
         STOP_EVENT.set() # Signal stop on critical listener error
     finally:
-        if server:
+        if server: # Server object exists
             logger.info(f"Worker {WORKER_ID} [TCP Server]: Shutting down listener.")
             server.close()
             try:
                 await server.wait_closed()
-            except Exception: # Handle potential errors during server close
+            except Exception:
                 logger.exception(f"Worker {WORKER_ID} [TCP Server]: Error during server.wait_closed().")
+        elif listener_socket: # Only socket was created, server failed before assignment
+            logger.info(f"Worker {WORKER_ID} [TCP Server]: Listener server not fully started, closing raw socket.")
+            listener_socket.close()
         else:
             logger.info(f"Worker {WORKER_ID} [TCP Server]: Listener was not started or already stopped.")
 
 
-async def attempt_p2p_tcp_connect(peer_public_ip: str, peer_internal_tcp_port: int) -> None:
+async def attempt_p2p_tcp_connect(peer_public_ip: str, peer_port_to_use: int) -> None: # Renamed peer_internal_tcp_port to peer_port_to_use
     logger.info(
-        f"Worker {WORKER_ID} [TCP Client]: Attempting to connect to peer {peer_public_ip}:{peer_internal_tcp_port} "
+        f"Worker {WORKER_ID} [TCP Client]: Attempting to connect to peer {peer_public_ip}:{peer_port_to_use} "
         f"from local port {INTERNAL_TCP_PORT}"
     )
+
     reader: Optional[asyncio.StreamReader] = None
     writer: Optional[asyncio.StreamWriter] = None
+    loop = asyncio.get_running_loop()
+
     try:
-        # Crucial part: binding the source port for the outgoing connection
-        # Timeout for the connection attempt itself can be managed by asyncio.wait_for if needed
-        # asyncio.open_connection itself doesn't have a direct timeout param like requests.get
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(
-            host=peer_public_ip,
-            port=peer_internal_tcp_port
-            # local_addr=('0.0.0.0', INTERNAL_TCP_PORT) # REMOVED: Let OS pick source port to avoid Errno 98
-        ), timeout=60.0) # Increased timeout to 60 seconds
+        # Create a custom client socket bound to INTERNAL_TCP_PORT with SO_REUSEPORT so
+        # it can coexist with the listener.
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError as e_rp:
+                logger.debug(f"SO_REUSEPORT not usable on P2P client socket: {e_rp}")
+
+        client_sock.bind(("0.0.0.0", INTERNAL_TCP_PORT))
+        client_sock.setblocking(False)
+
+        await asyncio.wait_for(
+            loop.sock_connect(client_sock, (peer_public_ip, peer_port_to_use)),
+            timeout=60.0,
+        )
+
+        reader, writer = await asyncio.open_connection(sock=client_sock)
 
         await handle_peer_connection(reader, writer, "client")
+
     except asyncio.TimeoutError:
-        logger.warning(f"Worker {WORKER_ID} [TCP Client]: Timeout connecting to {peer_public_ip}:{peer_internal_tcp_port}.")
+        logger.warning(
+            f"Worker {WORKER_ID} [TCP Client]: Timeout connecting to {peer_public_ip}:{peer_port_to_use}."
+        )
     except OSError as e:
         logger.warning(
-            f"Worker {WORKER_ID} [TCP Client]: OSError connecting to {peer_public_ip}:{peer_internal_tcp_port} "
-            f"(from local port {INTERNAL_TCP_PORT}): {e}" # Note: INTERNAL_TCP_PORT is still in log, but not used for bind
+            f"Worker {WORKER_ID} [TCP Client]: OSError connecting to {peer_public_ip}:{peer_port_to_use} "
+            f"(from local port {INTERNAL_TCP_PORT}): {e}"
         )
     except Exception:
-        logger.exception(f"Worker {WORKER_ID} [TCP Client]: Failed to connect to {peer_public_ip}:{peer_internal_tcp_port}.")
-    # No finally block here to close writer; handle_peer_connection does that.
-    # If open_connection fails, writer is None.
-    # STOP_EVENT is set by handle_peer_connection. If connect fails, listener continues for a while.
+        logger.exception(
+            f"Worker {WORKER_ID} [TCP Client]: Failed to connect to {peer_public_ip}:{peer_port_to_use}."
+        )
 
 
 async def discover_true_mapped_port(
     local_bind_ip: str,
-    local_bind_port: int
+    local_bind_port: int,
+    retry_attempts: int = 3, # Added retry logic
+    retry_delay_seconds: float = 8.0 # Increased delay to allow VM echo container to start
 ) -> Optional[Dict[str, Any]]:
     """
     Discovers the true public-facing (NAT mapped) IP and port for an outbound connection
@@ -168,198 +229,251 @@ async def discover_true_mapped_port(
         f"Worker {WORKER_ID}: Discovering true mapped port via external echo server "
         f"{EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} from {local_bind_ip}:{local_bind_port}"
     )
-    reader = None
-    writer = None
-    try:
-        # Connect to the external echo server from the specific internal port
-        logger.debug(f"Attempting to open connection to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} local_addr=({local_bind_ip}, {local_bind_port})")
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(
-            host=EXTERNAL_ECHO_SERVER_HOST,
-            port=EXTERNAL_ECHO_SERVER_PORT,
-            local_addr=(local_bind_ip, local_bind_port)
-        ), timeout=ECHO_CONNECT_TIMEOUT)
-        logger.debug(f"Connection established with external echo server.")
-
-        # Send a newline to prompt a response from simple echo servers
-        writer.write(b"\\n")
-        await writer.drain()
-        logger.debug(f"Sent data to external echo server.")
-
-        # Read the JSON response (e.g., up to a newline or specific byte count)
-        # Assuming the echo server sends a single line of JSON terminated by newline
-        response_bytes = await asyncio.wait_for(reader.readuntil(b'\\n'), timeout=ECHO_READ_TIMEOUT)
-        response_str = response_bytes.decode().strip()
-        logger.debug(f"Worker {WORKER_ID}: Received from external echo server: '{response_str}'")
-        
-        data = json.loads(response_str)
-        mapped_port_raw = data.get("mapped_public_port")
-        nat_public_ip_for_this_connection = data.get("public_ip") 
-
-        if mapped_port_raw is not None and nat_public_ip_for_this_connection is not None:
-            mapped_port = int(mapped_port_raw)
-            logger.info(
-                f"Worker {WORKER_ID}: True Mapped Public Port (from external echo): {mapped_port} "
-                f"on NAT Public IP: {nat_public_ip_for_this_connection}"
+    
+    for attempt in range(retry_attempts):
+        reader = None
+        writer = None
+        loop = asyncio.get_running_loop()
+        response_str = "<not_received>" # For logging in case of decode error
+        try:
+            logger.debug(
+                f"Attempt {attempt + 1}/{retry_attempts}: Opening connection to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} "
+                f"from local {local_bind_ip}:{local_bind_port} with custom socket"
             )
-            return {"ip": str(nat_public_ip_for_this_connection), "port": mapped_port}
+
+            # --- Create client socket manually so we can set SO_REUSEPORT ---
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError as e_rp:
+                    logger.debug(f"SO_REUSEPORT not usable on client socket: {e_rp}")
+            client_sock.bind((local_bind_ip, local_bind_port))
+            client_sock.setblocking(False)
+
+            await asyncio.wait_for(
+                loop.sock_connect(client_sock, (EXTERNAL_ECHO_SERVER_HOST, EXTERNAL_ECHO_SERVER_PORT)),
+                timeout=ECHO_CONNECT_TIMEOUT,
+            )
+
+            reader, writer = await asyncio.open_connection(sock=client_sock)
+            logger.debug(f"Connection established with external echo server.")
+
+            # Echo server expects a newline to trigger response, or responds immediately.
+            # Let's send a newline to be sure, as per original echo server design.
+            writer.write(b"\n") 
+            await writer.drain()
+            logger.debug(f"Sent newline to external echo server.")
+
+            response_bytes = await asyncio.wait_for(reader.readuntil(b'\n'), timeout=ECHO_READ_TIMEOUT)
+            response_str = response_bytes.decode().strip()
+            logger.debug(f"Worker {WORKER_ID}: Received from external echo server: '{response_str}'")
+            
+            data = json.loads(response_str)
+            mapped_port_raw = data.get("mapped_public_port")
+            nat_public_ip_for_this_connection = data.get("public_ip")
+
+            if mapped_port_raw is not None and nat_public_ip_for_this_connection is not None:
+                mapped_port = int(mapped_port_raw)
+                logger.info(
+                    f"Worker {WORKER_ID}: True Mapped Public Port (from external echo): {mapped_port} "
+                    f"on NAT Public IP: {nat_public_ip_for_this_connection} (Attempt {attempt + 1}/{retry_attempts})"
+                )
+                return {"ip": str(nat_public_ip_for_this_connection), "port": mapped_port}
+            else:
+                logger.warning(f"Worker {WORKER_ID}: Incomplete data from external echo server attempt {attempt + 1}/{retry_attempts}: {data}. Retrying...")
+            
+        except json.JSONDecodeError:
+            logger.warning(f"Worker {WORKER_ID}: Failed to decode JSON from external echo server (data: '{response_str}') attempt {attempt + 1}/{retry_attempts}. Retrying...")
+        except asyncio.TimeoutError:
+            logger.warning(f"Worker {WORKER_ID}: Timeout during echo discovery to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} attempt {attempt + 1}/{retry_attempts}. Retrying...")
+        except OSError as e_os:
+            logger.warning(
+                f"Worker {WORKER_ID}: OSError during echo discovery to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} "
+                f"(from {local_bind_ip}:{local_bind_port}), attempt {attempt + 1}/{retry_attempts}: {e_os}. Retrying..."
+            )
+        except Exception:
+            logger.exception(f"Worker {WORKER_ID}: Failed to discover mapped port from external echo server, attempt {attempt + 1}/{retry_attempts}. Retrying...")
+        finally:
+            if writer:
+                if not writer.is_closing():
+                    # logger.debug("Closing writer to external echo server.") # Too verbose for normal operation
+                    writer.close()
+                try:
+                    await writer.wait_closed()
+                    # logger.debug("Writer to external echo server closed.") # Too verbose
+                except Exception:
+                    logger.exception(f"Error closing writer to external echo server on attempt {attempt + 1}.")
+        
+        if attempt < retry_attempts - 1:
+            await asyncio.sleep(retry_delay_seconds)
         else:
-            logger.error(f"Worker {WORKER_ID}: Incomplete data from external echo server response: {data}")
+            logger.error(
+                f"Worker {WORKER_ID}: Failed to discover mapped port via echo server after {retry_attempts} attempts."
+            )
             return None
-    except json.JSONDecodeError:
-        logger.exception(f"Worker {WORKER_ID}: Failed to decode JSON from external echo server (data: '{response_str}').")
-        return None
-    except asyncio.TimeoutError:
-        logger.warning(f"Worker {WORKER_ID}: Timeout during STUN-like discovery to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT}")
-        return None
-    except OSError as e_os:
-        # Log specific OSError details which can be very helpful (e.g., Errno 98 Address already in use)
-        logger.warning(
-            f"Worker {WORKER_ID}: OSError during STUN-like discovery to {EXTERNAL_ECHO_SERVER_HOST}:{EXTERNAL_ECHO_SERVER_PORT} "
-            f"(from {local_bind_ip}:{local_bind_port}): {e_os}"
-        )
-        return None
-    except Exception:
-        logger.exception(f"Worker {WORKER_ID}: Failed to discover mapped port from external echo server.")
-        return None
-    finally:
-        if writer:
-            if not writer.is_closing():
-                logger.debug("Closing writer to external echo server.")
-                writer.close()
-            try:
-                await writer.wait_closed()
-                logger.debug("Writer to external echo server closed.")
-            except Exception as e_close:
-                 logger.exception(f"Error closing writer to external echo server: {e_close}")
+    return None # Should be unreachable
 
 
-async def rendezvous_client_and_p2p_manager() -> None:
-    if not RENDEZVOUS_URL:
-        logger.critical(f"Worker {WORKER_ID}: RENDEZVOUS_SERVICE_URL not set. Exiting.")
-        STOP_EVENT.set()
-        return
-    if not RENDEZVOUS_URL.startswith(("http://", "https://")):
-        logger.critical(f"Worker {WORKER_ID}: RENDEZVOUS_SERVICE_URL must start with http:// or https://. Value: '{RENDEZVOUS_URL}'. Exiting.")
-        STOP_EVENT.set()
-        return
-
-    ws_scheme = "wss" if RENDEZVOUS_URL.startswith("https://") else "ws"
-    base_url_no_scheme = RENDEZVOUS_URL.split("://", 1)[1]
-    full_rendezvous_ws_url = f"{ws_scheme}://{base_url_no_scheme.rstrip('/')}/ws/register_tcp/{WORKER_ID}"
-
-    # --- Public IP Discovery (General NAT IP) ---
+# NEW Test Function
+def test_internal_vs_external_ip_theory(rendezvous_http_url: str):
+    # This function is synchronous and will be run in an executor.
+    logger.info(f"Worker {WORKER_ID}: === Starting Internal vs. External IP Discovery Test ===")
     public_ip_from_ipify: Optional[str] = None
     try:
-        logger.info(f"Worker {WORKER_ID}: Determining public IP via api.ipify.org...")
-        # Using aiohttp for this call as well to keep things async
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.ipify.org", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                response.raise_for_status()
-                public_ip_from_ipify = (await response.text()).strip()
-                logger.info(f"Worker {WORKER_ID}: Public IP (ipify) discovered as {public_ip_from_ipify}")
-    except Exception as e: # Catching generic Exception for aiohttp and requests' potential errors
-        logger.warning(f"Worker {WORKER_ID}: Could not determine public IP from ipify ({type(e).__name__}): {e}.")
-        # If ipify fails, we must exit as we need some public IP reference.
-        logger.critical(f"Worker {WORKER_ID}: Failed to get any public IP reference. Exiting.")
+        logger.info(f"Worker {WORKER_ID}: Fetching public IP from ipify.org...")
+        response = requests.get("https://api.ipify.org", timeout=10)
+        response.raise_for_status()
+        public_ip_from_ipify = response.text.strip()
+        logger.info(f"Worker {WORKER_ID}: IP from ipify.org (External View): {public_ip_from_ipify}")
+    except requests.RequestException as e:
+        logger.error(f"Worker {WORKER_ID}: Could not get IP from ipify.org: {e}")
+        logger.info(f"Worker {WORKER_ID}: === IP Discovery Test Ended (ipify failed) ===")
+        return
+
+    if not rendezvous_http_url:
+        logger.error(f"Worker {WORKER_ID}: Rendezvous HTTP URL not provided for discovery test.")
+        logger.info(f"Worker {WORKER_ID}: === IP Discovery Test Ended (no rendezvous URL) ===")
+        return
+
+    discovery_target_url = f"{rendezvous_http_url.rstrip('/')}/discover_tcp_port"
+    ip_seen_by_rendezvous: Optional[str] = None
+    data_from_rendezvous = "<not received>"
+    try:
+        logger.info(f"Worker {WORKER_ID}: Calling Rendezvous' /discover_tcp_port at {discovery_target_url}...")
+        response = requests.get(discovery_target_url, timeout=15)
+        response.raise_for_status()
+        data_from_rendezvous = response.json()
+        ip_seen_by_rendezvous = data_from_rendezvous.get("public_ip_seen_by_rendezvous")
+        port_seen_by_rendezvous = data_from_rendezvous.get("port_seen_by_rendezvous")
+        logger.info(
+            f"Worker {WORKER_ID}: IP:Port seen by Rendezvous service (Internal/Optimized Path View): "
+            f"{ip_seen_by_rendezvous}:{port_seen_by_rendezvous}"
+        )
+    except requests.RequestException as e:
+        logger.error(f"Worker {WORKER_ID}: Could not get IP from Rendezvous /discover_tcp_port: {e} (Details: {response.text if 'response' in locals() else 'N/A'})")
+    except json.JSONDecodeError as e:
+        logger.error(f"Worker {WORKER_ID}: Could not parse JSON from Rendezvous /discover_tcp_port: {e} (Data: {data_from_rendezvous})")
+    except KeyError as e:
+        logger.error(f"Worker {WORKER_ID}: Unexpected JSON structure from Rendezvous /discover_tcp_port (missing key {e}): {data_from_rendezvous}")
+
+    if public_ip_from_ipify and ip_seen_by_rendezvous:
+        if public_ip_from_ipify == ip_seen_by_rendezvous:
+            logger.info(
+                f"Worker {WORKER_ID}: THEORY NOT SUPPORTED (or complex routing): "
+                f"IP from ipify ({public_ip_from_ipify}) MATCHES IP seen by Rendezvous "
+                f"({ip_seen_by_rendezvous})."
+            )
+        else:
+            logger.info(
+                f"Worker {WORKER_ID}: === THEORY SUPPORTED === "
+                f"IP from ipify ({public_ip_from_ipify}) DOES NOT MATCH IP seen by Rendezvous "
+                f"({ip_seen_by_rendezvous}). This suggests internal routing."
+            )
+    elif public_ip_from_ipify and not ip_seen_by_rendezvous:
+        logger.warning(f"Worker {WORKER_ID}: Could not determine IP seen by Rendezvous. Test inconclusive.")
+    else:
+        logger.warning(f"Worker {WORKER_ID}: Test inconclusive as external IP from ipify was not obtained.")
+    logger.info(f"Worker {WORKER_ID}: === IP Discovery Test Finished ===")
+
+async def rendezvous_client_and_p2p_manager() -> None:
+    """Manages WebSocket connection to rendezvous, NAT discovery, and P2P lifecycle."""
+    if not RENDEZVOUS_URL:
+        logger.critical("RENDEZVOUS_SERVICE_URL is not set. Cannot connect to rendezvous.")
         STOP_EVENT.set()
         return
 
-    # --- Discover True Mapped Port via External Echo Server ---
-    # This gives the specific NAT IP and Mapped Port for an outbound connection from INTERNAL_TCP_PORT.
-    # The IP from echo *should* match ipify_ip, but we prioritize the echo server's view for P2P.
-    nat_mapping_info = await discover_true_mapped_port("0.0.0.0", INTERNAL_TCP_PORT)
+    # ------------------------------------------------------------------
+    # Step 1.  NAT Mapping Discovery via External Echo Server
+    # ------------------------------------------------------------------
+    # We MUST run this *before* we start our local TCP listener so that the
+    # source port (INTERNAL_TCP_PORT) is free for the outbound socket.  When
+    # we previously started the listener first, the outbound dial failed with
+    # "address already in use" / "address family for hostname not supported"
+    # because Cloud Run (gVisor) does not allow another socket to bind to the
+    # same IP:PORT even with SO_REUSEPORT.
+    logger.info(
+        f"Worker {WORKER_ID}: Attempting external echo server discovery for local port {INTERNAL_TCP_PORT}"
+    )
 
-    p2p_public_ip_to_report: Optional[str] = None
-    p2p_mapped_port_to_report: Optional[int] = None
+    mapped_port_info: Optional[Dict[str, Any]] = await discover_true_mapped_port(
+        local_bind_ip="0.0.0.0",
+        local_bind_port=INTERNAL_TCP_PORT,
+    )
 
-    if nat_mapping_info:
-        p2p_public_ip_to_report = nat_mapping_info["ip"]
-        p2p_mapped_port_to_report = nat_mapping_info["port"]
-        if public_ip_from_ipify and p2p_public_ip_to_report != public_ip_from_ipify:
-            logger.warning(
-                f"Worker {WORKER_ID}: NAT Public IP from external echo ({p2p_public_ip_to_report}) "
-                f"differs from ipify's ({public_ip_from_ipify}). Using echo server's IP for P2P info."
-            )
+    # Give the OS a brief moment to release the port from the client socket's
+    # TIME_WAIT state before we try to re-bind it as a server.
+    await asyncio.sleep(0.5)
+
+    # ------------------------------------------------------------------
+    # Step 2.  Start the TCP listener (now that the discovery socket is
+    #          closed and the port is free again).
+    # ------------------------------------------------------------------
+    listener_ready_event = asyncio.Event()
+    listener_task = asyncio.create_task(tcp_listener_task(listener_ready_event))
+
+    if mapped_port_info:
+        mapped_public_port_for_listener = mapped_port_info.get("port")
+        discovered_public_ip = mapped_port_info.get("ip") # IP as seen by the echo server
+        logger.info(f"Worker {WORKER_ID}: Discovered public IP:Port {discovered_public_ip}:{mapped_public_port_for_listener} for internal port {INTERNAL_TCP_PORT} via echo server.")
     else:
         logger.error(
-            f"Worker {WORKER_ID}: Failed to discover true NAT-mapped public IP/port via external echo. "
-            "Using ipify IP and INTERNAL_TCP_PORT as fallback for rendezvous report (P2P likely to fail)."
+            f"Worker {WORKER_ID}: Failed to discover mapped public port using external echo server for internal port {INTERNAL_TCP_PORT}. "
+            "Proceeding without it, but TCP hole punching may fail."
         )
-        p2p_public_ip_to_report = public_ip_from_ipify # Fallback to general NAT IP
-        # Fallback to reporting internal port as mapped; less ideal than having no mapped port or a placeholder.
-        # Rendezvous server handles `None` for mapped_public_port, worker peer will then use peer_internal_tcp_port.
-        p2p_mapped_port_to_report = None # Explicitly None if discovery fails
-        logger.warning(
-             f"Worker {WORKER_ID}: Reporting to rendezvous: public_ip='{p2p_public_ip_to_report}', mapped_public_port=None (discovery failed)."
-        )
-        # Consider if P2P should be aborted if true mapping fails. For now, we proceed with fallback.
+        mapped_public_port_for_listener = None
+        discovered_public_ip = None # Ensure this is also None if discovery fails
 
-    listener_ready_event = asyncio.Event()
-    # Start the TCP listener task. It will set STOP_EVENT if it fails critically.
-    listener_task = asyncio.create_task(tcp_listener_task(listener_ready_event), name="TCPListenerTask")
-
-    logger.info(f"Worker {WORKER_ID}: Waiting for TCP listener (port {INTERNAL_TCP_PORT}) to be ready...")
+    # Wait for the TCP listener to be ready before trying to connect to rendezvous
     try:
+        logger.info(f"Worker {WORKER_ID}: Waiting for TCP listener on port {INTERNAL_TCP_PORT} to be ready...")
         await asyncio.wait_for(listener_ready_event.wait(), timeout=LISTENER_READY_TIMEOUT)
-        logger.info(f"Worker {WORKER_ID}: TCP listener is ready.")
+        logger.info(f"Worker {WORKER_ID}: TCP listener ready.")
     except asyncio.TimeoutError:
-        logger.critical(f"Worker {WORKER_ID}: Timeout waiting for TCP listener to start. Exiting.")
-        if not listener_task.done(): listener_task.cancel()
-        try: await listener_task
-        except asyncio.CancelledError: pass
-        STOP_EVENT.set() # Ensure main loop terminates if listener doesn't start
-        return
-    except Exception as e:
-        logger.critical(f"Worker {WORKER_ID}: Error waiting for TCP listener: {e}. Exiting.")
-        if not listener_task.done(): listener_task.cancel()
-        try: await listener_task
-        except asyncio.CancelledError: pass # Expected if cancelled
-        except Exception as e_inner: logger.error(f"Error during listener task await after failure: {e_inner}")
+        logger.critical(f"Worker {WORKER_ID}: TCP listener on port {INTERNAL_TCP_PORT} did not become ready in time. Shutting down.")
         STOP_EVENT.set()
-        return
-
-
-    if STOP_EVENT.is_set(): # Check if listener task failed and set STOP_EVENT
-        logger.warning(f"Worker {WORKER_ID}: Listener did not initialize correctly. Aborting rendezvous and P2P attempt.")
-        # Wait for the listener_task to finish if it's still running (e.g., during its own cleanup)
+        # Ensure listener_task is cancelled if it's stuck
         if not listener_task.done():
-            try: await asyncio.wait_for(listener_task, timeout=5.0)
-            except asyncio.TimeoutError: logger.warning("Timeout waiting for failed listener task to complete.")
-            except Exception as e: logger.warning(f"Error awaiting failed listener task: {e}")
-        return
+            listener_task.cancel()
+        try:
+            await listener_task # Allow cancellation to propagate
+        except asyncio.CancelledError:
+            logger.info(f"Worker {WORKER_ID}: Listener task successfully cancelled after timeout.")
+        return # Stop further execution
+
+    # --- Connection to Rendezvous Server ---
+    # Construct the WebSocket URL, ensuring ws:// or wss://
+    ws_scheme = "wss" if RENDEZVOUS_URL.startswith("https://") else "ws"
+    # Correctly extract base_url_no_scheme for ws/wss URL construction
+    if "://" in RENDEZVOUS_URL:
+        base_url_no_scheme = RENDEZVOUS_URL.split("://", 1)[1]
+    else:
+        base_url_no_scheme = RENDEZVOUS_URL # Assume it might be just host:port or host
+    full_rendezvous_ws_url = f"{ws_scheme}://{base_url_no_scheme.rstrip('/')}/ws/register_tcp/{WORKER_ID}"
 
     try:
         logger.info(f"Worker {WORKER_ID}: Connecting to Rendezvous server at {full_rendezvous_ws_url}")
-
-        # Prepare SSL context that forces HTTP/1.1 ALPN to avoid Cloud Run occasionally selecting HTTP/2, which
-        # the `websockets` library cannot parse. If the scheme is ws:// (plain-text), ssl_ctx will be None.
         ssl_ctx = None
         if full_rendezvous_ws_url.startswith("wss://"):
             import ssl
             ssl_ctx = ssl.create_default_context()
-            try:
-                # This attribute exists on modern OpenSSL / Python builds.
-                ssl_ctx.set_alpn_protocols(["http/1.1"])
-            except NotImplementedError:
-                # Older OpenSSL versions may not support ALPN; ignore.
-                pass
+            try: ssl_ctx.set_alpn_protocols(["http/1.1"])
+            except NotImplementedError: pass
 
         async with websockets.connect(
-            full_rendezvous_ws_url,
-            ping_interval=20,
-            open_timeout=WS_OPEN_TIMEOUT,
-            ssl=ssl_ctx,
+            full_rendezvous_ws_url, ping_interval=20, open_timeout=WS_OPEN_TIMEOUT, ssl=ssl_ctx
         ) as websocket:
             logger.info(f"Worker {WORKER_ID}: Connected to Rendezvous. Sending TCP info...")
             await websocket.send(json.dumps({
                 "type": "report_tcp_info",
-                "public_ip": p2p_public_ip_to_report, # Use IP seen by echo server, or ipify if echo failed
+                "public_ip": discovered_public_ip,
                 "internal_tcp_port": INTERNAL_TCP_PORT,
-                "mapped_public_port": p2p_mapped_port_to_report # Use port seen by echo, or None if failed
+                "mapped_public_port": mapped_public_port_for_listener
             }))
 
             logger.info(f"Worker {WORKER_ID}: Waiting for peer info from Rendezvous (timeout: {WS_RECV_TIMEOUT}s)...")
-            message_raw: str = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT)  # type: ignore
+            message_raw: str = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT)
             message_data = json.loads(message_raw)
 
             if message_data.get("type") == "p2p_tcp_peer_info":
@@ -368,108 +482,111 @@ async def rendezvous_client_and_p2p_manager() -> None:
                 peer_internal_tcp_port_str = message_data.get("peer_internal_tcp_port")
                 peer_mapped_public_port_str = message_data.get("peer_mapped_public_port")
 
-                if not (peer_id and peer_public_ip and peer_internal_tcp_port_str is not None):
+                if not (peer_id and peer_public_ip and (peer_internal_tcp_port_str is not None or peer_mapped_public_port_str is not None)):
                     logger.error(f"Worker {WORKER_ID}: Incomplete peer info from Rendezvous: {message_data}")
-                    # STOP_EVENT is not set here; listener continues, main task will finish
                     return
-
                 try:
-                    # Prefer mapped public port if provided; fall back to peer's internal port otherwise.
+                    peer_port_to_use: Optional[int] = None
                     if peer_mapped_public_port_str is not None:
                         peer_port_to_use = int(peer_mapped_public_port_str)
-                        logger.info(
-                            f"Worker {WORKER_ID}: Using peer's mapped_public_port={peer_port_to_use} for connection attempts."
-                        )
-                    else:
+                        logger.info(f"Worker {WORKER_ID}: Using peer's mapped_public_port={peer_port_to_use}.")
+                    elif peer_internal_tcp_port_str is not None: # Fallback if mapped is not available
                         peer_port_to_use = int(peer_internal_tcp_port_str)
-                        logger.info(
-                            f"Worker {WORKER_ID}: Peer did not provide mapped_public_port. Using internal port {peer_port_to_use}."
-                        )
+                        logger.info(f"Worker {WORKER_ID}: Peer mapped port not available, using peer's internal_tcp_port={peer_port_to_use}.")
+                    else:
+                        logger.error(f"Worker {WORKER_ID}: No valid port (mapped or internal) received for peer {peer_id}.")
+                        return
+                        
                     logger.info(
-                        f"Worker {WORKER_ID}: Received peer info: ID={peer_id}, IP={peer_public_ip}, PortToUse={peer_port_to_use}"
+                        f"Worker {WORKER_ID}: Received peer info: ID={peer_id}, "
+                        f"Target IP={peer_public_ip}, Target Port={peer_port_to_use}. "
+                        f"Will attempt up to {P2P_CONNECT_MAX_RETRIES} TCP dials (delay {P2P_RETRY_DELAY}s)."
                     )
-                    # This call will set STOP_EVENT upon completion or P2P error via handle_peer_connection
-                    await attempt_p2p_tcp_connect(str(peer_public_ip), peer_port_to_use)
+
+                    for attempt_idx in range(1, P2P_CONNECT_MAX_RETRIES + 1):
+                        if STOP_EVENT.is_set():
+                            logger.info(
+                                f"Worker {WORKER_ID}: STOP_EVENT set before P2P dial attempt {attempt_idx}; "
+                                "aborting further connect attempts."
+                            )
+                            break
+
+                        logger.info(
+                            f"Worker {WORKER_ID}: ---- P2P dial attempt {attempt_idx}/{P2P_CONNECT_MAX_RETRIES} ----"
+                        )
+                        await attempt_p2p_tcp_connect(str(peer_public_ip), peer_port_to_use)
+
+                        if STOP_EVENT.is_set():
+                            # A successful connection (handle_peer_connection sets STOP_EVENT) – break early.
+                            logger.info(
+                                f"Worker {WORKER_ID}: P2P connection succeeded on attempt {attempt_idx}. "
+                                "No further dials required."
+                            )
+                            break
+
+                        if attempt_idx < P2P_CONNECT_MAX_RETRIES:
+                            logger.info(
+                                f"Worker {WORKER_ID}: P2P dial attempt {attempt_idx} did not succeed. "
+                                f"Sleeping {P2P_RETRY_DELAY}s before next attempt."
+                            )
+                            await asyncio.sleep(P2P_RETRY_DELAY)
+                        else:
+                            logger.error(
+                                f"Worker {WORKER_ID}: Exhausted {P2P_CONNECT_MAX_RETRIES} P2P dial attempts without success."
+                            )
+                            # Set STOP_EVENT so that the rest of the cleanup logic triggers gracefully.
+                            STOP_EVENT.set()
                 except ValueError:
-                    logger.error(f"Worker {WORKER_ID}: Invalid peer port format from rendezvous: '{peer_internal_tcp_port_str}'")
-                    # STOP_EVENT is not set here; listener continues
-                    return 
+                    logger.error(f"Worker {WORKER_ID}: Invalid peer port format from rendezvous. Mapped: '{peer_mapped_public_port_str}', Internal: '{peer_internal_tcp_port_str}'")
             else:
                 logger.warning(f"Worker {WORKER_ID}: Received unexpected message from Rendezvous: {message_data}")
-                # STOP_EVENT is not set here; listener continues
-                return
 
     except websockets.exceptions.InvalidURI:
         logger.critical(f"Worker {WORKER_ID}: Invalid Rendezvous URI: {full_rendezvous_ws_url}. Exiting.", exc_info=True)
         STOP_EVENT.set()
-    except websockets.exceptions.InvalidMessage as im_err:
-        # This often indicates the server replied with HTTP/2 (binary) instead of HTTP/1.1, which
-        # can happen if ALPN negotiates h2. Retry once with plain ws:// as a fallback.
+    except websockets.exceptions.InvalidMessage as im_err: # Handle potential HTTP/2 issues with ALPN
         if full_rendezvous_ws_url.startswith("wss://"):
             fallback_url = full_rendezvous_ws_url.replace("wss://", "ws://", 1)
-            logger.warning(
-                f"Worker {WORKER_ID}: Received InvalidMessage during WebSocket handshake (likely HTTP/2). "
-                f"Retrying once with plain-text WebSocket at {fallback_url} ..."
-            )
+            logger.warning(f"Worker {WORKER_ID}: InvalidMessage (likely HTTP/2). Retrying with plain ws:// {fallback_url}")
             try:
-                async with websockets.connect(
-                    fallback_url,
-                    ping_interval=20,
-                    open_timeout=WS_OPEN_TIMEOUT,
-                ) as websocket:
-                    logger.info(f"Worker {WORKER_ID}: Connected to Rendezvous (fallback ws). Sending TCP info...")
-                    await websocket.send(json.dumps({
-                        "type": "report_tcp_info",
-                        "public_ip": p2p_public_ip_to_report, # Use IP seen by echo server, or ipify if echo failed
-                        "internal_tcp_port": INTERNAL_TCP_PORT,
-                        "mapped_public_port": p2p_mapped_port_to_report # Use port seen by echo, or None if failed
+                async with websockets.connect(fallback_url, ping_interval=20, open_timeout=WS_OPEN_TIMEOUT) as websocket_fallback:
+                    logger.info(f"Worker {WORKER_ID}: Connected (fallback ws). Sending TCP info...")
+                    await websocket_fallback.send(json.dumps({
+                        "type": "report_tcp_info", 
+                        "public_ip": discovered_public_ip, 
+                        "internal_tcp_port": INTERNAL_TCP_PORT, 
+                        "mapped_public_port": mapped_public_port_for_listener
                     }))
-                    # reuse the same receive / peer-handling logic by duplicating minimal portion.
-                    logger.info(f"Worker {WORKER_ID}: Waiting for peer info from Rendezvous (timeout: {WS_RECV_TIMEOUT}s)...")
-                    message_raw: str = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT)  # type: ignore
-                    message_data = json.loads(message_raw)
-                    # We jump to same handling logic by simulating else path; easiest is to recursion or copy: we'll copy below quickly.
-                    if message_data.get("type") == "p2p_tcp_peer_info":
-                        peer_id = message_data.get("peer_worker_id")
-                        peer_public_ip = message_data.get("peer_public_ip")
-                        peer_internal_tcp_port_str = message_data.get("peer_internal_tcp_port")
-                        peer_mapped_public_port_str = message_data.get("peer_mapped_public_port")
-
-                        if not (peer_id and peer_public_ip and peer_internal_tcp_port_str is not None):
-                            logger.error(f"Worker {WORKER_ID}: Incomplete peer info from Rendezvous: {message_data}")
-                        else:
-                            try:
-                                if peer_mapped_public_port_str is not None:
-                                    peer_port_to_use = int(peer_mapped_public_port_str)
-                                    logger.info(
-                                        f"Worker {WORKER_ID}: Using peer's mapped_public_port={peer_port_to_use} for connection attempts."
-                                    )
-                                else:
-                                    peer_port_to_use = int(peer_internal_tcp_port_str)
-                                    logger.info(
-                                        f"Worker {WORKER_ID}: Peer did not provide mapped_public_port. Using internal port {peer_port_to_use}."
-                                    )
-                                logger.info(
-                                    f"Worker {WORKER_ID}: Received peer info: ID={peer_id}, IP={peer_public_ip}, PortToUse={peer_port_to_use}"
-                                )
-                                await attempt_p2p_tcp_connect(str(peer_public_ip), peer_port_to_use)
-                            except ValueError:
-                                logger.error(f"Worker {WORKER_ID}: Invalid peer port format from rendezvous: '{peer_internal_tcp_port_str}'")
-                    else:
-                        logger.warning(f"Worker {WORKER_ID}: Received unexpected message from Rendezvous: {message_data}")
+                    message_raw_fallback: str = await asyncio.wait_for(websocket_fallback.recv(), timeout=WS_RECV_TIMEOUT)
+                    message_data_fallback = json.loads(message_raw_fallback)
+                    # (Re-paste peer handling logic here, or refactor to a common function)
+                    if message_data_fallback.get("type") == "p2p_tcp_peer_info":
+                        peer_id_fb = message_data_fallback.get("peer_worker_id")
+                        peer_public_ip_fb = message_data_fallback.get("peer_public_ip")
+                        peer_internal_tcp_port_str_fb = message_data_fallback.get("peer_internal_tcp_port")
+                        peer_mapped_public_port_str_fb = message_data_fallback.get("peer_mapped_public_port")
+                        if not (peer_id_fb and peer_public_ip_fb and (peer_internal_tcp_port_str_fb is not None or peer_mapped_public_port_str_fb is not None)):
+                            logger.error(f"Worker {WORKER_ID}: Incomplete peer info (fallback): {message_data_fallback}")
+                            return
+                        try:
+                            peer_port_to_use_fb: Optional[int] = None
+                            if peer_mapped_public_port_str_fb is not None:
+                                peer_port_to_use_fb = int(peer_mapped_public_port_str_fb)
+                            elif peer_internal_tcp_port_str_fb is not None:
+                                peer_port_to_use_fb = int(peer_internal_tcp_port_str_fb)
+                            if peer_port_to_use_fb is not None:
+                                 logger.info(f"Worker {WORKER_ID}: Received peer info (fallback): ID={peer_id_fb}, Target IP={peer_public_ip_fb}, Target Port={peer_port_to_use_fb}")
+                                 await attempt_p2p_tcp_connect(str(peer_public_ip_fb), peer_port_to_use_fb)
+                            else: logger.error(f"Worker {WORKER_ID}: No valid port for peer (fallback): {peer_id_fb}")
+                        except ValueError: logger.error(f"Worker {WORKER_ID}: Invalid peer port (fallback). Mapped: '{peer_mapped_public_port_str_fb}', Internal: '{peer_internal_tcp_port_str_fb}'")
+                    else: logger.warning(f"Worker {WORKER_ID}: Unexpected message (fallback): {message_data_fallback}")
             except Exception as fallback_err:
-                logger.critical(
-                    f"Worker {WORKER_ID}: Fallback ws:// handshake also failed: {fallback_err}. Exiting.",
-                    exc_info=True,
-                )
+                logger.critical(f"Worker {WORKER_ID}: Fallback ws:// handshake also failed: {fallback_err}. Exiting.", exc_info=True)
                 STOP_EVENT.set()
-        else:
-            logger.critical(
-                f"Worker {WORKER_ID}: WebSocket connection error with Rendezvous (InvalidMessage): {im_err}. Exiting.",
-                exc_info=True,
-            )
+        else: # Was not wss:// to begin with, or other InvalidMessage issue
+            logger.critical(f"Worker {WORKER_ID}: WebSocket InvalidMessage: {im_err}. Exiting.", exc_info=True)
             STOP_EVENT.set()
-    except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:  # More specific catch
+    except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:
         logger.critical(f"Worker {WORKER_ID}: WebSocket connection error with Rendezvous ({type(e).__name__}): {e}. Exiting.", exc_info=True)
         STOP_EVENT.set()
     except asyncio.TimeoutError:
@@ -478,57 +595,46 @@ async def rendezvous_client_and_p2p_manager() -> None:
     except json.JSONDecodeError:
         logger.critical(f"Worker {WORKER_ID}: Could not decode JSON from Rendezvous message. Exiting.", exc_info=True)
         STOP_EVENT.set()
-    except Exception: # Catch-all for other errors
+    except Exception:
         logger.critical(f"Worker {WORKER_ID}: Error in Rendezvous client or P2P management. Exiting.", exc_info=True)
         STOP_EVENT.set()
     finally:
         logger.info(f"Worker {WORKER_ID}: Rendezvous client and P2P manager task finished.")
-        # If this phase finishes without STOP_EVENT being set by P2P interaction or a critical error,
-        # set it now to ensure the worker terminates gracefully after one cycle.
         if not STOP_EVENT.is_set():
-            logger.info(f"Worker {WORKER_ID}: Main P2P/Rendezvous logic finished. Setting STOP_EVENT to terminate worker cycle.")
+            logger.info(f"Worker {WORKER_ID}: Main P2P/Rendezvous logic finished. Setting STOP_EVENT.")
             STOP_EVENT.set()
-        
-        # Ensure listener task is cleaned up if it hasn't already finished due to STOP_EVENT
         if listener_task and not listener_task.done():
-            logger.info(f"Worker {WORKER_ID}: Ensuring listener task ({listener_task.get_name()}) is handled post-manager logic.")
-            # STOP_EVENT being set should cause listener_task to exit its `await STOP_EVENT.wait()`
-            # We await it here to ensure its own finally block (server.close()) completes.
+            logger.info(f"Worker {WORKER_ID}: Ensuring listener task ({listener_task.get_name()}) is handled.")
             try:
-                await asyncio.wait_for(listener_task, timeout=10.0) # Give it time to shutdown gracefully
-                logger.info(f"Worker {WORKER_ID}: Listener task confirmed finished post-manager logic.")
+                await asyncio.wait_for(listener_task, timeout=10.0)
             except asyncio.TimeoutError:
-                logger.warning(f"Worker {WORKER_ID}: Timeout waiting for listener task to complete during final cleanup. Cancelling.")
+                logger.warning(f"Worker {WORKER_ID}: Timeout waiting for listener task. Cancelling.")
                 listener_task.cancel()
                 try: await listener_task
-                except asyncio.CancelledError: pass # Expected
-            except Exception as e:
-                logger.error(f"Worker {WORKER_ID}: Error awaiting listener task during final cleanup: {e}")
-
+                except asyncio.CancelledError: pass
+            except Exception as e_lt_clean:
+                logger.error(f"Worker {WORKER_ID}: Error awaiting listener task in cleanup: {e_lt_clean}")
 
 def health_check_server_thread_func() -> None:
     class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        def log_message(self, format_str: str, *args: Any) -> None: # type: ignore
-            # logger.debug(f"Health check request: {format_str % args}") # Optional: log health checks at DEBUG
-            return # Suppress default http.server logs unless debugging
-
+            if self.path == '/': # Default health check path for Cloud Run
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_error(404, "File Not Found")
+        def log_message(self, format_str: str, *args: Any) -> None:
+            return
     server_address = ("0.0.0.0", APP_PORT)
     logger.info(f"Worker {WORKER_ID}: Health check HTTP server starting on 0.0.0.0:{APP_PORT}")
     try:
         with http.server.ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler) as httpd:
             logger.info(f"Worker {WORKER_ID}: Health check HTTP server listening on 0.0.0.0:{APP_PORT}")
-            httpd.serve_forever() # This will block until server is shut down, but it's in a daemon thread.
+            httpd.serve_forever()
     except Exception:
         logger.critical(f"Worker {WORKER_ID}: Health check server failed to start or crashed.", exc_info=True)
-        # This might warrant setting STOP_EVENT if health checks are critical for Cloud Run liveness
-        # However, health check failing won't stop the daemon thread unless it crashes the whole process.
-        # If Cloud Run relies on this health check, the instance might be recycled.
-        # STOP_EVENT.set() # Consider if this is desired.
     logger.info(f"Worker {WORKER_ID}: Health check HTTP server thread finished.")
 
 

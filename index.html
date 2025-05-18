@@ -57,6 +57,18 @@
             </div>
             <div id="benchmarkStatus" class="mt-4 text-base text-gray-700 bg-gray-100 p-4 rounded-lg min-h-[45px] shadow-inner">Benchmark status will appear here.</div>
         </div>
+
+        <div id="adminSection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-slate-50 shadow">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">Worker Admin</h3>
+            <button id="restartWorkerButton" class="w-full sm:w-auto bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                Restart This Worker
+            </button>
+            <button id="redoStunButton" class="w-full sm:w-auto mt-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                Re-Discover STUN &amp; Re-Register
+            </button>
+            <div id="restartWorkerStatus" class="mt-4 text-sm text-gray-600"></div>
+            <div id="redoStunStatus" class="mt-2 text-sm text-gray-600"></div>
+        </div>
     </div>
 
     <script>
@@ -69,6 +81,10 @@
         const benchmarkSizeInput = document.getElementById('benchmarkSize');
         const startBenchmarkButton = document.getElementById('startBenchmarkButton');
         const benchmarkStatusDiv = document.getElementById('benchmarkStatus');
+        const restartWorkerButton = document.getElementById('restartWorkerButton');
+        const restartWorkerStatus = document.getElementById('restartWorkerStatus');
+        const redoStunButton = document.getElementById('redoStunButton');
+        const redoStunStatus = document.getElementById('redoStunStatus');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown";
@@ -144,6 +160,8 @@
                         addMessage(`Benchmark: ${data.message}`, "system");
                     } else if (data.type === "error") {
                         addMessage(`Error from backend: ${data.message}`, "system");
+                    } else if (data.type === "system_message") {
+                        addMessage(data.message, "system");
                     }
                 } catch (e) {
                     addMessage("Received non-JSON message from backend: " + event.data, "system");
@@ -203,6 +221,35 @@
             } else {
                 addMessage("Cannot start benchmark. Not connected to local backend.", "system");
                 benchmarkStatusDiv.textContent = "Not connected to local backend.";
+            }
+        };
+
+        restartWorkerButton.onclick = function() {
+            if (confirm("Are you sure you want to restart this worker instance? The current UI will disconnect.")) {
+                if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                    localUiSocket.send(JSON.stringify({ type: "restart_worker_request" }));
+                    restartWorkerStatus.textContent = "Restart command sent. This worker will now terminate and disconnect...";
+                    addMessage("Restart command sent. This worker will now terminate.", "system");
+                    // Disable buttons to prevent further interaction
+                    sendButton.disabled = true;
+                    startBenchmarkButton.disabled = true;
+                    restartWorkerButton.disabled = true;
+                    restartWorkerButton.classList.add('opacity-50', 'cursor-not-allowed');
+                } else {
+                    addMessage("Cannot send restart command. Not connected to local backend.", "system");
+                    restartWorkerStatus.textContent = "Error: Not connected to local backend.";
+                }
+            }
+        };
+
+        redoStunButton.onclick = function() {
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({ type: "redo_stun_request" }));
+                redoStunStatus.textContent = "Requested STUN re-discovery and re-registration...";
+                addMessage("Requested STUN re-discovery and re-registration.", "system");
+            } else {
+                addMessage("Cannot send STUN re-discovery request. Not connected to local backend.", "system");
+                redoStunStatus.textContent = "Error: Not connected to local backend.";
             }
         };
 

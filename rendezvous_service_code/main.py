@@ -214,6 +214,30 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
                     else:
                         await websocket.send_text(json.dumps({"type": "udp_endpoint_ack", "status": "error", "detail": "Missing IP or Port"}))
                 
+                elif msg_type == "explicit_deregister":
+                    requesting_worker_id = message.get("worker_id")
+                    if requesting_worker_id == worker_id: # Ensure the message is from the correct worker
+                        print(f"Rendezvous: Worker '{worker_id}' requested explicit deregistration.")
+                        # Perform cleanup immediately
+                        if worker_id in connected_workers:
+                            del connected_workers[worker_id]
+                            print(f"Rendezvous: Worker '{worker_id}' explicitly de-registered (from connected_workers). Total active: {len(connected_workers)}")
+                        if worker_id in workers_ready_for_pairing:
+                            workers_ready_for_pairing.remove(worker_id)
+                            print(f"Rendezvous: Worker '{worker_id}' explicitly de-registered (from workers_ready_for_pairing). Pairing list size: {len(workers_ready_for_pairing)}")
+                        
+                        try:
+                            await websocket.send_text(json.dumps({"type": "deregister_ack", "worker_id": worker_id, "status": "success"}))
+                        except Exception as e_ack:
+                            print(f"Rendezvous: Error sending deregister_ack to '{worker_id}': {e_ack}")
+                        
+                        # Close connection from server side after explicit deregister
+                        await websocket.close(code=1000, reason="Worker explicitly deregistered")
+                        print(f"Rendezvous: Closed WebSocket for '{worker_id}' after explicit deregistration.")
+                        break # Exit message loop, leading to the finally block for this WebSocket
+                    else:
+                        print(f"Rendezvous: Received explicit_deregister from '{worker_id}' with mismatched ID in payload: '{requesting_worker_id}'. Ignoring.")
+
                 elif msg_type == "echo_request": 
                     payload = message.get("payload", "")
                     await websocket.send_text(json.dumps({

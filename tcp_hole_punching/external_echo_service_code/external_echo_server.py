@@ -26,17 +26,17 @@ async def handle_echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     logger.info(f"Connection from {client_ip}:{client_port}")
 
     try:
-        # Optionally, read a bit of data to ensure the connection is fully established
-        # and to clear any data the client might send (like the newline from our worker)
-        try:
-            await asyncio.wait_for(reader.read(100), timeout=1.0)
-        except asyncio.TimeoutError:
-            logger.debug(f"No data received from {client_ip}:{client_port} within timeout, proceeding.")
-        except ConnectionResetError:
-            logger.warning(f"Connection reset by {client_ip}:{client_port} during initial read.")
-            return # Exit if connection reset
-        except Exception as e_read:
-            logger.warning(f"Error reading initial data from {client_ip}:{client_port}: {e_read}")
+        # SIMPLIFICATION: Respond immediately without an initial read from the client.
+        # The worker client will connect and then expect this response.
+        # try:
+        #     await asyncio.wait_for(reader.read(100), timeout=1.0)
+        # except asyncio.TimeoutError:
+        #     logger.debug(f"No data received from {client_ip}:{client_port} within timeout, proceeding.")
+        # except ConnectionResetError:
+        #     logger.warning(f"Connection reset by {client_ip}:{client_port} during initial read.")
+        #     return # Exit if connection reset
+        # except Exception as e_read:
+        #     logger.warning(f"Error reading initial data from {client_ip}:{client_port}: {e_read}")
             # Continue to try and send response anyway
 
         response_data = {
