@@ -31,18 +31,21 @@
         </h1>
         <div class="text-center text-base text-gray-600 mb-1">Worker ID: <span id="workerIdSpan" class="font-semibold text-indigo-600"></span></div>
         <div id="status" class="text-center text-base text-gray-700 mb-2">Connecting to local worker backend...</div>
-        <div id="peerInfo" class="text-center text-base text-blue-700 font-medium mb-6">Peer: Not connected</div>
+        <div id="peerInfo" class="text-center text-base text-blue-700 font-medium">Peer: Not connected</div>
+        <div id="quicStatus" class="text-center text-sm text-gray-500 mb-6">QUIC: n/a</div>
 
         <div id="chatbox" class="custom-scrollbar h-96 border border-gray-300 rounded-lg p-4 overflow-y-auto mb-5 bg-gray-100 space-y-3">
             <!-- Messages will appear here -->
         </div>
 
-        <div class="flex flex-col sm:flex-row items-center gap-3 mb-8">
+        <div class="flex flex-col sm:flex-row items-center gap-3 mb-1">
             <input type="text" id="messageInput" placeholder="Type your message..." class="w-full sm:w-auto flex-grow p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
             <button id="sendButton" type="button" class="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold py-4 px-8 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
                 Send
             </button>
         </div>
+
+        <p id="slashHelp" class="text-xs text-gray-400 mb-7 hidden">/ping – UDP RTT  /echo – QUIC RTT</p>
 
         <div id="benchmarkSection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-slate-50 shadow">
             <h3 class="text-2xl font-semibold text-gray-800 mb-4">P2P UDP Throughput Benchmark</h3>
@@ -85,6 +88,8 @@
         const restartWorkerStatus = document.getElementById('restartWorkerStatus');
         const redoStunButton = document.getElementById('redoStunButton');
         const redoStunStatus = document.getElementById('redoStunStatus');
+        const quicStatusEl = document.getElementById('quicStatus');
+        const slashHelp = document.getElementById('slashHelp');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown";
@@ -162,6 +167,24 @@
                         addMessage(`Error from backend: ${data.message}`, "system");
                     } else if (data.type === "system_message") {
                         addMessage(data.message, "system");
+                    } else if (data.type === "quic_status_update") {
+                        if (data.state === "connected") {
+                            quicStatusEl.innerHTML = `QUIC: <span class='text-green-600 font-semibold'>connected</span> (${data.role})`;
+                        } else {
+                            quicStatusEl.innerHTML = `QUIC: <span class='text-red-600 font-semibold'>disconnected</span>`;
+                        }
+                    } else if (data.type === "p2p_ping_result") {
+                        addMessage(`🔧 UDP ping ${data.rtt_ms.toFixed(1)} ms`, "system");
+                    } else if (data.type === "quic_echo_result") {
+                        addMessage(`🚄 QUIC echo ${data.rtt_ms.toFixed(1)} ms`, "system");
+                    } else if (data.type === "quic_echo_response") {
+                        addMessage(`🚄 QUIC echo ${data.rtt_ms.toFixed ? data.rtt_ms.toFixed(1) : data.rtt_ms} ms`, "system");
+                    } else if (data.type === "p2p_ping_response") {
+                        const sentTs = data.original_timestamp;
+                        if (typeof sentTs === 'number') {
+                            const rtt = (performance.now() - (sentTs*1000)) / 1; // best-effort
+                            addMessage(`🔧 UDP ping ~${rtt.toFixed(1)} ms`, "system");
+                        }
                     }
                 } catch (e) {
                     addMessage("Received non-JSON message from backend: " + event.data, "system");
@@ -184,7 +207,9 @@
             };
         }
 
-        sendButton.onclick = function() {
+        sendButton.onclick = sendChat;
+
+        function sendChat() {
             const messageText = messageInput.value.trim();
             if (messageText && localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
                 localUiSocket.send(JSON.stringify({
@@ -199,7 +224,28 @@
             else {
                 addMessage("Cannot send message. Not connected to local backend.", "system");
             }
-        };
+        }
+
+        // Slash-command handler for /ping and /echo
+        messageInput.addEventListener('keydown', e => {
+            if (e.key === '/') slashHelp.classList.remove('hidden');
+            if (e.key === 'Enter') {
+                slashHelp.classList.add('hidden');
+                const txt = messageInput.value.trim();
+                if (!txt) return;
+
+                if (txt === '/ping') {
+                    localUiSocket.send(JSON.stringify({ type: 'p2p_ping_command' }));
+                    messageInput.value = '';
+                    return;
+                }
+                if (txt === '/echo') {
+                    localUiSocket.send(JSON.stringify({ type: 'quic_echo_command', payload: 'echo ' + Date.now() }));
+                    messageInput.value = '';
+                    return;
+                }
+            }
+        });
         
         startBenchmarkButton.disabled = true; // Initially disable
         startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
@@ -253,10 +299,17 @@
             }
         };
 
+        // Prevent empty messages from being sent when slash-command handlers
+        // have already consumed the input (they clear the text field).
         messageInput.addEventListener("keypress", function(event) {
             if (event.key === "Enter") {
                 event.preventDefault();
-                sendButton.click();
+                const trimmed = messageInput.value.trim();
+                if (trimmed.length > 0) {
+                    // Only forward the action to the regular send handler if
+                    // there is still content in the input box.
+                    sendButton.click();
+                }
             }
         });
 

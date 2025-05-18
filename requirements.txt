@@ -1,7 +1,9 @@
 websockets>=12.0
 requests>=2.0.0
-# Flask    # Not needed anymore if we removed the Flask app 
+# Flask    # Not needed anymore if we removed the Flask app
 pystun3>=1.1.6
 # For async GCS download in benchmark
 aiohttp>=3.8
-# Check for the latest stable version of pystun3 
+# Check for the latest stable version of pystun3
+aioquic
+cryptography
