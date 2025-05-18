@@ -79,7 +79,8 @@ async def start_udp_hole_punch(app_context: Any, peer_udp_ip: str, peer_udp_port
             await asyncio.sleep(0.5)
             # Ensure new_quic_engine (now the global one) is connected
             engine_to_connect = app_context.get_quic_engine()
-            if engine_to_connect: engine_to_connect.connect_if_client()
+            if engine_to_connect:
+                await engine_to_connect.connect_if_client()
             print(f"Worker '{worker_id}': QUIC engine setup initiated for peer {current_p2p_peer_addr}. Role: Client")
         else:
             print(f"Worker '{worker_id}': Acting as QUIC Server – will create tunnel on first inbound Initial packet.")

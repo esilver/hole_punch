@@ -8,6 +8,13 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived, HandshakeCompleted, ConnectionTerminated
 
+# Attempt to import QuicErrorCode, otherwise use a default integer
+try:
+    from aioquic.quic.packet import QuicErrorCode
+    INTERNAL_QUIC_ERROR_CODE = QuicErrorCode.INTERNAL_ERROR
+except ImportError:
+    INTERNAL_QUIC_ERROR_CODE = 1 # Default internal error code
+
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
@@ -32,6 +39,7 @@ class QuicTunnel:
         udp_sender_func: Callable[[bytes, Tuple[str, int]], None],
         is_client_role: bool,
         original_destination_cid: Optional[bytes] = None,
+        on_close_callback: Optional[Callable[[], None]] = None,
     ):
         self.worker_id = worker_id_val
         self.peer_addr = peer_addr_val
@@ -145,32 +153,37 @@ class QuicTunnel:
         self._relay_tasks: List[asyncio.Task] = []
         self._handshake_completed: bool = False
         self._last_ping_time: float = time.time()
+        self._underlying_transport_lost: bool = False # Flag for lost transport
 
         # Buffer for QUIC stream data that may arrive before the local TCP
         # relay is fully established (mainly on the server side where the
         # relay is spun up only after the first data frame is observed).
         self._pending_quic_stream_data: Dict[int, List[bytes]] = {}
+        self._quic_state_lock = asyncio.Lock() # Lock for QUIC connection operations
+        self._on_close_callback = on_close_callback # Store callback
 
         print(f"Worker '{self.worker_id}': QuicTunnel initialized for peer {self.peer_addr}. Role: {'Client' if self.is_client else 'Server'}")
 
-    def connect_if_client(self):
+    async def connect_if_client(self):
         if self.is_client:
             print(f"Worker '{self.worker_id}': QUIC client connecting to {self.peer_addr}")
-            self.quic_connection.connect(self.peer_addr, now=time.time())
-            self._transmit_pending_udp()
+            async with self._quic_state_lock: # Protect connect and initial transmit
+                self.quic_connection.connect(self.peer_addr, now=time.time())
+                self._transmit_pending_udp() # Assumes this is safe to call under lock / doesn't re-lock
             self._start_timer_loop()
 
-    def feed_datagram(self, data: bytes, sender_addr: Tuple[str, int]):
-        try:
-            self.quic_connection.receive_datagram(data, sender_addr, now=time.time())
-        except Exception as e_rd:
-            print(
-                f"Worker '{self.worker_id}': QUIC receive_datagram ignored invalid packet from {sender_addr}: {type(e_rd).__name__} – {e_rd}"
-            )
-            return
+    async def feed_datagram(self, data: bytes, sender_addr: Tuple[str, int]):
+        async with self._quic_state_lock:
+            try:
+                self.quic_connection.receive_datagram(data, sender_addr, now=time.time())
+            except Exception as e_rd:
+                print(
+                    f"Worker '{self.worker_id}': QUIC receive_datagram ignored invalid packet from {sender_addr}: {type(e_rd).__name__} – {e_rd}"
+                )
+                return
 
-        self._process_quic_events()
-        self._transmit_pending_udp()
+            self._process_quic_events()
+            self._transmit_pending_udp()
 
     def _transmit_pending_udp(self):
         for data, addr in self.quic_connection.datagrams_to_send(now=time.time()):
@@ -207,55 +220,76 @@ class QuicTunnel:
                     try:
                         data_str = event.data.decode()
                     except UnicodeDecodeError:
-                        pass  # Binary payload, not an echo control frame
+                        # Non-UTF8 payload – not an echo control frame.
+                        data_str = ""
 
-                    if data_str.startswith("QUIC_ECHO_REQUEST"):
-                        parts = data_str.split(" ", 3)
-                        # Format: QUIC_ECHO_REQUEST <worker_id> <timestamp> <payload>
-                        if len(parts) >= 3:
-                            try:
-                                request_worker_id = parts[1]
-                                original_ts = float(parts[2])
-                                echoed_payload = parts[3] if len(parts) > 3 else ""
+                    # Efficiently handle the possibility that multiple echo requests
+                    # were coalesced into a single StreamDataReceived event.  We split
+                    # the buffer at the control-frame prefix and process each chunk
+                    # independently.
+                    if "QUIC_ECHO_REQUEST" in data_str:
+                        # The first element from split() may be an empty string if the
+                        # data begins with the prefix, so we skip empties.
+                        # We re-attach the prefix so each chunk is a full frame.
+                        potential_frames = [
+                            "QUIC_ECHO_REQUEST " + chunk for chunk in data_str.split("QUIC_ECHO_REQUEST ") if chunk
+                        ]
 
-                                if request_worker_id == self.worker_id:
-                                    # This is the response to our earlier request – measure RTT.
-                                    rtt_ms = (time.monotonic() - original_ts) * 1000
-                                    print(
-                                        f"Worker '{self.worker_id}': QUIC Echo response received, RTT: {rtt_ms:.2f} ms. Broadcasting to UI."
-                                    )
-                                    asyncio.create_task(
-                                        broadcast_to_all_ui_clients(
-                                            {
-                                                "type": "quic_echo_response",
-                                                "rtt_ms": rtt_ms,
-                                                "payload": echoed_payload,
-                                                "peer": f"{self.peer_addr[0]}:{self.peer_addr[1]}",
-                                            }
-                                        )
-                                    )
-                                    # Do not forward this response further.
-                                    event = self.quic_connection.next_event()
-                                    continue
-                                else:
-                                    # This is a request from the peer; echo it back verbatim.
-                                    if self._quic_stream_id is not None:
-                                        try:
-                                            self.quic_connection.send_stream_data(
-                                                self._quic_stream_id, event.data
-                                            )
-                                            self._transmit_pending_udp()
-                                        except Exception as e_echo_send:
-                                            print(
-                                                f"Worker '{self.worker_id}': Error echoing QUIC request back: {e_echo_send}"
-                                            )
-                                    # No RTT calculation; we are just the mirror.
-                                    event = self.quic_connection.next_event()
-                                    continue
-                            except (ValueError, IndexError):
+                        for frame in potential_frames:
+                            parts = frame.split(" ", 3)
+                            # Expected format:
+                            #   QUIC_ECHO_REQUEST <worker_id> <timestamp> <payload>
+                            if len(parts) < 3:
                                 print(
-                                    f"Worker '{self.worker_id}': Malformed QUIC_ECHO_REQUEST string: {data_str}"
+                                    f"Worker '{self.worker_id}': Malformed QUIC_ECHO_REQUEST (too few parts): {frame}"
                                 )
+                                continue
+
+                            request_worker_id = parts[1]
+                            try:
+                                original_ts = float(parts[2])
+                            except ValueError:
+                                print(
+                                    f"Worker '{self.worker_id}': Invalid timestamp in QUIC_ECHO_REQUEST: {parts[2]}"
+                                )
+                                continue
+
+                            echoed_payload = parts[3] if len(parts) > 3 else ""
+
+                            if request_worker_id == self.worker_id:
+                                # This is *our* original request coming back – measure RTT.
+                                rtt_ms = (time.monotonic() - original_ts) * 1000
+                                print(
+                                    f"Worker '{self.worker_id}': QUIC Echo response received, RTT: {rtt_ms:.2f} ms. Broadcasting to UI."
+                                )
+                                asyncio.create_task(
+                                    broadcast_to_all_ui_clients(
+                                        {
+                                            "type": "quic_echo_response",
+                                            "rtt_ms": rtt_ms,
+                                            "payload": echoed_payload,
+                                            "peer": f"{self.peer_addr[0]}:{self.peer_addr[1]}",
+                                        }
+                                    )
+                                )
+                            else:
+                                # This is a request from the peer – echo it back verbatim.
+                                if self._quic_stream_id is not None:
+                                    try:
+                                        self.quic_connection.send_stream_data(
+                                            self._quic_stream_id, frame.encode()
+                                        )
+                                        self._transmit_pending_udp()
+                                    except Exception as e_echo_send:
+                                        print(
+                                            f"Worker '{self.worker_id}': Error echoing QUIC request back: {e_echo_send}"
+                                        )
+                        # After handling echo frames (either responded or mirrored),
+                        # we continue to the next QUIC event so the remainder of the
+                        # processing logic does not incorrectly forward these control
+                        # frames to the TCP relay.
+                        event = self.quic_connection.next_event()
+                        continue
 
                     # Forward payload to local TCP relay or buffer until ready
                     if self._local_tcp_writer:
@@ -363,37 +397,90 @@ class QuicTunnel:
     async def _timer_management_loop(self):
         try:
             while True:
-                self._transmit_pending_udp()
-                
-                timeout = self.quic_connection.get_timer()
-                
-                # send keep-alive ping every 5 s
+                # Transmit any datagrams queued by previous operations,
+                # before acquiring lock for new timer-driven operations.
+                # This _transmit_pending_udp is outside the main lock for this iteration's timer events.
+                # It handles packets from prior locked sections.
+                # If _transmit_pending_udp needs a lock itself, this design needs adjustment.
+                # For now, assuming _transmit_pending_udp just sends and doesn't need _quic_state_lock itself.
+                # This is consistent with it being called inside the lock in feed_datagram/handle_timer.
+                # So, calls to _transmit_pending_udp and _process_quic_events are *part* of the locked operation.
+                # This initial transmit handles datagrams from operations outside this loop's main locked block.
+                # This needs to be re-evaluated.
+                # Let's assume the lock should cover any sequence of Q opérations.
+                # The original code:
+                # self._transmit_pending_udp() --> This is for prior things.
+                # timeout = self.quic_connection.get_timer() --> Needs lock
+                # if PING_TIME: self.quic_connection.ping() --> Needs lock, then transmit
+                # await asyncio.sleep(delay)
+                # self.quic_connection.handle_timer() --> Needs lock
+                # self._process_quic_events() --> Part of handle_timer op
+                # self._transmit_pending_udp() --> Part of handle_timer op
+
+                # Revised structure for timer loop:
+
+                # Determine next timeout. get_timer() reads state, let's assume it's safe or lock it briefly.
+                # For safety, operations on quic_connection should be locked.
+                current_timeout: Optional[float]
+                async with self._quic_state_lock:
+                    current_timeout = self.quic_connection.get_timer()
+                    # Transmit anything pending before sleeping or deciding next action
+                    self._transmit_pending_udp()
+
+
+                # Ping logic
                 now_val = time.time()
                 if now_val - self._last_ping_time > 5.0:
-                    try:
-                        self.quic_connection.ping()
-                        self._last_ping_time = now_val
-                    except Exception:
-                        pass
+                    async with self._quic_state_lock:
+                        try:
+                            print(f"Worker '{self.worker_id}': QUIC Pinging peer {self.peer_addr}")
+                            self.quic_connection.ping()
+                            self._transmit_pending_udp() # Transmit ping
+                        except Exception as e_ping:
+                            print(f"Worker '{self.worker_id}': QUIC ping failed: {e_ping}")
+                    self._last_ping_time = now_val
+                    # After pinging, re-check timer as ping might affect it
+                    async with self._quic_state_lock:
+                        current_timeout = self.quic_connection.get_timer()
+
 
                 if self._connection_terminated:
                     print(f"Worker '{self.worker_id}': QUIC connection marked terminated, stopping timer loop.")
                     break
 
-                if timeout is None:
-                    await asyncio.sleep(0.05)
+                if current_timeout is None:
+                    # No specific timer, short poll.
+                    # This might happen if connection is idle but not yet timed out by idle_timeout.
+                    # Pings are handled above.
+                    await asyncio.sleep(0.1) # Check again in 100ms
                     continue
 
-                delay = max(0, timeout - time.time())
+                delay = max(0, current_timeout - time.time())
                 await asyncio.sleep(delay)
 
-                try:
-                    self.quic_connection.handle_timer(now=time.time())
-                except Exception as e_ht:
-                    print(
-                        f"Worker '{self.worker_id}': Exception in handle_timer: {type(e_ht).__name__} – {e_ht}"
-                    )
-                    self._connection_terminated = True
+                # Timer has expired, handle it
+                async with self._quic_state_lock:
+                    try:
+                        # print(f"Worker '{self.worker_id}': QUIC handling timer for peer {self.peer_addr}")
+                        self.quic_connection.handle_timer(now=time.time())
+                        self._process_quic_events() 
+                        self._transmit_pending_udp()
+                    except Exception as e_ht:
+                        print(
+                            f"Worker '{self.worker_id}': Exception in handle_timer sequence: {type(e_ht).__name__} – {e_ht}"
+                        )
+                        # If handle_timer itself raises ConnectionTerminated, _process_quic_events might set this.
+                        # Or if another error occurs, we might need to terminate.
+                        if not isinstance(e_ht, ConnectionTerminated): # aioquic might raise this
+                             print(f"Worker \'{self.worker_id}\': Unhandled exception in handle_timer, closing connection.")
+                             # We are already in a lock, so direct calls are fine.
+                             self.quic_connection.close(error_code=INTERNAL_QUIC_ERROR_CODE, reason_phrase=f"Timer handling error: {type(e_ht).__name__}")
+                             self._connection_terminated = True # Mark it
+                             self._transmit_pending_udp() # Send the close
+                        # If it was ConnectionTerminated, _process_quic_events would handle flag.
+                        
+                if self._connection_terminated: # Re-check after handle_timer processing
+                    print(f"Worker '{self.worker_id}': QUIC connection terminated after handle_timer, stopping timer loop.")
                     break
         except asyncio.CancelledError:
             print(f"Worker '{self.worker_id}': QUIC timer loop cancelled for peer {self.peer_addr}.")
@@ -402,8 +489,22 @@ class QuicTunnel:
         finally:
             print(f"Worker '{self.worker_id}': QUIC timer loop exited for peer {self.peer_addr}.")
 
+    async def notify_transport_lost(self):
+        print(f"Worker '{self.worker_id}': Underlying UDP transport was lost for QUIC tunnel to {self.peer_addr}.")
+        self._underlying_transport_lost = True
+        if not self._connection_terminated:
+            self._connection_terminated = True 
+            
+            async with self._quic_state_lock: # Lock for QUIC operations
+                try:
+                    self.quic_connection.close(error_code=INTERNAL_QUIC_ERROR_CODE, reason_phrase="Underlying transport lost")
+                    self._transmit_pending_udp() 
+                except Exception as e_close_on_lost_transport:
+                    print(f"Worker '{self.worker_id}': Exception while trying to close QUIC connection on transport loss: {e_close_on_lost_transport}")
+
+            asyncio.create_task(self.close())
+
     async def close(self):
-        # Assuming quic_engine global is managed in main.py or passed if needed
         print(f"Worker '{self.worker_id}': Closing QUIC tunnel with {self.peer_addr}.")
         if self._timer_task:
             self._timer_task.cancel()
@@ -420,15 +521,27 @@ class QuicTunnel:
             try: await self._local_tcp_writer.wait_closed()
             except Exception: pass
 
-        if not self._connection_terminated:
-            try:
-                self.quic_connection.close(error_code=0, reason_phrase="Tunnel closing")
-                self._transmit_pending_udp()
-            except Exception:
-                pass
+        # _connection_terminated might be set by notify_transport_lost or ConnectionTerminated event
+        # We still attempt a final close operation on quic_connection if not already done.
+        if not getattr(self.quic_connection, '_is_closed_completely', False): # Hypothetical check if aioquic has such a flag
+             # More robust: check self._connection_terminated. If another path already closed it, this is a no-op or safe re-close.
+            if not self._connection_terminated: # Only attempt close if not already marked terminated
+                async with self._quic_state_lock: 
+                    try:
+                        print(f"Worker '{self.worker_id}': Attempting to close QUIC connection for {self.peer_addr}.")
+                        self.quic_connection.close(error_code=0, reason_phrase="Tunnel closing") 
+                        self._transmit_pending_udp()
+                    except Exception as e_close: 
+                        print(f"Worker '{self.worker_id}': Exception during QUIC connection close: {e_close}")
+                self._connection_terminated = True # Mark terminated after attempting close
         
-        # Logic to update global quic_engine should be handled by the caller in main.py
         print(f"Worker '{self.worker_id}': QUIC tunnel with {self.peer_addr} resources released.")
+        # Call the on_close_callback if it exists, after all resources are released.
+        if self._on_close_callback:
+            try:
+                self._on_close_callback()
+            except Exception as e_callback:
+                print(f"Worker '{self.worker_id}': Error in QuicTunnel on_close_callback: {e_callback}")
 
     @property
     def handshake_completed(self) -> bool:
@@ -436,9 +549,21 @@ class QuicTunnel:
 
     async def send_app_data(self, data: bytes):
         """Send application data over the relay stream, opening one if necessary."""
-        if self._quic_stream_id is None:
-            # Allocate a bidirectional stream
-            self._quic_stream_id = self.quic_connection.get_next_available_stream_id(False)
-            print(f"Worker '{self.worker_id}': Opening new QUIC stream {self._quic_stream_id} for app data.")
-        self.quic_connection.send_stream_data(self._quic_stream_id, data, end_stream=False)
-        self._transmit_pending_udp() 
+        # This method could be called from external application logic.
+        if self._connection_terminated or self._underlying_transport_lost:
+            print(f"Worker '{self.worker_id}': Cannot send app data, connection is terminated or transport lost.")
+            return
+
+        async with self._quic_state_lock:
+            if self._quic_stream_id is None:
+                # TODO: what if not self.is_client? Server might not initiate streams this way.
+                # This is for app-initiated data, primarily from client perspective or established stream.
+                # Consider if server needs to open new stream for app data not in reply.
+                self._quic_stream_id = self.quic_connection.get_next_available_stream_id(is_unidirectional=False)
+                print(f"Worker '{self.worker_id}': Opening new QUIC stream {self._quic_stream_id} for app data.")
+            self.quic_connection.send_stream_data(self._quic_stream_id, data, end_stream=False)
+            self._transmit_pending_udp()
+
+    def is_terminated_or_transport_lost(self) -> bool:
+        """Check if the tunnel is effectively unusable."""
+        return self._connection_terminated or self._underlying_transport_lost 

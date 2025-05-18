@@ -29,6 +29,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.benchmark_sessions: Dict[str, Dict] = {} # Manages its own benchmark sessions
+        self.associated_quic_tunnel: Optional[QuicTunnel] = None # For robustly handling the tunnel for this protocol instance
         print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
 
     def connection_made(self, transport: asyncio.DatagramTransport):
@@ -38,57 +39,101 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {self.internal_udp_port}).")
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-        current_p2p_peer_addr = self.get_current_p2p_peer_addr()
+        # Use the tunnel specifically associated with this protocol instance if active.
+        active_tunnel = self.associated_quic_tunnel
+        
+        if active_tunnel and active_tunnel.is_terminated_or_transport_lost(): # Check QuicTunnel's state
+            print(f"Worker '{self.worker_id}': Associated QuicTunnel for {active_tunnel.peer_addr} is terminated/lost. Clearing reference.")
+            self.associated_quic_tunnel = None # It might have already called its on_close to do this.
+            active_tunnel = None
+
+        if active_tunnel:
+            # If there's an active associated tunnel, route probable QUIC packets to it.
+            # This assumes one P2PUDPProtocol instance handles one peer relationship at a time.
+            if is_probable_quic_datagram(data):
+                # Update peer address if it has changed (e.g. NAT rebinding)
+                if addr != active_tunnel.peer_addr:
+                    old_addr = active_tunnel.peer_addr
+                    active_tunnel.peer_addr = addr # Update the QuicTunnel instance directly
+                    print(
+                        f"Worker '{self.worker_id}': Detected peer UDP address change for associated tunnel "
+                        f"{old_addr} ➜ {addr}. Updated QuicTunnel.peer_addr."
+                    )
+                
+                asyncio.create_task(active_tunnel.feed_datagram(data, addr))
+                return
+            # If not a QUIC datagram, it falls through to JSON/benchmark processing below,
+            # using the peer context (get_current_p2p_peer_id/addr) for those messages.
+        else:
+            # No active associated tunnel for this P2PUDPProtocol instance.
+            # Try to create a server-side tunnel if it's an Initial packet from the expected peer.
+            current_p2p_peer_addr = self.get_current_p2p_peer_addr()
+            is_initial_quic_packet = (data[0] & 0x80) and ((data[0] & 0x30) == 0x00) # QUIC Initial packet check
+
+            if (current_p2p_peer_addr is not None and 
+                addr == current_p2p_peer_addr and 
+                is_initial_quic_packet):
+                
+                odcid: Optional[bytes] = None
+                if data and (data[0] & 0x80): # Long header
+                    try:
+                        dcid_len_offset = 5
+                        dcid_len = data[dcid_len_offset]
+                        odcid = data[dcid_len_offset + 1 : dcid_len_offset + 1 + dcid_len]
+                    except IndexError: odcid = None
+
+                def udp_sender_for_quic(data_to_send: bytes, destination_addr: Tuple[str, int]):
+                    if self.transport and not self.transport.is_closing():
+                        self.transport.sendto(data_to_send, destination_addr)
+                    else:
+                        print(f"Worker '{self.worker_id}': QUIC UDP sender: transport closing/gone – cannot send.")
+                
+                # Define the callback for when this new server tunnel closes
+                # Need to ensure new_server_tunnel is accessible in the closure. Best to pass it.
+                # This callback will be specific to *this* new_server_tunnel instance.
+                def server_tunnel_on_close_callback_factory(tunnel_instance_being_closed: QuicTunnel):
+                    def server_tunnel_on_close_callback():
+                        if self.associated_quic_tunnel is tunnel_instance_being_closed:
+                            print(f"Worker '{self.worker_id}': Associated server-side QuicTunnel for {tunnel_instance_being_closed.peer_addr} closed. Clearing reference.")
+                            self.associated_quic_tunnel = None
+                        # Note: This does not automatically set the global AppContext engine to None.
+                        # That should be handled by a callback provided by main.py/AppContext if needed,
+                        # when this tunnel was set as the global one.
+                    return server_tunnel_on_close_callback
+
+                # Create the new server-side tunnel instance first
+                new_server_tunnel = QuicTunnel(
+                    worker_id_val=self.worker_id,
+                    peer_addr_val=addr,
+                    udp_sender_func=udp_sender_for_quic,
+                    is_client_role=False,
+                    original_destination_cid=odcid,
+                    on_close_callback=None # Placeholder, will be set below by factory
+                )
+                # Now set its specific on_close_callback
+                new_server_tunnel._on_close_callback = server_tunnel_on_close_callback_factory(new_server_tunnel)
+
+                self.associated_quic_tunnel = new_server_tunnel # Associate with this protocol instance
+                self.set_quic_engine(new_server_tunnel) # Inform main context this is the current/new engine
+                
+                asyncio.create_task(new_server_tunnel.feed_datagram(data, addr))
+                new_server_tunnel._start_timer_loop() 
+                print(f"Worker '{self.worker_id}': Lazy-created server-side QuicTunnel (associated with this protocol) upon first packet from {addr}.")
+                return
+            
+            elif is_probable_quic_datagram(data):
+                # Received a QUIC packet, but no associated tunnel for this P2PUDPProtocol instance,
+                # and it wasn't an Initial packet for the configured P2P peer.
+                # This could be a late packet for a tunnel that was associated but now gone,
+                # or a packet for a tunnel managed by a different P2P protocol instance or context.
+                # The global get_quic_engine() might know about it, but relying on that was the original issue.
+                # For robustness of *this* protocol instance, if it doesn't own the tunnel, it shouldn't guess.
+                print(f"Worker '{self.worker_id}': Received probable QUIC datagram from {addr}, but no QUIC engine is specifically associated with this P2P protocol instance and it wasn't an Initial packet for its designated peer. Datagram not processed by QUIC here.")
+
+        # Fall through for non-QUIC P2P messages (JSON, benchmarks)
+        # These use self.get_current_p2p_peer_id() and self.get_current_p2p_peer_addr() for context.
+        current_p2p_peer_addr_for_msg = self.get_current_p2p_peer_addr()
         current_p2p_peer_id = self.get_current_p2p_peer_id()
-        quic_engine_current = self.get_quic_engine()
-
-        if (
-            quic_engine_current is None
-            and current_p2p_peer_addr is not None
-            and addr == current_p2p_peer_addr
-            and data
-            and (data[0] & 0x80)  # Long header only
-            and (data[0] & 0x30) == 0x00  # Packet type = Initial
-        ):
-            odcid: Optional[bytes] = None
-            if data and (data[0] & 0x80):
-                try:
-                    dcid_len = data[5]
-                    odcid = data[6 : 6 + dcid_len]
-                except Exception as _: odcid = None
-
-            def udp_sender_for_quic(data_to_send: bytes, destination_addr: Tuple[str, int]):
-                if self.transport and not self.transport.is_closing():
-                    self.transport.sendto(data_to_send, destination_addr)
-                else:
-                    print(f"Worker '{self.worker_id}': QUIC UDP sender: transport closing – cannot send.")
-
-            new_quic_engine = QuicTunnel(
-                worker_id_val=self.worker_id, # Use self.worker_id passed during __init__
-                peer_addr_val=addr,
-                udp_sender_func=udp_sender_for_quic,
-                is_client_role=False,
-                original_destination_cid=odcid,
-            )
-            self.set_quic_engine(new_quic_engine) # Update main.py's global quic_engine
-            new_quic_engine.feed_datagram(data, addr)
-            new_quic_engine._start_timer_loop() # Ensure timer loop is started for server-side engine
-            print(f"Worker '{self.worker_id}': Lazy-created server-side QuicTunnel upon first packet from {addr} (ODCID len={len(odcid) if odcid else 'n/a'}).")
-            return
-
-        quic_engine_current = self.get_quic_engine() # Re-fetch in case it was just set
-        if quic_engine_current and addr == quic_engine_current.peer_addr:
-            # Only feed packets that appear to be QUIC.  Previously we forwarded
-            # every packet once the handshake was done, which meant JSON chat
-            # messages were accidentally given to aioquic and silently
-            # discarded.  Restrict forwarding to real QUIC-looking datagrams.
-            should_feed = is_probable_quic_datagram(data)
-            if should_feed:
-                try:
-                    quic_engine_current.feed_datagram(data, addr)
-                    return 
-                except Exception as e_quic_feed:
-                    print(f"Worker '{self.worker_id}': Error feeding datagram to QUIC engine for {addr}: {type(e_quic_feed).__name__} – {e_quic_feed}")
 
         try:
             message_str = data.decode()
@@ -206,10 +251,18 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     
     def connection_lost(self, exc: Optional[Exception]): 
         print(f"Worker '{self.worker_id}': P2P UDP listener connection lost: {exc if exc else 'Closed normally'}")
-        # If this specific transport instance was the one main.py knew about, clear it.
-        # This is determined by the set_main_p2p_udp_transport callback logic in main.py
-        # which should only clear its global if the transport being lost is the current global one.
-        # For safety, we always call to inform main.py that *this* transport instance is lost.
-        # Main.py will decide if its global p2p_udp_transport needs to be set to None.
-        if self.transport: # Check if this instance had a transport
-             self.set_main_p2p_udp_transport(None) # Inform main.py, it should check identity before nullifying global. 
+        
+        # Notify the current QUIC engine, if any, that its transport is gone.
+        current_quic_engine = self.get_quic_engine()
+        if current_quic_engine:
+            # It's possible the QUIC engine is already closing or closed, 
+            # but calling this method ensures it knows the transport is definitively gone.
+            asyncio.create_task(current_quic_engine.notify_transport_lost())
+
+        # Inform main.py (or the AppContext) about the transport loss.
+        # The callback itself (set_main_p2p_udp_transport) is responsible for checking if the 
+        # lost transport instance matches the one it holds globally before nullifying it.
+        if self.transport: # Check if this protocol instance *had* a transport associated with it.
+             self.set_main_p2p_udp_transport(None) # Signal that this transport is gone.
+        
+        self.transport = None # Clear this protocol instance's own reference to the transport. 

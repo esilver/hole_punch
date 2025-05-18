@@ -32,7 +32,11 @@
         <div class="text-center text-base text-gray-600 mb-1">Worker ID: <span id="workerIdSpan" class="font-semibold text-indigo-600"></span></div>
         <div id="status" class="text-center text-base text-gray-700 mb-2">Connecting to local worker backend...</div>
         <div id="peerInfo" class="text-center text-base text-blue-700 font-medium">Peer: Not connected</div>
-        <div id="quicStatus" class="text-center text-sm text-gray-500 mb-6">QUIC: n/a</div>
+        <div id="quicInfo" class="text-center text-sm text-gray-500 mb-4 flex items-center justify-center">
+            <span id="quicStatus" class="mr-2">QUIC: n/a</span>
+            <span id="quicLiveRtt" class="text-xs mr-2"></span>
+            <button id="toggleQuicLivePing" type="button">Start Live QUIC Ping</button>
+        </div>
 
         <div id="chatbox" class="custom-scrollbar h-96 border border-gray-300 rounded-lg p-4 overflow-y-auto mb-5 bg-gray-100 space-y-3">
             <!-- Messages will appear here -->
@@ -89,10 +93,16 @@
         const redoStunButton = document.getElementById('redoStunButton');
         const redoStunStatus = document.getElementById('redoStunStatus');
         const quicStatusEl = document.getElementById('quicStatus');
+        const quicLiveRttEl = document.getElementById('quicLiveRtt');
+        const toggleQuicLivePingButton = document.getElementById('toggleQuicLivePing');
         const slashHelp = document.getElementById('slashHelp');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown";
+
+        // For QUIC Live Ping
+        let quicLivePingIntervalId = null;
+        let quicPingTimeoutId = null;
 
         function addMessage(text, type = "system", sender = "") {
             const messageDiv = document.createElement('div');
@@ -172,13 +182,24 @@
                             quicStatusEl.innerHTML = `QUIC: <span class='text-green-600 font-semibold'>connected</span> (${data.role})`;
                         } else {
                             quicStatusEl.innerHTML = `QUIC: <span class='text-red-600 font-semibold'>disconnected</span>`;
+                            if (quicLivePingIntervalId) { // Stop live ping if QUIC disconnects
+                                toggleQuicLivePing(); // Call the toggle function to properly stop and reset UI
+                            }
                         }
                     } else if (data.type === "p2p_ping_result") {
                         addMessage(`🔧 UDP ping ${data.rtt_ms.toFixed(1)} ms`, "system");
                     } else if (data.type === "quic_echo_result") {
                         addMessage(`🚄 QUIC echo ${data.rtt_ms.toFixed(1)} ms`, "system");
                     } else if (data.type === "quic_echo_response") {
-                        addMessage(`🚄 QUIC echo ${data.rtt_ms.toFixed ? data.rtt_ms.toFixed(1) : data.rtt_ms} ms`, "system");
+                        if (data.payload && data.payload.startsWith("live_ping_")) {
+                            if (quicLivePingIntervalId) { // Only update if live ping is active
+                                clearTimeout(quicPingTimeoutId); 
+                                quicPingTimeoutId = null;
+                                quicLiveRttEl.textContent = `RTT: ${data.rtt_ms.toFixed(1)} ms`;
+                            }
+                        } else {
+                             addMessage(`🚄 QUIC echo ${data.rtt_ms ? data.rtt_ms.toFixed(1) : data.rtt_ms} ms`, "system");
+                        }
                     } else if (data.type === "p2p_ping_response") {
                         const sentTs = data.original_timestamp;
                         if (typeof sentTs === 'number') {
@@ -312,6 +333,61 @@
                 }
             }
         });
+
+        // --- QUIC Live Ping Logic ---
+        function sendQuicEchoForLivePing() {
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                const payload = "live_ping_" + Date.now();
+                localUiSocket.send(JSON.stringify({ type: 'quic_echo_command', payload: payload }));
+                
+                // Set a timeout for this specific ping
+                clearTimeout(quicPingTimeoutId);
+                quicPingTimeoutId = setTimeout(() => {
+                    if (quicLivePingIntervalId) { // Only show timeout if live ping is still active
+                        quicLiveRttEl.textContent = "(Timeout)";
+                    }
+                }, 2800); // Slightly less than the interval
+            } else {
+                if (quicLivePingIntervalId) { // If live ping was supposed to be active
+                    quicLiveRttEl.textContent = "(WS Closed)";
+                     // Optionally, try to stop it to prevent repeated errors if WS is closed
+                    toggleQuicLivePing();
+                }
+            }
+        }
+
+        function toggleQuicLivePing() {
+            if (quicLivePingIntervalId) { // If active, stop it
+                clearInterval(quicLivePingIntervalId);
+                quicLivePingIntervalId = null;
+                clearTimeout(quicPingTimeoutId);
+                quicPingTimeoutId = null;
+                toggleQuicLivePingButton.textContent = "Start Live QUIC Ping";
+                toggleQuicLivePingButton.classList.remove('bg-red-500', 'hover:bg-red-600');
+                toggleQuicLivePingButton.classList.add('bg-green-500', 'hover:bg-green-600');
+                quicLiveRttEl.textContent = "";
+            } else { // If inactive, start it
+                const quicStatusText = quicStatusEl.textContent || quicStatusEl.innerText;
+                if (!quicStatusText.includes("connected")) {
+                    addMessage("Cannot start live QUIC ping: QUIC is not connected.", "system");
+                    return;
+                }
+                sendQuicEchoForLivePing(); // Send immediately
+                quicLivePingIntervalId = setInterval(sendQuicEchoForLivePing, 3000);
+                toggleQuicLivePingButton.textContent = "Stop Live QUIC Ping";
+                toggleQuicLivePingButton.classList.remove('bg-green-500', 'hover:bg-green-600');
+                toggleQuicLivePingButton.classList.add('bg-red-500', 'hover:bg-red-600');
+                quicLiveRttEl.textContent = "(Pinging...)";
+            }
+        }
+
+        if (toggleQuicLivePingButton) {
+            toggleQuicLivePingButton.onclick = toggleQuicLivePing;
+        }
+        // Initialize button style
+        if (toggleQuicLivePingButton) {
+            toggleQuicLivePingButton.classList.add('bg-green-500', 'hover:bg-green-600', 'text-white', 'font-semibold', 'py-1', 'px-3', 'rounded-lg', 'text-xs', 'transition', 'duration-150', 'ease-in-out');
+        }
 
         connectToLocalBackend();
     </script>
