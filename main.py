@@ -127,7 +127,8 @@ class AppContext:
             get_current_p2p_peer_addr_func=self.get_current_p2p_peer_addr,
             get_quic_engine_func=self.get_quic_engine,
             set_quic_engine_func=self.set_quic_engine,
-            set_main_p2p_udp_transport_func=self.set_p2p_transport
+            set_main_p2p_udp_transport_func=self.set_p2p_transport,
+            set_current_p2p_peer_addr_func=self.set_current_p2p_peer_addr
         )
 
     # Getters for global state
@@ -418,7 +419,8 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         get_current_p2p_peer_addr_func=get_current_p2p_peer_addr_cb,
         get_quic_engine_func=get_quic_engine_cb,
         set_quic_engine_func=set_quic_engine_cb,
-        set_main_p2p_udp_transport_func=set_main_p2p_udp_transport_cb
+        set_main_p2p_udp_transport_func=set_main_p2p_udp_transport_cb,
+        set_current_p2p_peer_addr_func=set_current_p2p_peer_addr_cb
     )
 
     while not stop_signal_received:
