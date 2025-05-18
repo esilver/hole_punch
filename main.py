@@ -108,6 +108,9 @@ class AppContext:
         self.LOCAL_QUIC_RELAY_PORT = int(os.environ.get("LOCAL_QUIC_RELAY_PORT", "9000")) # Added
         self.LOCAL_QUIC_RELAY_HOST = "127.0.0.1" # Added
 
+        # Reference to the active P2PUDPProtocol instance
+        self.p2p_protocol_instance: Optional[P2PUDPProtocol] = None
+
         # Use the benchmark sender from network_utils (5-argument signature)
         import network_utils as _nu
         self.benchmark_send_udp_data = (
@@ -137,6 +140,9 @@ class AppContext:
     def get_current_p2p_peer_id(self) -> Optional[str]: return current_p2p_peer_id
     def get_current_p2p_peer_addr(self) -> Optional[Tuple[str, int]]: return current_p2p_peer_addr
 
+    def get_p2p_protocol_instance(self) -> Optional[P2PUDPProtocol]:
+        return self.p2p_protocol_instance
+
     # Setters for global state (use with caution, ensure they are called appropriately)
     def set_p2p_transport(self, transport: Optional[asyncio.DatagramTransport]):
         global p2p_udp_transport
@@ -165,6 +171,9 @@ class AppContext:
     def set_current_p2p_peer_addr(self, addr: Optional[Tuple[str, int]]):
         global current_p2p_peer_addr
         current_p2p_peer_addr = addr
+
+    def set_p2p_protocol_instance(self, proto: Optional[P2PUDPProtocol]):
+        self.p2p_protocol_instance = proto
 # --- End AppContext ---
 
 # --- Callbacks for P2PUDPProtocol (no longer needed here, AppContext provides them) ---
