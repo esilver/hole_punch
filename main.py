@@ -45,6 +45,7 @@ worker_id = str(uuid.uuid4())
 stop_signal_received = False
 active_rendezvous_websocket: Optional[websockets.WebSocketClientProtocol] = None # Added for explicit deregister
 p2p_udp_transport: Optional[asyncio.DatagramTransport] = None
+p2p_protocol_instance: Optional[P2PUDPProtocol] = None  # Keep reference to the P2P protocol for QUIC routing
 our_stun_discovered_udp_ip: Optional[str] = None
 our_stun_discovered_udp_port: Optional[int] = None
 current_p2p_peer_id: Optional[str] = None
@@ -197,7 +198,9 @@ def handle_shutdown_signal(signum, frame):
         p2p_udp_transport = None 
     if quic_engine:
         engine_to_close = quic_engine
-        quic_engine = None 
+        quic_engine = None
+        if p2p_protocol_instance and p2p_protocol_instance.associated_quic_tunnel is engine_to_close:
+            p2p_protocol_instance.associated_quic_tunnel = None
         print(f"Worker '{worker_id}': Cleared global QUIC engine reference, scheduling close for {engine_to_close.peer_addr}.")
         asyncio.create_task(engine_to_close.close())
     # UI clients are managed in ui_server.py; their individual closing is handled there or by server shutdown.
@@ -352,12 +355,21 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
                 else:
                     print(f"Worker '{worker_id}': QUIC UDP sender: P2P transport not available or closing. Cannot send.")
 
+            def client_tunnel_on_close():
+                global quic_engine, p2p_protocol_instance
+                if p2p_protocol_instance and p2p_protocol_instance.associated_quic_tunnel is quic_engine:
+                    p2p_protocol_instance.associated_quic_tunnel = None
+                quic_engine = None
+
             quic_engine = QuicTunnel(
                 worker_id_val=worker_id,
                 peer_addr_val=current_p2p_peer_addr,
                 udp_sender_func=udp_sender_for_quic,
                 is_client_role=True,
+                on_close_callback=client_tunnel_on_close,
             )
+            if p2p_protocol_instance:
+                p2p_protocol_instance.associated_quic_tunnel = quic_engine
             await asyncio.sleep(0.5)
             await quic_engine.connect_if_client()
             print(f"Worker '{worker_id}': QUIC engine setup initiated for peer {current_p2p_peer_addr}. Role: Client")
@@ -447,10 +459,11 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 if stun_success_initial and not udp_listener_active:
                     try:
                         _transport, _protocol = await loop.create_datagram_endpoint(
-                            protocol_factory, # MODIFIED HERE
+                            protocol_factory,
                             local_addr=('0.0.0.0', INTERNAL_UDP_PORT)
                         )
                         p2p_listener_transport_local_ref = _transport
+                        p2p_protocol_instance = _protocol  # store protocol for future association
                         # p2p_udp_transport is now set by the callback
                         await asyncio.sleep(0.1)
                         if p2p_udp_transport: print(f"Worker '{worker_id}': Asyncio P2P UDP listener appears active on 0.0.0.0:{INTERNAL_UDP_PORT}.")
@@ -523,17 +536,18 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
         finally: 
-            active_rendezvous_websocket = None 
-            if p2p_listener_transport_local_ref: 
+            active_rendezvous_websocket = None
+            if p2p_listener_transport_local_ref:
                 print(f"Worker '{worker_id}': Closing local P2P UDP transport (asyncio wrapper) from this WS session.")
                 # p2p_listener_transport_local_ref.close() # This is tricky if it's also the global one managed by P2PUDPProtocol
                 # The callback set_main_p2p_udp_transport_cb(None) should be called by P2PUDPProtocol.connection_lost
                 # if this transport instance is indeed lost.
-                # If this specific p2p_listener_transport_local_ref needs explicit closing here, 
+                # If this specific p2p_listener_transport_local_ref needs explicit closing here,
                 # ensure it doesn't conflict with P2PUDPProtocol's management.
                 # For now, relying on P2PUDPProtocol.connection_lost to clear the global p2p_udp_transport via callback.
                 pass # Let P2PUDPProtocol's connection_lost handle its own transport closure and callback.
-                udp_listener_active = False 
+                udp_listener_active = False
+                p2p_protocol_instance = None
         if not stop_signal_received: await asyncio.sleep(10)
         else: break
 
