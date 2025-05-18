@@ -16,7 +16,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                  get_current_p2p_peer_addr_func: Callable[[], Optional[Tuple[str,int]]],
                  get_quic_engine_func: Callable[[], Optional[QuicTunnel]],
                  set_quic_engine_func: Callable[[Optional[QuicTunnel]], None],
-                 set_main_p2p_udp_transport_func: Callable[[Optional[asyncio.DatagramTransport]], None]
+                 set_main_p2p_udp_transport_func: Callable[[Optional[asyncio.DatagramTransport]], None],
+                 set_current_p2p_peer_addr_func: Callable[[Optional[Tuple[str, int]]], None]
                 ):
         self.worker_id = worker_id_val
         self.internal_udp_port = internal_udp_port_val
@@ -26,6 +27,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         self.get_quic_engine = get_quic_engine_func
         self.set_quic_engine = set_quic_engine_func
         self.set_main_p2p_udp_transport = set_main_p2p_udp_transport_func
+        self.set_current_p2p_peer_addr = set_current_p2p_peer_addr_func
 
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.benchmark_sessions: Dict[str, Dict] = {} # Manages its own benchmark sessions
@@ -54,10 +56,11 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 # Update peer address if it has changed (e.g. NAT rebinding)
                 if addr != active_tunnel.peer_addr:
                     old_addr = active_tunnel.peer_addr
-                    active_tunnel.peer_addr = addr # Update the QuicTunnel instance directly
+                    active_tunnel.peer_addr = addr  # Update the QuicTunnel instance directly
+                    self.set_current_p2p_peer_addr(addr)
                     print(
                         f"Worker '{self.worker_id}': Detected peer UDP address change for associated tunnel "
-                        f"{old_addr} ➜ {addr}. Updated QuicTunnel.peer_addr."
+                        f"{old_addr} ➜ {addr}. Updated QuicTunnel.peer_addr and global peer addr."
                     )
                 
                 asyncio.create_task(active_tunnel.feed_datagram(data, addr))
@@ -177,6 +180,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
         msg_type = p2p_message.get("type")
         from_id = p2p_message.get("from_worker_id")
+
+        if from_id and from_id == current_p2p_peer_id and addr != current_p2p_peer_addr_for_msg:
+            self.set_current_p2p_peer_addr(addr)
+            print(f"Worker '{self.worker_id}': Updated global peer addr to {addr} based on message from peer.")
 
         if from_id and current_p2p_peer_id and from_id != current_p2p_peer_id:
             print(f"Worker '{self.worker_id}': WARNING - Received P2P message from '{from_id}' but current peer is '{current_p2p_peer_id}'. Addr: {addr}")

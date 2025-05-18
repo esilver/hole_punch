@@ -108,6 +108,9 @@ class AppContext:
         self.LOCAL_QUIC_RELAY_PORT = int(os.environ.get("LOCAL_QUIC_RELAY_PORT", "9000")) # Added
         self.LOCAL_QUIC_RELAY_HOST = "127.0.0.1" # Added
 
+        # Reference to the active P2PUDPProtocol instance
+        self.p2p_protocol_instance: Optional[P2PUDPProtocol] = None
+
         # Use the benchmark sender from network_utils (5-argument signature)
         import network_utils as _nu
         self.benchmark_send_udp_data = (
@@ -124,7 +127,8 @@ class AppContext:
             get_current_p2p_peer_addr_func=self.get_current_p2p_peer_addr,
             get_quic_engine_func=self.get_quic_engine,
             set_quic_engine_func=self.set_quic_engine,
-            set_main_p2p_udp_transport_func=self.set_p2p_transport
+            set_main_p2p_udp_transport_func=self.set_p2p_transport,
+            set_current_p2p_peer_addr_func=self.set_current_p2p_peer_addr
         )
 
     # Getters for global state
@@ -136,6 +140,9 @@ class AppContext:
     def get_quic_engine(self) -> Optional[QuicTunnel]: return quic_engine
     def get_current_p2p_peer_id(self) -> Optional[str]: return current_p2p_peer_id
     def get_current_p2p_peer_addr(self) -> Optional[Tuple[str, int]]: return current_p2p_peer_addr
+
+    def get_p2p_protocol_instance(self) -> Optional[P2PUDPProtocol]:
+        return self.p2p_protocol_instance
 
     # Setters for global state (use with caution, ensure they are called appropriately)
     def set_p2p_transport(self, transport: Optional[asyncio.DatagramTransport]):
@@ -165,6 +172,9 @@ class AppContext:
     def set_current_p2p_peer_addr(self, addr: Optional[Tuple[str, int]]):
         global current_p2p_peer_addr
         current_p2p_peer_addr = addr
+
+    def set_p2p_protocol_instance(self, proto: Optional[P2PUDPProtocol]):
+        self.p2p_protocol_instance = proto
 # --- End AppContext ---
 
 # --- Callbacks for P2PUDPProtocol (no longer needed here, AppContext provides them) ---
@@ -409,7 +419,8 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         get_current_p2p_peer_addr_func=get_current_p2p_peer_addr_cb,
         get_quic_engine_func=get_quic_engine_cb,
         set_quic_engine_func=set_quic_engine_cb,
-        set_main_p2p_udp_transport_func=set_main_p2p_udp_transport_cb
+        set_main_p2p_udp_transport_func=set_main_p2p_udp_transport_cb,
+        set_current_p2p_peer_addr_func=set_current_p2p_peer_addr_cb
     )
 
     while not stop_signal_received:

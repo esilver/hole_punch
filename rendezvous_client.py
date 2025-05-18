@@ -33,8 +33,11 @@ async def start_udp_hole_punch(app_context: Any, peer_udp_ip: str, peer_udp_port
         print(f"Worker '{worker_id}': Peer changed or re-initiating. Closing existing QUIC tunnel with {quic_engine.peer_addr}.")
         old_engine = quic_engine
         app_context.set_quic_engine(None)
+        proto_inst = app_context.get_p2p_protocol_instance()
+        if proto_inst and proto_inst.associated_quic_tunnel is old_engine:
+            proto_inst.associated_quic_tunnel = None
         asyncio.create_task(old_engine.close())
-        quic_engine = None # Local var update
+        quic_engine = None  # Local var update
 
     app_context.set_current_p2p_peer_id(peer_worker_id)
     app_context.set_current_p2p_peer_addr((peer_udp_ip, peer_udp_port))
@@ -76,6 +79,9 @@ async def start_udp_hole_punch(app_context: Any, peer_udp_ip: str, peer_udp_port
                 is_client_role=True,
             )
             app_context.set_quic_engine(new_quic_engine)
+            proto_inst = app_context.get_p2p_protocol_instance()
+            if proto_inst:
+                proto_inst.associated_quic_tunnel = new_quic_engine
             await asyncio.sleep(0.5)
             # Ensure new_quic_engine (now the global one) is connected
             engine_to_connect = app_context.get_quic_engine()
@@ -165,10 +171,11 @@ async def connect_to_rendezvous(app_context: Any, rendezvous_ws_url: str):
                     if not app_context.get_p2p_transport():
                         try:
                             _transport, _protocol = await loop.create_datagram_endpoint(
-                                p2p_protocol_factory, 
+                                p2p_protocol_factory,
                                 local_addr=('0.0.0.0', internal_udp_port)
                             )
-                            p2p_listener_transport_local_ref = _transport 
+                            p2p_listener_transport_local_ref = _transport
+                            app_context.set_p2p_protocol_instance(_protocol)
                             await asyncio.sleep(0.1)
                             if app_context.get_p2p_transport(): 
                                 print(f"Worker '{worker_id}': Asyncio P2P UDP listener appears active on 0.0.0.0:{internal_udp_port}.")
@@ -241,10 +248,11 @@ async def connect_to_rendezvous(app_context: Any, rendezvous_ws_url: str):
             print(f"Worker '{worker_id}': Rendezvous WS connection closed before or during connect: {e_outer_closed}")
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
-        finally: 
-            app_context.set_active_rendezvous_websocket(None) 
-            active_rendezvous_ws_local = None 
-            if app_context.get_p2p_transport() is None: 
+        finally:
+            app_context.set_active_rendezvous_websocket(None)
+            active_rendezvous_ws_local = None
+            app_context.set_p2p_protocol_instance(None)
+            if app_context.get_p2p_transport() is None:
                 udp_listener_active = False
 
         if not app_context.get_stop_signal(): await asyncio.sleep(10)
