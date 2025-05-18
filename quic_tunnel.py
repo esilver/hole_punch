@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import StreamDataReceived, HandshakeCompleted, ConnectionTerminated
+from aioquic.quic.events import StreamDataReceived, HandshakeCompleted, ConnectionTerminated, PingAcknowledged
 
 # Attempt to import QuicErrorCode, otherwise use a default integer
 try:
@@ -153,6 +153,7 @@ class QuicTunnel:
         self._relay_tasks: List[asyncio.Task] = []
         self._handshake_completed: bool = False
         self._last_ping_time: float = time.time()
+        self._ping_uid_counter: int = 1  # incremental UID for send_ping()
         self._underlying_transport_lost: bool = False # Flag for lost transport
 
         # Buffer for QUIC stream data that may arrive before the local TCP
@@ -301,6 +302,9 @@ class QuicTunnel:
                         print(f"Worker '{self.worker_id}': QUIC stream {event.stream_id} ended by peer.")
                         if self._local_tcp_writer:
                             self._local_tcp_writer.close()
+            elif isinstance(event, PingAcknowledged):
+                # Simple keep-alive / RTT observation – we currently just log.
+                print(f"Worker '{self.worker_id}': QUIC PingAcknowledged (uid={event.uid}) from {self.peer_addr}.")
             elif isinstance(event, ConnectionTerminated):
                 print(
                     f"Worker '{self.worker_id}': QUIC ConnectionTerminated with {self.peer_addr}. "
@@ -433,9 +437,11 @@ class QuicTunnel:
                 if now_val - self._last_ping_time > 5.0:
                     async with self._quic_state_lock:
                         try:
-                            print(f"Worker '{self.worker_id}': QUIC Pinging peer {self.peer_addr}")
-                            self.quic_connection.ping()
-                            self._transmit_pending_udp() # Transmit ping
+                            print(f"Worker '{self.worker_id}': QUIC sending PING to peer {self.peer_addr}")
+                            # aioquic expects a unique int UID for each PING frame.
+                            self.quic_connection.send_ping(self._ping_uid_counter)
+                            # Increment counter, wrap at 2^31 to avoid overflow.
+                            self._ping_uid_counter = (self._ping_uid_counter + 1) & 0x7FFFFFFF
                         except Exception as e_ping:
                             print(f"Worker '{self.worker_id}': QUIC ping failed: {e_ping}")
                     self._last_ping_time = now_val
