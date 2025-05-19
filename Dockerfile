@@ -19,6 +19,9 @@ COPY ui_server.py ./
 COPY p2p_protocol.py ./
 COPY rendezvous_client.py ./
 COPY index.html ./
+# Include certificates for QUIC connections
+COPY cert.pem ./
+COPY key.pem ./
 
 # Make port 8080 available to the world outside this container (Cloud Run default)
 EXPOSE 8080
