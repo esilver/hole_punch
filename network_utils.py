@@ -21,19 +21,53 @@ def is_probable_quic_datagram(blob: bytes) -> bool:
       • Otherwise accept it as QUIC only if the *fixed* bit (0x40) is set,
         which every short-header packet must have.
     """
-    if not blob:
-        return False
+    # ------------------------------------------------------------------
+    # Fast exclusions – bail out early for traffic we *know* is not QUIC.
+    # ------------------------------------------------------------------
+    # 1) Our own UDP NAT-hole-punch keep-alive messages begin with plain
+    #    ASCII such as "P2P_HOLE_PUNCH_PING_FROM_…".  Short-header QUIC
+    #    packets also set the fixed bit (0x40) which happens to be the same
+    #    bit pattern as many printable ASCII characters (e.g. 'P' = 0x50 has
+    #    bit 6 set).  Explicitly filter those out before running the generic
+    #    bit-tests below.
+    ascii_exclusions = (
+        b"P2P_HOLE_PUNCH_PING_FROM_",
+        b"P2P_HOLE_PUNCH_PONG_FROM_",
+        b"P2P_PING_",
+    )
+    for prefix in ascii_exclusions:
+        if blob.startswith(prefix):
+            return False
+
+    # 2) If the first byte is an ASCII letter and the payload decodes cleanly
+    #    as UTF-8 printable text, it is *very* unlikely to be QUIC.  This helps
+    #    to filter out ad-hoc text pings without having to list them all.
+    if 0x20 <= blob[0] <= 0x7E:  # Printable ASCII range
+        try:
+            blob.decode("utf-8")  # Cheap heuristic – will throw for binary
+            return False          # Decoded ⇒ treat as non-QUIC text traffic
+        except UnicodeDecodeError:
+            pass  # Binary payload – fall through to the bit heuristics
+
     first = blob[0]
+
+    # ------------------------------------------------------------------
+    # Generic QUIC header heuristics (unchanged from previous version)
+    # ------------------------------------------------------------------
 
     # Long-header packets – MSB must be 1
     if first & 0x80:
         return True
 
-    # Short-header packets must have the fixed bit set, *and* the two reserved
+    # Short-header packets must have the fixed bit set, and the two reserved
     # bits 5-4 cannot both be 1 (0x30).  ASCII '{' is 0x7B which has the fixed
     # bit (0x40) plus 0x30, so it is rejected by the extra check below.
     if first & 0x40 and (first & 0x30) != 0x30:
-        return True
+        # Additionally, the packet number length (bits 1-0) cannot be 0 per
+        # QUIC spec.  This single extra check excludes many printable ASCII
+        # characters like 'P' (0x50 – length bits == 0).
+        if (first & 0x03):
+            return True
 
     return False
 

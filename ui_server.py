@@ -126,19 +126,12 @@ async def ui_websocket_handler(
                     else:
                         await websocket.send(json.dumps({"type": "system_message", "message": "Cannot send QUIC Echo: QUIC tunnel not ready."}))
 
-                elif msg_type == "p2p_ping_response": # Received from P2PUDPProtocol broadcast
-                    original_timestamp = message.get("original_timestamp")
-                    from_peer = message.get("from_peer_id") # Should be the remote peer
-                    if original_timestamp is not None:
-                        rtt_ms = (time.monotonic() - float(original_timestamp)) * 1000
-                        print(f"Worker '{worker_id_val}': Received P2P Ping Response from '{from_peer}'. RTT: {rtt_ms:.2f} ms.")
-                        # Send to the specific UI client that might be waiting, or broadcast if simpler
-                        await websocket.send(json.dumps({
-                            "type": "p2p_ping_result", # New type for UI to display
-                            "rtt_ms": rtt_ms,
-                            "peer_id": from_peer
-                        }))
-                
+                elif msg_type == "p2p_ping_response": # Forward directly to UI so it can compute RTT
+                    # The frontend expects the same message structure it originally sent, with
+                    # `type: p2p_ping_response` and an `original_timestamp` field. Simply pass the
+                    # payload through so the UI can calculate RTT on the client side.
+                    await websocket.send(json.dumps(message))
+
                 elif msg_type == "quic_echo_response": # Received from QuicTunnel broadcast
                     rtt_ms = message.get("rtt_ms")
                     echoed_payload = message.get("payload")
