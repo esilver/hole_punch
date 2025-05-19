@@ -32,5 +32,8 @@ class TestIsProbableQuicDatagram(unittest.TestCase):
     def test_non_quic_binary(self):
         self.assertFalse(network_utils.is_probable_quic_datagram(b"\x05\x01\x02"))
 
+    def test_empty_blob(self):
+        self.assertFalse(network_utils.is_probable_quic_datagram(b""))
+
 if __name__ == "__main__":
     unittest.main()

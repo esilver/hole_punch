@@ -30,6 +30,9 @@ def is_probable_quic_datagram(blob: bytes) -> bool:
     #    bit pattern as many printable ASCII characters (e.g. 'P' = 0x50 has
     #    bit 6 set).  Explicitly filter those out before running the generic
     #    bit-tests below.
+    if not blob:
+        return False
+
     ascii_exclusions = (
         b"P2P_HOLE_PUNCH_PING_FROM_",
         b"P2P_HOLE_PUNCH_PONG_FROM_",
