@@ -99,9 +99,12 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         if self.associated_quic_tunnel is tunnel_instance_being_closed:
                             print(f"Worker '{self.worker_id}': Associated server-side QuicTunnel for {tunnel_instance_being_closed.peer_addr} closed. Clearing reference.")
                             self.associated_quic_tunnel = None
-                        # Note: This does not automatically set the global AppContext engine to None.
-                        # That should be handled by a callback provided by main.py/AppContext if needed,
-                        # when this tunnel was set as the global one.
+                        if self.get_quic_engine() is tunnel_instance_being_closed:
+                            print(
+                                f"Worker '{self.worker_id}': Server-side QuicTunnel that was global for {tunnel_instance_being_closed.peer_addr} closed. Clearing global reference."
+                            )
+                            self.set_quic_engine(None)
+                        # Note: Main context is notified here via set_quic_engine if this tunnel was the global one.
                     return server_tunnel_on_close_callback
 
                 # Create the new server-side tunnel instance first
