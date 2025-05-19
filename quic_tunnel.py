@@ -244,6 +244,10 @@ class QuicTunnel:
                                 print(
                                     f"Worker '{self.worker_id}': Malformed QUIC_ECHO_REQUEST (too few parts): {frame}"
                                 )
+                                # Additional debug detail to help diagnose
+                                print(
+                                    f"Worker '{self.worker_id}': Debug - split parts were: {parts}"
+                                )
                                 continue
 
                             request_worker_id = parts[1]
@@ -252,6 +256,10 @@ class QuicTunnel:
                             except ValueError:
                                 print(
                                     f"Worker '{self.worker_id}': Invalid timestamp in QUIC_ECHO_REQUEST: {parts[2]}"
+                                )
+                                # Extra debug information for troubleshooting
+                                print(
+                                    f"Worker '{self.worker_id}': Debug - original frame was: {frame}"
                                 )
                                 continue
 
