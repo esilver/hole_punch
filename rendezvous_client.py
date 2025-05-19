@@ -68,9 +68,19 @@ async def start_udp_hole_punch(app_context: Any, peer_udp_ip: str, peer_udp_port
                 # Need to get fresh p2p_udp_transport via app_context if it can change
                 current_p2p_transport = app_context.get_p2p_transport()
                 if current_p2p_transport and not current_p2p_transport.is_closing():
-                    current_p2p_transport.sendto(data_to_send, destination_addr)
+                    try:
+                        print(
+                            f"Worker '{worker_id}': UDP_SENDER_FOR_QUIC sending {len(data_to_send)} bytes to {destination_addr} via {current_p2p_transport}"
+                        )
+                        current_p2p_transport.sendto(data_to_send, destination_addr)
+                    except Exception as e_send:
+                        print(
+                            f"Worker '{worker_id}': UDP_SENDER_FOR_QUIC error sending to {destination_addr}: {e_send}"
+                        )
                 else:
-                    print(f"Worker '{worker_id}': QUIC UDP sender: P2P transport not available or closing. Cannot send.")
+                    print(
+                        f"Worker '{worker_id}': QUIC UDP sender: P2P transport not available or closing. Cannot send data to {destination_addr}."
+                    )
 
             new_quic_engine = QuicTunnel_cls(
                 worker_id_val=worker_id,

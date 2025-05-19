@@ -240,9 +240,17 @@ class QuicTunnel:
     def _transmit_pending_udp(self):
         for data, addr in self.quic_connection.datagrams_to_send(now=time.time()):
             print(
-                f"Worker '{self.worker_id}': _transmit_pending_udp sending {len(data)} bytes to {addr}"
+                f"Worker '{self.worker_id}': _transmit_pending_udp about to send {len(data)} bytes to {addr}"
             )
-            self.udp_sender(data, addr)
+            try:
+                self.udp_sender(data, addr)
+                print(
+                    f"Worker '{self.worker_id}': _transmit_pending_udp send complete to {addr}"
+                )
+            except Exception as e_send:
+                print(
+                    f"Worker '{self.worker_id}': Error calling udp_sender for {addr}: {e_send}"
+                )
 
     def _process_quic_events(self):
         event = self.quic_connection.next_event()
