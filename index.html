@@ -31,18 +31,25 @@
         </h1>
         <div class="text-center text-base text-gray-600 mb-1">Worker ID: <span id="workerIdSpan" class="font-semibold text-indigo-600"></span></div>
         <div id="status" class="text-center text-base text-gray-700 mb-2">Connecting to local worker backend...</div>
-        <div id="peerInfo" class="text-center text-base text-blue-700 font-medium mb-6">Peer: Not connected</div>
+        <div id="peerInfo" class="text-center text-base text-blue-700 font-medium">Peer: Not connected</div>
+        <div id="quicInfo" class="text-center text-sm text-gray-500 mb-4 flex items-center justify-center">
+            <span id="quicStatus" class="mr-2">QUIC: n/a</span>
+            <span id="quicLiveRtt" class="text-xs mr-2"></span>
+            <button id="toggleQuicLivePing" type="button">Start Live QUIC Ping</button>
+        </div>
 
         <div id="chatbox" class="custom-scrollbar h-96 border border-gray-300 rounded-lg p-4 overflow-y-auto mb-5 bg-gray-100 space-y-3">
             <!-- Messages will appear here -->
         </div>
 
-        <div class="flex flex-col sm:flex-row items-center gap-3 mb-8">
+        <div class="flex flex-col sm:flex-row items-center gap-3 mb-1">
             <input type="text" id="messageInput" placeholder="Type your message..." class="w-full sm:w-auto flex-grow p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
             <button id="sendButton" type="button" class="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold py-4 px-8 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
                 Send
             </button>
         </div>
+
+        <p id="slashHelp" class="text-xs text-gray-400 mb-7 hidden">/ping – UDP RTT  /echo – QUIC RTT</p>
 
         <div id="benchmarkSection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-slate-50 shadow">
             <h3 class="text-2xl font-semibold text-gray-800 mb-4">P2P UDP Throughput Benchmark</h3>
@@ -57,6 +64,18 @@
             </div>
             <div id="benchmarkStatus" class="mt-4 text-base text-gray-700 bg-gray-100 p-4 rounded-lg min-h-[45px] shadow-inner">Benchmark status will appear here.</div>
         </div>
+
+        <div id="adminSection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-slate-50 shadow">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">Worker Admin</h3>
+            <button id="restartWorkerButton" class="w-full sm:w-auto bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                Restart This Worker
+            </button>
+            <button id="redoStunButton" class="w-full sm:w-auto mt-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                Re-Discover STUN &amp; Re-Register
+            </button>
+            <div id="restartWorkerStatus" class="mt-4 text-sm text-gray-600"></div>
+            <div id="redoStunStatus" class="mt-2 text-sm text-gray-600"></div>
+        </div>
     </div>
 
     <script>
@@ -69,9 +88,21 @@
         const benchmarkSizeInput = document.getElementById('benchmarkSize');
         const startBenchmarkButton = document.getElementById('startBenchmarkButton');
         const benchmarkStatusDiv = document.getElementById('benchmarkStatus');
+        const restartWorkerButton = document.getElementById('restartWorkerButton');
+        const restartWorkerStatus = document.getElementById('restartWorkerStatus');
+        const redoStunButton = document.getElementById('redoStunButton');
+        const redoStunStatus = document.getElementById('redoStunStatus');
+        const quicStatusEl = document.getElementById('quicStatus');
+        const quicLiveRttEl = document.getElementById('quicLiveRtt');
+        const toggleQuicLivePingButton = document.getElementById('toggleQuicLivePing');
+        const slashHelp = document.getElementById('slashHelp');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown";
+
+        // For QUIC Live Ping
+        let quicLivePingIntervalId = null;
+        let quicPingTimeoutId = null;
 
         function addMessage(text, type = "system", sender = "") {
             const messageDiv = document.createElement('div');
@@ -144,6 +175,37 @@
                         addMessage(`Benchmark: ${data.message}`, "system");
                     } else if (data.type === "error") {
                         addMessage(`Error from backend: ${data.message}`, "system");
+                    } else if (data.type === "system_message") {
+                        addMessage(data.message, "system");
+                    } else if (data.type === "quic_status_update") {
+                        if (data.state === "connected") {
+                            quicStatusEl.innerHTML = `QUIC: <span class='text-green-600 font-semibold'>connected</span> (${data.role})`;
+                        } else {
+                            quicStatusEl.innerHTML = `QUIC: <span class='text-red-600 font-semibold'>disconnected</span>`;
+                            if (quicLivePingIntervalId) { // Stop live ping if QUIC disconnects
+                                toggleQuicLivePing(); // Call the toggle function to properly stop and reset UI
+                            }
+                        }
+                    } else if (data.type === "p2p_ping_result") {
+                        addMessage(`🔧 UDP ping ${data.rtt_ms.toFixed(1)} ms`, "system");
+                    } else if (data.type === "quic_echo_result") {
+                        addMessage(`🚄 QUIC echo ${data.rtt_ms.toFixed(1)} ms`, "system");
+                    } else if (data.type === "quic_echo_response") {
+                        if (data.payload && data.payload.startsWith("live_ping_")) {
+                            if (quicLivePingIntervalId) { // Only update if live ping is active
+                                clearTimeout(quicPingTimeoutId); 
+                                quicPingTimeoutId = null;
+                                quicLiveRttEl.textContent = `RTT: ${data.rtt_ms.toFixed(1)} ms`;
+                            }
+                        } else {
+                             addMessage(`🚄 QUIC echo ${data.rtt_ms ? data.rtt_ms.toFixed(1) : data.rtt_ms} ms`, "system");
+                        }
+                    } else if (data.type === "p2p_ping_response") {
+                        const sentTs = data.original_timestamp;
+                        if (typeof sentTs === 'number') {
+                            const rtt = (performance.now() - (sentTs*1000)) / 1; // best-effort
+                            addMessage(`🔧 UDP ping ~${rtt.toFixed(1)} ms`, "system");
+                        }
                     }
                 } catch (e) {
                     addMessage("Received non-JSON message from backend: " + event.data, "system");
@@ -166,7 +228,9 @@
             };
         }
 
-        sendButton.onclick = function() {
+        sendButton.onclick = sendChat;
+
+        function sendChat() {
             const messageText = messageInput.value.trim();
             if (messageText && localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
                 localUiSocket.send(JSON.stringify({
@@ -181,7 +245,28 @@
             else {
                 addMessage("Cannot send message. Not connected to local backend.", "system");
             }
-        };
+        }
+
+        // Slash-command handler for /ping and /echo
+        messageInput.addEventListener('keydown', e => {
+            if (e.key === '/') slashHelp.classList.remove('hidden');
+            if (e.key === 'Enter') {
+                slashHelp.classList.add('hidden');
+                const txt = messageInput.value.trim();
+                if (!txt) return;
+
+                if (txt === '/ping') {
+                    localUiSocket.send(JSON.stringify({ type: 'p2p_ping_command' }));
+                    messageInput.value = '';
+                    return;
+                }
+                if (txt === '/echo') {
+                    localUiSocket.send(JSON.stringify({ type: 'quic_echo_command', payload: 'echo ' + Date.now() }));
+                    messageInput.value = '';
+                    return;
+                }
+            }
+        });
         
         startBenchmarkButton.disabled = true; // Initially disable
         startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
@@ -206,12 +291,103 @@
             }
         };
 
+        restartWorkerButton.onclick = function() {
+            if (confirm("Are you sure you want to restart this worker instance? The current UI will disconnect.")) {
+                if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                    localUiSocket.send(JSON.stringify({ type: "restart_worker_request" }));
+                    restartWorkerStatus.textContent = "Restart command sent. This worker will now terminate and disconnect...";
+                    addMessage("Restart command sent. This worker will now terminate.", "system");
+                    // Disable buttons to prevent further interaction
+                    sendButton.disabled = true;
+                    startBenchmarkButton.disabled = true;
+                    restartWorkerButton.disabled = true;
+                    restartWorkerButton.classList.add('opacity-50', 'cursor-not-allowed');
+                } else {
+                    addMessage("Cannot send restart command. Not connected to local backend.", "system");
+                    restartWorkerStatus.textContent = "Error: Not connected to local backend.";
+                }
+            }
+        };
+
+        redoStunButton.onclick = function() {
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({ type: "redo_stun_request" }));
+                redoStunStatus.textContent = "Requested STUN re-discovery and re-registration...";
+                addMessage("Requested STUN re-discovery and re-registration.", "system");
+            } else {
+                addMessage("Cannot send STUN re-discovery request. Not connected to local backend.", "system");
+                redoStunStatus.textContent = "Error: Not connected to local backend.";
+            }
+        };
+
+        // Prevent empty messages from being sent when slash-command handlers
+        // have already consumed the input (they clear the text field).
         messageInput.addEventListener("keypress", function(event) {
             if (event.key === "Enter") {
                 event.preventDefault();
-                sendButton.click();
+                const trimmed = messageInput.value.trim();
+                if (trimmed.length > 0) {
+                    // Only forward the action to the regular send handler if
+                    // there is still content in the input box.
+                    sendButton.click();
+                }
             }
         });
+
+        // --- QUIC Live Ping Logic ---
+        function sendQuicEchoForLivePing() {
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                const payload = "live_ping_" + Date.now();
+                localUiSocket.send(JSON.stringify({ type: 'quic_echo_command', payload: payload }));
+                
+                // Set a timeout for this specific ping
+                clearTimeout(quicPingTimeoutId);
+                quicPingTimeoutId = setTimeout(() => {
+                    if (quicLivePingIntervalId) { // Only show timeout if live ping is still active
+                        quicLiveRttEl.textContent = "(Timeout)";
+                    }
+                }, 2800); // Slightly less than the interval
+            } else {
+                if (quicLivePingIntervalId) { // If live ping was supposed to be active
+                    quicLiveRttEl.textContent = "(WS Closed)";
+                     // Optionally, try to stop it to prevent repeated errors if WS is closed
+                    toggleQuicLivePing();
+                }
+            }
+        }
+
+        function toggleQuicLivePing() {
+            if (quicLivePingIntervalId) { // If active, stop it
+                clearInterval(quicLivePingIntervalId);
+                quicLivePingIntervalId = null;
+                clearTimeout(quicPingTimeoutId);
+                quicPingTimeoutId = null;
+                toggleQuicLivePingButton.textContent = "Start Live QUIC Ping";
+                toggleQuicLivePingButton.classList.remove('bg-red-500', 'hover:bg-red-600');
+                toggleQuicLivePingButton.classList.add('bg-green-500', 'hover:bg-green-600');
+                quicLiveRttEl.textContent = "";
+            } else { // If inactive, start it
+                const quicStatusText = quicStatusEl.textContent || quicStatusEl.innerText;
+                if (!quicStatusText.includes("connected")) {
+                    addMessage("Cannot start live QUIC ping: QUIC is not connected.", "system");
+                    return;
+                }
+                sendQuicEchoForLivePing(); // Send immediately
+                quicLivePingIntervalId = setInterval(sendQuicEchoForLivePing, 3000);
+                toggleQuicLivePingButton.textContent = "Stop Live QUIC Ping";
+                toggleQuicLivePingButton.classList.remove('bg-green-500', 'hover:bg-green-600');
+                toggleQuicLivePingButton.classList.add('bg-red-500', 'hover:bg-red-600');
+                quicLiveRttEl.textContent = "(Pinging...)";
+            }
+        }
+
+        if (toggleQuicLivePingButton) {
+            toggleQuicLivePingButton.onclick = toggleQuicLivePing;
+        }
+        // Initialize button style
+        if (toggleQuicLivePingButton) {
+            toggleQuicLivePingButton.classList.add('bg-green-500', 'hover:bg-green-600', 'text-white', 'font-semibold', 'py-1', 'px-3', 'rounded-lg', 'text-xs', 'transition', 'duration-150', 'ease-in-out');
+        }
 
         connectToLocalBackend();
     </script>

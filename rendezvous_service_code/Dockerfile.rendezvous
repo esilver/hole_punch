@@ -17,7 +17,7 @@ COPY main.py .
 
 # Make port 8080 available (Cloud Run default)
 EXPOSE 8080
-ENV PORT 8080
+ENV PORT=8080
 
 # Command to run the Uvicorn server for FastAPI
 # --host 0.0.0.0 makes it accessible from outside the container
