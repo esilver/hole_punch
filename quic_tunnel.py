@@ -203,7 +203,15 @@ class QuicTunnel:
             )
 
     async def feed_datagram(self, data: bytes, sender_addr: Tuple[str, int]):
+        entry_feed_time = time.monotonic()
+        print(
+            f"Worker '{self.worker_id}': QuicTunnel.feed_datagram ENTER from {sender_addr} at {entry_feed_time:.4f}"
+        )
         async with self._quic_state_lock:
+            lock_acquired_time = time.monotonic()
+            print(
+                f"Worker '{self.worker_id}': QuicTunnel.feed_datagram LOCK ACQUIRED at {lock_acquired_time:.4f} (waited {(lock_acquired_time - entry_feed_time):.4f}s)"
+            )
             try:
                 self.quic_connection.receive_datagram(data, sender_addr, now=time.time())
             except Exception as e_rd:
@@ -212,8 +220,22 @@ class QuicTunnel:
                 )
                 return
 
+            datagram_processed_time = time.monotonic()
+            print(
+                f"Worker '{self.worker_id}': QuicTunnel.feed_datagram aioquic.receive_datagram DONE at {datagram_processed_time:.4f}"
+            )
+
             self._process_quic_events()
+
+            events_processed_time = time.monotonic()
+            print(
+                f"Worker '{self.worker_id}': QuicTunnel.feed_datagram _process_quic_events DONE at {events_processed_time:.4f} (took {(events_processed_time - datagram_processed_time):.4f}s)"
+            )
             self._transmit_pending_udp()
+        lock_release_time = time.monotonic()
+        print(
+            f"Worker '{self.worker_id}': QuicTunnel.feed_datagram EXIT, lock released at {lock_release_time:.4f} (total in func {(lock_release_time - entry_feed_time):.4f}s, in lock {(lock_release_time - lock_acquired_time):.4f}s)"
+        )
 
     def _transmit_pending_udp(self):
         for data, addr in self.quic_connection.datagrams_to_send(now=time.time()):
@@ -222,8 +244,9 @@ class QuicTunnel:
     def _process_quic_events(self):
         event = self.quic_connection.next_event()
         while event:
+            event_popped_time = time.monotonic()
             print(
-                f"Worker '{self.worker_id}': Processing QUIC event {type(event).__name__}: {event}"
+                f"Worker '{self.worker_id}': Processing QUIC event {type(event).__name__} at {event_popped_time:.4f}: {event}"
             )
             if isinstance(event, HandshakeCompleted):
                 print(
@@ -394,6 +417,10 @@ class QuicTunnel:
                 print(
                     f"Worker '{self.worker_id}': Unhandled QUIC event type {type(event).__name__}: {event}"
                 )
+            event_handled_time = time.monotonic()
+            print(
+                f"Worker '{self.worker_id}': Done handling event {type(event).__name__} at {event_handled_time:.4f} (took {(event_handled_time - event_popped_time):.4f}s)"
+            )
             event = self.quic_connection.next_event()
 
         if not self._handshake_completed:

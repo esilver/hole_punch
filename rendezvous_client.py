@@ -78,6 +78,16 @@ async def start_udp_hole_punch(app_context: Any, peer_udp_ip: str, peer_udp_port
                 udp_sender_func=udp_sender_for_quic,
                 is_client_role=True,
             )
+
+            def client_tunnel_closed():
+                if app_context.get_quic_engine() is new_quic_engine:
+                    app_context.set_quic_engine(None)
+                proto = app_context.get_p2p_protocol_instance()
+                if proto and proto.associated_quic_tunnel is new_quic_engine:
+                    proto.associated_quic_tunnel = None
+
+            new_quic_engine._on_close_callback = client_tunnel_closed
+
             app_context.set_quic_engine(new_quic_engine)
             proto_inst = app_context.get_p2p_protocol_instance()
             if proto_inst:
@@ -119,6 +129,7 @@ async def connect_to_rendezvous(app_context: Any, rendezvous_ws_url: str):
     udp_listener_active = False # This state might need to be part of app_context if it persists across calls
     loop = asyncio.get_running_loop()
     last_stun_recheck_time = 0.0
+    previous_quic_engine_connected = False
     
     active_rendezvous_ws_local: Optional[websockets.WebSocketClientProtocol] = None 
 
@@ -239,10 +250,30 @@ async def connect_to_rendezvous(app_context: Any, rendezvous_ws_url: str):
                             last_stun_recheck_time = current_time
                         except websockets.exceptions.ConnectionClosed as e_stun_conn_closed:
                             print(f"Worker '{worker_id}': Connection closed during periodic STUN update: {e_stun_conn_closed}. Will attempt to reconnect.")
-                            break 
+                            break
                         except Exception as e_stun_general:
                             print(f"Worker '{worker_id}': Error during periodic STUN UDP endpoint check: {type(e_stun_general).__name__} - {e_stun_general}. Will retry STUN after interval.")
-                            last_stun_recheck_time = current_time 
+                            last_stun_recheck_time = current_time
+
+                    current_engine = app_context.get_quic_engine()
+                    if previous_quic_engine_connected and current_engine is None:
+                        stun_ip = app_context.get_stun_discovered_ip()
+                        stun_port = app_context.get_stun_discovered_port()
+                        if stun_ip and stun_port:
+                            try:
+                                await active_rendezvous_ws_local.send(json.dumps({
+                                    "type": "update_udp_endpoint",
+                                    "udp_ip": stun_ip,
+                                    "udp_port": stun_port,
+                                }))
+                                print(f"Worker '{worker_id}': Re-registered UDP endpoint after QUIC tunnel drop.")
+                            except Exception as e_rereg:
+                                print(f"Worker '{worker_id}': Error sending update_udp_endpoint after QUIC drop: {e_rereg}")
+                        else:
+                            print(f"Worker '{worker_id}': QUIC tunnel dropped but no STUN info to re-register.")
+                        previous_quic_engine_connected = False
+                    else:
+                        previous_quic_engine_connected = current_engine is not None
                 if app_context.get_stop_signal(): break 
         except websockets.exceptions.ConnectionClosed as e_outer_closed:
             print(f"Worker '{worker_id}': Rendezvous WS connection closed before or during connect: {e_outer_closed}")

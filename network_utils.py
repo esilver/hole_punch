@@ -106,7 +106,10 @@ async def discover_stun_endpoint(
             try:
                 nat_type, external_ip, external_port = stun.get_ip_info(
                     source_ip="0.0.0.0",
-                    source_port=internal_udp_port_val,
+                    # Use an ephemeral source port so we don't conflict with
+                    # the main UDP listener which is likely already bound to
+                    # `internal_udp_port_val`. NAT will map consistently.
+                    source_port=0,
                     stun_host=stun_host_to_use,
                     stun_port=stun_port_to_use,
                 )
