@@ -47,8 +47,7 @@ async def ui_websocket_handler(
     config_default_stun_host: str,
     config_default_stun_port: int,
     # Functions to call (originally global or from other modules)
-    benchmark_sender_func: Callable, # benchmark_send_udp_data from main.py
-    delayed_exit_caller: Callable, # delayed_exit from main.py
+    benchmark_sender_func: Callable, # benchmark_send_udp_data via AppContext from network_utils
     discover_stun_caller: Callable, # discover_stun_endpoint from network_utils.py
     # For STUN redial to update main.py's globals for discovered IP/Port
     update_main_stun_globals_func: Callable[[Optional[str], Optional[int]], None],
@@ -248,7 +247,3 @@ async def broadcast_to_all_ui_clients(message_payload: Dict):
                     client_info = str(client_list_for_error[i].remote_address)
                 print(f"Error broadcasting to UI client {client_info}: {result}")
 
-# Placeholder for broadcasting to UI clients, if needed from ui_server.py itself.
-# async def broadcast_to_ui_clients(message: str):
-#     if ui_websocket_clients:
-#         await asyncio.wait([client.send(message) for client in ui_websocket_clients]) 
