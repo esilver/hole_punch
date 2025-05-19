@@ -71,7 +71,12 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 print(
                     f"Worker '{self.worker_id}': Feeding datagram to QUIC tunnel at {time.monotonic():.4f}"
                 )
-                asyncio.create_task(active_tunnel.feed_datagram(data, addr))
+                task = asyncio.create_task(active_tunnel.feed_datagram(data, addr))
+                task.add_done_callback(
+                    lambda t, peer=addr: print(
+                        f"Worker '{self.worker_id}': feed_datagram task exception from {peer}: {t.exception()}"
+                    ) if t.exception() else None
+                )
                 return
             # If not a QUIC datagram, it falls through to JSON/benchmark processing below,
             # using the peer context (get_current_p2p_peer_id/addr) for those messages.
