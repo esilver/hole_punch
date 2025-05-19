@@ -37,3 +37,12 @@ class TestIsProbableQuicDatagram(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestIsProbableQuicDatagramRandomized(unittest.TestCase):
+    def test_random_inputs_do_not_raise(self):
+        import os, random
+        for _ in range(100):
+            length = random.randint(1, 32)
+            blob = os.urandom(length)
+            result = network_utils.is_probable_quic_datagram(blob)
+            self.assertIn(result, (True, False))
