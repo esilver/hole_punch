@@ -113,13 +113,34 @@ class QuicTunnel:
                 except Exception as e_gen:
                     print(f"Worker '{self.worker_id}': ERROR generating self-signed cert: {type(e_gen).__name__} – {e_gen}")
             else:
-                pass
+                print(
+                    f"Worker '{self.worker_id}': CRITICAL SERVER ERROR: cert.pem or key.pem NOT FOUND for server role."
+                )
 
         if CERTIFICATE_FILE.exists() and PRIVATE_KEY_FILE.exists():
             try:
                 self.quic_config.load_cert_chain(str(CERTIFICATE_FILE), str(PRIVATE_KEY_FILE))
+                print(
+                    f"Worker '{self.worker_id}': Cert chain loaded. Cert is {'SET' if self.quic_config.certificate else 'NONE'}. "
+                    f"Key is {'SET' if self.quic_config.private_key else 'NONE'}."
+                )
+                if self.quic_config.certificate and self.quic_config.private_key:
+                    try:
+                        with open(PRIVATE_KEY_FILE, "rb") as f_key, open(CERTIFICATE_FILE, "rb") as f_cert:
+                            loaded_key = serialization.load_pem_private_key(f_key.read(), password=None)
+                            loaded_cert = x509.load_pem_x509_certificate(f_cert.read())
+                        if loaded_key.public_key().public_numbers() != loaded_cert.public_key().public_numbers():
+                            print(
+                                f"Worker '{self.worker_id}': CRITICAL SERVER ERROR: Certificate and private key do not match!"
+                            )
+                    except Exception as e_val:
+                        print(
+                            f"Worker '{self.worker_id}': Warning verifying certificate/key pair: {type(e_val).__name__}: {e_val}"
+                        )
             except Exception as e_load:
-                print(f"Worker '{self.worker_id}': Failed to load certificate chain – proceeding as client-only. {type(e_load).__name__}: {e_load}")
+                print(
+                    f"Worker '{self.worker_id}': CRITICAL SERVER ERROR - Failed to load certificate chain: {type(e_load).__name__}: {e_load}"
+                )
 
         odcid = (
             original_destination_cid
@@ -170,11 +191,16 @@ class QuicTunnel:
 
     async def connect_if_client(self):
         if self.is_client:
-            print(f"Worker '{self.worker_id}': QUIC client connecting to {self.peer_addr}")
+            print(
+                f"Worker '{self.worker_id}': QUIC client connecting to {self.peer_addr}"
+            )
             async with self._quic_state_lock: # Protect connect and initial transmit
                 self.quic_connection.connect(self.peer_addr, now=time.time())
                 self._transmit_pending_udp() # Assumes this is safe to call under lock / doesn't re-lock
             self._start_timer_loop()
+            print(
+                f"Worker '{self.worker_id}': QUIC client connection initiated; timer loop started"
+            )
 
     async def feed_datagram(self, data: bytes, sender_addr: Tuple[str, int]):
         async with self._quic_state_lock:
@@ -196,8 +222,14 @@ class QuicTunnel:
     def _process_quic_events(self):
         event = self.quic_connection.next_event()
         while event:
+            print(
+                f"Worker '{self.worker_id}': Processing QUIC event {type(event).__name__}: {event}"
+            )
             if isinstance(event, HandshakeCompleted):
-                print(f"Worker '{self.worker_id}': QUIC HandshakeCompleted with {self.peer_addr}. ALPN: {event.alpn_protocol}")
+                print(
+                    f"Worker '{self.worker_id}': QUIC HandshakeCompleted with {self.peer_addr}. "
+                    f"ALPN: {event.alpn_protocol}"
+                )
                 if self.is_client:
                     self._quic_stream_id = self.quic_connection.get_next_available_stream_id(is_unidirectional=False)
                     print(f"Worker '{self.worker_id}': QUIC client opening stream {self._quic_stream_id} for relay.")
@@ -358,6 +390,10 @@ class QuicTunnel:
                 )
                 self._connection_terminated = True
                 asyncio.create_task(self.close())
+            else:
+                print(
+                    f"Worker '{self.worker_id}': Unhandled QUIC event type {type(event).__name__}: {event}"
+                )
             event = self.quic_connection.next_event()
 
         if not self._handshake_completed:
