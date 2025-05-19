@@ -7,3 +7,4 @@ aiohttp>=3.8
 # Check for the latest stable version of pystun3
 aioquic
 cryptography
+pytest
