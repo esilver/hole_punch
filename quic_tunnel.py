@@ -160,6 +160,9 @@ class QuicTunnel:
         # relay is fully established (mainly on the server side where the
         # relay is spun up only after the first data frame is observed).
         self._pending_quic_stream_data: Dict[int, List[bytes]] = {}
+        # Buffer to accumulate control-frame bytes per stream in case prefixes
+        # arrive split across StreamDataReceived events.
+        self._control_buffer: Dict[int, bytes] = {}
         self._quic_state_lock = asyncio.Lock() # Lock for QUIC connection operations
         self._on_close_callback = on_close_callback # Store callback
 
@@ -216,40 +219,36 @@ class QuicTunnel:
                     self._relay_tasks.append(asyncio.create_task(self._start_local_tcp_relay()))
 
                 if event.stream_id == self._quic_stream_id:
-                    # Attempt echo-detection regardless of TCP relay state
-                    data_str = ""
-                    try:
-                        data_str = event.data.decode()
-                    except UnicodeDecodeError:
-                        # Non-UTF8 payload – not an echo control frame.
-                        data_str = ""
+                    data = self._control_buffer.get(event.stream_id, b"") + event.data
+                    self._control_buffer[event.stream_id] = b""
+                    echo_prefix = b"QUIC_ECHO_REQUEST "
+                    chat_prefix = b"QUIC_CHAT_MESSAGE "
 
-                    # Efficiently handle the possibility that multiple echo requests
-                    # were coalesced into a single StreamDataReceived event.  We split
-                    # the buffer at the control-frame prefix and process each chunk
-                    # independently.
-                    if "QUIC_ECHO_REQUEST" in data_str:
-                        # The first element from split() may be an empty string if the
-                        # data begins with the prefix, so we skip empties.
-                        # We re-attach the prefix so each chunk is a full frame.
-                        potential_frames = [
-                            "QUIC_ECHO_REQUEST " + chunk for chunk in data_str.split("QUIC_ECHO_REQUEST ") if chunk
-                        ]
+                    pos = 0
+                    while pos < len(data):
+                        if data.startswith(echo_prefix, pos):
+                            next_echo = data.find(echo_prefix, pos + len(echo_prefix))
+                            next_chat = data.find(chat_prefix, pos + len(echo_prefix))
+                            next_indices = [i for i in (next_echo, next_chat) if i != -1]
+                            if not next_indices:
+                                self._control_buffer[event.stream_id] = data[pos:]
+                                pos = len(data)
+                                break
+                            frame_end = min(next_indices)
+                            frame_bytes = data[pos:frame_end]
+                            pos = frame_end
 
-                        for frame in potential_frames:
-                            parts = frame.split(" ", 3)
-                            # Expected format:
-                            #   QUIC_ECHO_REQUEST <worker_id> <timestamp> <payload>
+                            frame_str = frame_bytes.decode(errors="ignore")
+                            parts = frame_str.split(" ", 3)
                             if len(parts) < 3:
                                 print(
-                                    f"Worker '{self.worker_id}': Malformed QUIC_ECHO_REQUEST (too few parts): {frame}"
+                                    f"Worker '{self.worker_id}': Malformed QUIC_ECHO_REQUEST (too few parts): {frame_str}"
                                 )
                                 # Additional debug detail to help diagnose
                                 print(
                                     f"Worker '{self.worker_id}': Debug - split parts were: {parts}"
                                 )
                                 continue
-
                             request_worker_id = parts[1]
                             try:
                                 original_ts = float(parts[2])
@@ -262,11 +261,8 @@ class QuicTunnel:
                                     f"Worker '{self.worker_id}': Debug - original frame was: {frame}"
                                 )
                                 continue
-
                             echoed_payload = parts[3] if len(parts) > 3 else ""
-
                             if request_worker_id == self.worker_id:
-                                # This is *our* original request coming back – measure RTT.
                                 rtt_ms = (time.monotonic() - original_ts) * 1000
                                 print(
                                     f"Worker '{self.worker_id}': QUIC Echo response received, RTT: {rtt_ms:.2f} ms. Broadcasting to UI."
@@ -282,30 +278,32 @@ class QuicTunnel:
                                     )
                                 )
                             else:
-                                # This is a request from the peer – echo it back verbatim.
                                 if self._quic_stream_id is not None:
                                     try:
                                         self.quic_connection.send_stream_data(
-                                            self._quic_stream_id, frame.encode()
+                                            self._quic_stream_id, frame_bytes
                                         )
                                         self._transmit_pending_udp()
                                     except Exception as e_echo_send:
                                         print(
                                             f"Worker '{self.worker_id}': Error echoing QUIC request back: {e_echo_send}"
-                                    )
-                        # After handling echo frames (either responded or mirrored),
-                        # we continue to the next QUIC event so the remainder of the
-                        # processing logic does not incorrectly forward these control
-                        # frames to the TCP relay.
-                        event = self.quic_connection.next_event()
-                        continue
+                                        )
+                            continue
 
-                    if "QUIC_CHAT_MESSAGE" in data_str:
-                        potential_frames = [
-                            "QUIC_CHAT_MESSAGE " + chunk for chunk in data_str.split("QUIC_CHAT_MESSAGE ") if chunk
-                        ]
-                        for frame in potential_frames:
-                            parts = frame.split(" ", 3)
+                        if data.startswith(chat_prefix, pos):
+                            next_chat = data.find(chat_prefix, pos + len(chat_prefix))
+                            next_echo = data.find(echo_prefix, pos + len(chat_prefix))
+                            next_indices = [i for i in (next_chat, next_echo) if i != -1]
+                            if not next_indices:
+                                self._control_buffer[event.stream_id] = data[pos:]
+                                pos = len(data)
+                                break
+                            frame_end = min(next_indices)
+                            frame_bytes = data[pos:frame_end]
+                            pos = frame_end
+
+                            frame_str = frame_bytes.decode(errors="ignore")
+                            parts = frame_str.split(" ", 3)
                             if len(parts) < 3:
                                 continue
                             from_id = parts[1]
@@ -320,19 +318,28 @@ class QuicTunnel:
                                         }
                                     )
                                 )
-                        event = self.quic_connection.next_event()
-                        continue
+                            continue
 
-                    # Forward payload to local TCP relay or buffer until ready
-                    if self._local_tcp_writer:
-                        self._local_tcp_writer.write(event.data)
-                    else:
-                        self._pending_quic_stream_data.setdefault(event.stream_id, []).append(event.data)
+                        next_echo_idx = data.find(echo_prefix, pos)
+                        next_chat_idx = data.find(chat_prefix, pos)
+                        next_idx_candidates = [i for i in (next_echo_idx, next_chat_idx) if i != -1]
+                        next_idx = min(next_idx_candidates) if next_idx_candidates else len(data)
+                        payload = data[pos:next_idx]
+                        if payload:
+                            if self._local_tcp_writer:
+                                self._local_tcp_writer.write(payload)
+                            else:
+                                self._pending_quic_stream_data.setdefault(event.stream_id, []).append(payload)
+                        pos = next_idx
+
+                    if pos < len(data):
+                        self._control_buffer[event.stream_id] = data[pos:]
 
                     if event.end_stream:
                         print(f"Worker '{self.worker_id}': QUIC stream {event.stream_id} ended by peer.")
                         if self._local_tcp_writer:
                             self._local_tcp_writer.close()
+
             elif isinstance(event, PingAcknowledged):
                 # Simple keep-alive / RTT observation – we currently just log.
                 print(f"Worker '{self.worker_id}': QUIC PingAcknowledged (uid={event.uid}) from {self.peer_addr}.")
