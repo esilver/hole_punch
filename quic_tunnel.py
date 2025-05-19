@@ -258,7 +258,7 @@ class QuicTunnel:
                                 )
                                 # Extra debug information for troubleshooting
                                 print(
-                                    f"Worker '{self.worker_id}': Debug - original frame was: {frame}"
+                                    f"Worker '{self.worker_id}': Debug - original frame was: {frame_str}"
                                 )
                                 continue
                             echoed_payload = parts[3] if len(parts) > 3 else ""

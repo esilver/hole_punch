@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 # Using the wildcard ensures new modules are automatically included without needing manual Dockerfile edits.
 COPY *.py ./
 COPY index.html ./
+# Include certificates for QUIC connections
+COPY cert.pem ./
+COPY key.pem ./
 # If you have other ancillary files (e.g., certificates, static assets) place additional COPY commands here.
 
 # This worker doesn't run a Gunicorn server anymore; it runs the main.py script directly.
