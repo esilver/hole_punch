@@ -119,7 +119,27 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 self.associated_quic_tunnel = new_server_tunnel # Associate with this protocol instance
                 self.set_quic_engine(new_server_tunnel) # Inform main context this is the current/new engine
                 
-                asyncio.create_task(new_server_tunnel.feed_datagram(data, addr))
+                # Process the very first QUIC datagram (the Initial packet) *synchronously* to
+                # guarantee it is handled before any follow-up packets from the peer can arrive.
+                # Doing this inline avoids a race where the next datagram (e.g. a Handshake or ACK
+                # packet) would otherwise hit the connection first and trigger an assertion in
+                # aioquic ("first packet must be INITIAL").
+                try:
+                    # Directly feed the Initial packet without going through the async wrapper –
+                    # at this point no other coroutine has access to the new tunnel yet, so we can
+                    # safely bypass the internal asyncio lock.
+                    new_server_tunnel.quic_connection.receive_datagram(data, addr, now=time.time())
+                    new_server_tunnel._process_quic_events()
+                    new_server_tunnel._transmit_pending_udp()
+                except Exception as sync_init_err:  # pylint: disable=broad-except
+                    # If something goes wrong we fall back to the async path so the packet is at
+                    # least attempted, and we log the issue for diagnosis.
+                    print(f"Worker '{self.worker_id}': Error handling initial QUIC packet synchronously: {sync_init_err}. Falling back to async feed_datagram.")
+                    asyncio.create_task(new_server_tunnel.feed_datagram(data, addr))
+
+                # Start the tunnel's internal timer loop *after* the Initial packet has been
+                # processed so that timer management (e.g. retransmissions) has a valid starting
+                # state.
                 new_server_tunnel._start_timer_loop() 
                 print(f"Worker '{self.worker_id}': Lazy-created server-side QuicTunnel (associated with this protocol) upon first packet from {addr}.")
                 return

@@ -38,6 +38,13 @@
             <button id="toggleQuicLivePing" type="button">Start Live QUIC Ping</button>
         </div>
 
+        <div class="mb-4 flex space-x-2">
+            <button id="udpChatTab" class="px-3 py-1 rounded-md bg-indigo-600 text-white text-sm">UDP Chat</button>
+            <button id="quicChatTab" class="px-3 py-1 rounded-md bg-gray-300 text-sm">QUIC Chat</button>
+        </div>
+
+        <div id="udpChatSection">
+
         <div id="chatbox" class="custom-scrollbar h-96 border border-gray-300 rounded-lg p-4 overflow-y-auto mb-5 bg-gray-100 space-y-3">
             <!-- Messages will appear here -->
         </div>
@@ -50,6 +57,20 @@
         </div>
 
         <p id="slashHelp" class="text-xs text-gray-400 mb-7 hidden">/ping – UDP RTT  /echo – QUIC RTT</p>
+        </div> <!-- close udpChatSection -->
+
+        <div id="quicChatSection" class="hidden">
+        <div id="quicChatbox" class="custom-scrollbar h-96 border border-gray-300 rounded-lg p-4 overflow-y-auto mb-5 bg-gray-100 space-y-3">
+            <!-- QUIC messages will appear here -->
+        </div>
+
+        <div class="flex flex-col sm:flex-row items-center gap-3 mb-1">
+            <input type="text" id="quicMessageInput" placeholder="Type your QUIC message..." class="w-full sm:w-auto flex-grow p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
+            <button id="quicSendButton" type="button" class="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold py-4 px-8 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                Send
+            </button>
+        </div>
+        </div> <!-- close quicChatSection -->
 
         <div id="benchmarkSection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-slate-50 shadow">
             <h3 class="text-2xl font-semibold text-gray-800 mb-4">P2P UDP Throughput Benchmark</h3>
@@ -83,6 +104,13 @@
         const chatbox = document.getElementById('chatbox');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
+        const quicChatbox = document.getElementById('quicChatbox');
+        const quicMessageInput = document.getElementById('quicMessageInput');
+        const quicSendButton = document.getElementById('quicSendButton');
+        const udpChatTab = document.getElementById('udpChatTab');
+        const quicChatTab = document.getElementById('quicChatTab');
+        const udpChatSection = document.getElementById('udpChatSection');
+        const quicChatSection = document.getElementById('quicChatSection');
         const statusDiv = document.getElementById('status');
         const peerInfoDiv = document.getElementById('peerInfo');
         const benchmarkSizeInput = document.getElementById('benchmarkSize');
@@ -104,6 +132,28 @@
         let quicLivePingIntervalId = null;
         let quicPingTimeoutId = null;
 
+        function showUdpTab() {
+            udpChatTab.classList.add('bg-indigo-600', 'text-white');
+            udpChatTab.classList.remove('bg-gray-300');
+            quicChatTab.classList.remove('bg-indigo-600', 'text-white');
+            quicChatTab.classList.add('bg-gray-300');
+            udpChatSection.classList.remove('hidden');
+            quicChatSection.classList.add('hidden');
+        }
+
+        function showQuicTab() {
+            quicChatTab.classList.add('bg-indigo-600', 'text-white');
+            quicChatTab.classList.remove('bg-gray-300');
+            udpChatTab.classList.remove('bg-indigo-600', 'text-white');
+            udpChatTab.classList.add('bg-gray-300');
+            quicChatSection.classList.remove('hidden');
+            udpChatSection.classList.add('hidden');
+        }
+
+        udpChatTab.onclick = showUdpTab;
+        quicChatTab.onclick = showQuicTab;
+        showUdpTab();
+
         function addMessage(text, type = "system", sender = "") {
             const messageDiv = document.createElement('div');
             messageDiv.classList.add('p-3', 'rounded-xl', 'max-w-[90%]', 'break-words', 'shadow-sm', 'text-base');
@@ -121,6 +171,25 @@
             messageDiv.textContent = fullMessageText;
             chatbox.appendChild(messageDiv);
             chatbox.scrollTop = chatbox.scrollHeight;
+        }
+
+        function addQuicMessage(text, type = "system", sender = "") {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('p-3', 'rounded-xl', 'max-w-[90%]', 'break-words', 'shadow-sm', 'text-base');
+            let fullMessageText = text;
+
+            if (type === 'local') {
+                messageDiv.classList.add('bg-indigo-600', 'text-white', 'ml-auto', 'rounded-br-lg');
+                fullMessageText = text;
+            } else if (type === 'peer') {
+                messageDiv.classList.add('bg-slate-200', 'text-slate-800', 'mr-auto', 'rounded-bl-lg');
+                fullMessageText = sender ? `${sender}: ${text}` : text;
+            } else {
+                messageDiv.classList.add('bg-slate-100', 'text-slate-600', 'text-sm', 'italic', 'text-center', 'w-full', 'max-w-full', 'py-2', 'mx-auto', 'rounded-md');
+            }
+            messageDiv.textContent = fullMessageText;
+            quicChatbox.appendChild(messageDiv);
+            quicChatbox.scrollTop = quicChatbox.scrollHeight;
         }
 
         function connectToLocalBackend() {
@@ -155,6 +224,8 @@
                         }
                     } else if (data.type === "p2p_message_received") {
                         addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
+                    } else if (data.type === "quic_message_received") {
+                        addQuicMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
                     } else if (data.type === "p2p_status_update") {
                         addMessage(`P2P Status: ${data.message}`, "system");
                         if (data.peer_id) {
@@ -229,6 +300,7 @@
         }
 
         sendButton.onclick = sendChat;
+        quicSendButton.onclick = sendQuicChat;
 
         function sendChat() {
             const messageText = messageInput.value.trim();
@@ -244,6 +316,22 @@
             }
             else {
                 addMessage("Cannot send message. Not connected to local backend.", "system");
+            }
+        }
+
+        function sendQuicChat() {
+            const messageText = quicMessageInput.value.trim();
+            if (messageText && localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({
+                    type: "send_quic_message",
+                    content: messageText
+                }));
+                addQuicMessage(messageText, "local");
+                quicMessageInput.value = '';
+            } else if (!messageText) {
+                addQuicMessage("Cannot send an empty message.", "system");
+            } else {
+                addQuicMessage("Cannot send message. Not connected to local backend.", "system");
             }
         }
 
@@ -264,6 +352,15 @@
                     localUiSocket.send(JSON.stringify({ type: 'quic_echo_command', payload: 'echo ' + Date.now() }));
                     messageInput.value = '';
                     return;
+                }
+            }
+        });
+
+        quicMessageInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                if (quicMessageInput.value.trim().length > 0) {
+                    quicSendButton.click();
                 }
             }
         });
