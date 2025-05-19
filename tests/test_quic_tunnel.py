@@ -106,3 +106,44 @@ class TestQuicTunnelSendData(unittest.TestCase):
         asyncio.run(qt.send_app_data(b"hello"))
         self.assertIsNotNone(qt._quic_stream_id)
         self.assertEqual(qt.quic_connection.sent[0][1], b"hello")
+
+class EventQueueQuicConnection(QuicConnection):
+    """QuicConnection stub that returns predefined events."""
+    def __init__(self, events=None):
+        super().__init__()
+        self.events = list(events or [])
+    def next_event(self):
+        return self.events.pop(0) if self.events else None
+
+class TestQuicTunnelEvents(unittest.IsolatedAsyncioTestCase):
+    async def test_handshake_completion_sets_flag(self):
+        HandshakeCompleted = sys.modules["aioquic.quic.events"].HandshakeCompleted
+        ev = HandshakeCompleted()
+        ev.alpn_protocol = "test"
+        qc = EventQueueQuicConnection([ev])
+        qt = QuicTunnel("worker", ("127.0.0.1", 9999), lambda d, a: None, False)
+        qt.quic_connection = qc
+        qt._process_quic_events()
+        await asyncio.sleep(0)
+        self.assertTrue(qt.handshake_completed)
+
+    async def test_connection_terminated_triggers_close(self):
+        TermClass = type("TermEvent", (), {})
+        sys.modules["aioquic.quic.events"].ConnectionTerminated = TermClass
+        import quic_tunnel
+        quic_tunnel.ConnectionTerminated = TermClass
+        ev = TermClass()
+        ev.error_code = 0
+        ev.reason_phrase = "bye"
+        qc = EventQueueQuicConnection([ev])
+        qt = QuicTunnel("worker", ("127.0.0.1", 9999), lambda d, a: None, False)
+        qt.quic_connection = qc
+        closed = False
+        async def dummy_close():
+            nonlocal closed
+            closed = True
+        qt.close = dummy_close
+        qt._process_quic_events()
+        await asyncio.sleep(0)
+        self.assertTrue(qt._connection_terminated)
+        self.assertTrue(closed)
