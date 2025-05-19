@@ -446,7 +446,8 @@ class QuicTunnel:
                 self._quic_stream_id = None
 
     async def _local_tcp_to_quic_loop(self):
-        if not self._local_tcp_reader or not self._quic_stream_id: return
+        if self._local_tcp_reader is None or self._quic_stream_id is None:
+            return
         try:
             while True:
                 data = await self._local_tcp_reader.read(4096)
