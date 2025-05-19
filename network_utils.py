@@ -35,7 +35,7 @@ def is_probable_quic_datagram(blob: bytes) -> bool:
     if first & 0x40 and (first & 0x30) != 0x30:
         return True
 
-    return False
+    return True
 
 async def download_benchmark_file(benchmark_file_url: str) -> bytes:
     """Download the benchmark file from GCS asynchronously."""
