@@ -362,27 +362,44 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
             def udp_sender_for_quic(data_to_send: bytes, destination_addr: Tuple[str, int]):
                 if p2p_udp_transport and not p2p_udp_transport.is_closing():
                     p2p_udp_transport.sendto(data_to_send, destination_addr)
+                    print(
+                        f"Worker '{worker_id}': udp_sender_for_quic sent {len(data_to_send)} bytes to {destination_addr}"
+                    )
                 else:
-                    print(f"Worker '{worker_id}': QUIC UDP sender: P2P transport not available or closing. Cannot send.")
+                    print(
+                        f"Worker '{worker_id}': QUIC UDP sender: P2P transport not available or closing. Cannot send."
+                    )
 
-            def client_tunnel_on_close():
-                global quic_engine, p2p_protocol_instance
-                if p2p_protocol_instance and p2p_protocol_instance.associated_quic_tunnel is quic_engine:
-                    p2p_protocol_instance.associated_quic_tunnel = None
-                quic_engine = None
-
-            quic_engine = QuicTunnel(
+            new_quic_engine = QuicTunnel(
                 worker_id_val=worker_id,
                 peer_addr_val=current_p2p_peer_addr,
                 udp_sender_func=udp_sender_for_quic,
                 is_client_role=True,
-                on_close_callback=client_tunnel_on_close,
+                on_close_callback=None,
             )
+
+            def client_tunnel_on_close() -> None:
+                global quic_engine, p2p_protocol_instance
+                if (
+                    p2p_protocol_instance
+                    and p2p_protocol_instance.associated_quic_tunnel is new_quic_engine
+                ):
+                    p2p_protocol_instance.associated_quic_tunnel = None
+                if quic_engine is new_quic_engine:
+                    quic_engine = None
+                print(
+                    f"Worker '{worker_id}': client QuicTunnel closed for {new_quic_engine.peer_addr}"
+                )
+
+            new_quic_engine._on_close_callback = client_tunnel_on_close
+            quic_engine = new_quic_engine
             if p2p_protocol_instance:
-                p2p_protocol_instance.associated_quic_tunnel = quic_engine
+                p2p_protocol_instance.associated_quic_tunnel = new_quic_engine
             await asyncio.sleep(0.5)
-            await quic_engine.connect_if_client()
-            print(f"Worker '{worker_id}': QUIC engine setup initiated for peer {current_p2p_peer_addr}. Role: Client")
+            await new_quic_engine.connect_if_client()
+            print(
+                f"Worker '{worker_id}': QUIC engine setup initiated for peer {current_p2p_peer_addr}. Role: Client"
+            )
         else:
             print(f"Worker '{worker_id}': Acting as QUIC Server – will create tunnel on first inbound Initial packet.")
 
