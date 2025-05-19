@@ -231,12 +231,22 @@ class QuicTunnel:
                             next_chat = data.find(chat_prefix, pos + len(echo_prefix))
                             next_indices = [i for i in (next_echo, next_chat) if i != -1]
                             if not next_indices:
-                                self._control_buffer[event.stream_id] = data[pos:]
-                                pos = len(data)
-                                break
-                            frame_end = min(next_indices)
-                            frame_bytes = data[pos:frame_end]
-                            pos = frame_end
+                                candidate = data[pos:]
+                                candidate_str = candidate.decode(errors="ignore")
+                                # Attempt to parse even without a following prefix
+                                candidate_parts = candidate_str.split(" ", 3)
+                                if len(candidate_parts) < 3:
+                                    # Incomplete frame – store and wait for more data
+                                    self._control_buffer[event.stream_id] = candidate
+                                    pos = len(data)
+                                    break
+                                frame_end = len(data)
+                                frame_bytes = candidate
+                                pos = frame_end
+                            else:
+                                frame_end = min(next_indices)
+                                frame_bytes = data[pos:frame_end]
+                                pos = frame_end
 
                             frame_str = frame_bytes.decode(errors="ignore")
                             parts = frame_str.split(" ", 3)
@@ -258,7 +268,7 @@ class QuicTunnel:
                                 )
                                 # Extra debug information for troubleshooting
                                 print(
-                                    f"Worker '{self.worker_id}': Debug - original frame was: {frame}"
+                                    f"Worker '{self.worker_id}': Debug - original frame was: {frame_str}"
                                 )
                                 continue
                             echoed_payload = parts[3] if len(parts) > 3 else ""
@@ -295,12 +305,20 @@ class QuicTunnel:
                             next_echo = data.find(echo_prefix, pos + len(chat_prefix))
                             next_indices = [i for i in (next_chat, next_echo) if i != -1]
                             if not next_indices:
-                                self._control_buffer[event.stream_id] = data[pos:]
-                                pos = len(data)
-                                break
-                            frame_end = min(next_indices)
-                            frame_bytes = data[pos:frame_end]
-                            pos = frame_end
+                                candidate = data[pos:]
+                                candidate_str = candidate.decode(errors="ignore")
+                                candidate_parts = candidate_str.split(" ", 3)
+                                if len(candidate_parts) < 3:
+                                    self._control_buffer[event.stream_id] = candidate
+                                    pos = len(data)
+                                    break
+                                frame_end = len(data)
+                                frame_bytes = candidate
+                                pos = frame_end
+                            else:
+                                frame_end = min(next_indices)
+                                frame_bytes = data[pos:frame_end]
+                                pos = frame_end
 
                             frame_str = frame_bytes.decode(errors="ignore")
                             parts = frame_str.split(" ", 3)
