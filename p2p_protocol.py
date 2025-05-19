@@ -41,6 +41,11 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {self.internal_udp_port}).")
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        recv_time = time.monotonic()
+        print(
+            f"Worker '{self.worker_id}': P2PUDPProtocol.datagram_received from {addr} at {recv_time:.4f}, size {len(data)}"
+        )
+
         # Use the tunnel specifically associated with this protocol instance if active.
         active_tunnel = self.associated_quic_tunnel
         
@@ -63,6 +68,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         f"{old_addr} ➜ {addr}. Updated QuicTunnel.peer_addr and global peer addr."
                     )
                 
+                print(
+                    f"Worker '{self.worker_id}': Feeding datagram to QUIC tunnel at {time.monotonic():.4f}"
+                )
                 asyncio.create_task(active_tunnel.feed_datagram(data, addr))
                 return
             # If not a QUIC datagram, it falls through to JSON/benchmark processing below,
