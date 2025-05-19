@@ -284,11 +284,34 @@ class QuicTunnel:
                                     except Exception as e_echo_send:
                                         print(
                                             f"Worker '{self.worker_id}': Error echoing QUIC request back: {e_echo_send}"
-                                        )
+                                    )
                         # After handling echo frames (either responded or mirrored),
                         # we continue to the next QUIC event so the remainder of the
                         # processing logic does not incorrectly forward these control
                         # frames to the TCP relay.
+                        event = self.quic_connection.next_event()
+                        continue
+
+                    if "QUIC_CHAT_MESSAGE" in data_str:
+                        potential_frames = [
+                            "QUIC_CHAT_MESSAGE " + chunk for chunk in data_str.split("QUIC_CHAT_MESSAGE ") if chunk
+                        ]
+                        for frame in potential_frames:
+                            parts = frame.split(" ", 3)
+                            if len(parts) < 3:
+                                continue
+                            from_id = parts[1]
+                            content = parts[3] if len(parts) > 3 else ""
+                            if from_id != self.worker_id:
+                                asyncio.create_task(
+                                    broadcast_to_all_ui_clients(
+                                        {
+                                            "type": "quic_message_received",
+                                            "from_peer_id": from_id,
+                                            "content": content,
+                                        }
+                                    )
+                                )
                         event = self.quic_connection.next_event()
                         continue
 

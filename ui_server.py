@@ -126,6 +126,25 @@ async def ui_websocket_handler(
                     else:
                         await websocket.send(json.dumps({"type": "system_message", "message": "Cannot send QUIC Echo: QUIC tunnel not ready."}))
 
+                elif msg_type == "send_quic_message":
+                    quic_engine = get_quic_engine_global_func()
+                    content = message.get("content", "")
+                    if not content:
+                        await websocket.send(json.dumps({"type": "error", "message": "Cannot send empty message."}))
+                    elif quic_engine and getattr(quic_engine, "handshake_completed", False):
+                        timestamp = time.monotonic()
+                        payload = f"QUIC_CHAT_MESSAGE {worker_id_val} {timestamp} {content}".encode()
+                        try:
+                            await quic_engine.send_app_data(payload)
+                        except Exception as e:
+                            console_msg = f"Error sending QUIC chat: {e}"
+                            print(console_msg)
+                            await websocket.send(json.dumps({"type": "system_message", "message": console_msg}))
+                        else:
+                            print(f"Worker '{worker_id_val}': Sent QUIC chat '{content}'")
+                    else:
+                        await websocket.send(json.dumps({"type": "system_message", "message": "Cannot send QUIC chat: QUIC tunnel not ready."}))
+
                 elif msg_type == "p2p_ping_response": # Received from P2PUDPProtocol broadcast
                     original_timestamp = message.get("original_timestamp")
                     from_peer = message.get("from_peer_id") # Should be the remote peer
