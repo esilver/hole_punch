@@ -158,17 +158,23 @@ async def ui_websocket_handler(
                             "peer_id": from_peer
                         }))
                 
-                elif msg_type == "quic_echo_response": # Received from QuicTunnel broadcast
+                elif msg_type == "quic_echo_response":  # Received from QuicTunnel broadcast
                     rtt_ms = message.get("rtt_ms")
                     echoed_payload = message.get("payload")
-                    from_peer_addr = message.get("peer") # This is peer_addr from QuicTunnel event
-                    print(f"Worker '{worker_id_val}': Received QUIC Echo Response from peer {from_peer_addr}. RTT: {rtt_ms:.2f} ms. Payload: '{echoed_payload}'")
-                    await websocket.send(json.dumps({
-                        "type": "quic_echo_result", # New type for UI
-                        "rtt_ms": rtt_ms,
-                        "payload": echoed_payload,
-                        "peer": from_peer_addr
-                    }))
+                    from_peer_addr = message.get("peer")  # This is peer_addr from QuicTunnel event
+                    print(
+                        f"Worker '{worker_id_val}': Received QUIC Echo Response from peer {from_peer_addr}. RTT: {rtt_ms:.2f} ms. Payload: '{echoed_payload}'"
+                    )
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "quic_echo_response",  # Keep original type for frontend handlers
+                                "rtt_ms": rtt_ms,
+                                "payload": echoed_payload,
+                                "peer": from_peer_addr,
+                            }
+                        )
+                    )
 
                 elif msg_type == "ui_client_hello":
                     print(f"Worker '{worker_id_val}': UI Client says hello.")

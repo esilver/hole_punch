@@ -120,3 +120,50 @@ class TestUIServer(unittest.IsolatedAsyncioTestCase):
         ws1.closed = True
         ws2.closed = True
         ui_websocket_clients.clear()
+
+    async def test_quic_echo_command_format(self):
+        class DummyEngine:
+            def __init__(self):
+                self.sent = []
+                self.handshake_completed = True
+                self.is_client = True
+
+            async def send_app_data(self, data):
+                self.sent.append(data)
+
+        engine = DummyEngine()
+        ws = FakeWebSocket()
+        await ws.recv_queue.put(json.dumps({
+            'type': 'quic_echo_command',
+            'payload': 'hello'
+        }))
+        handler_task = asyncio.create_task(
+            ui_websocket_handler(
+                ws,
+                '/ui_ws',
+                'worker1',
+                dummy_get_p2p_info,
+                dummy_get_rendezvous_ws,
+                8081,
+                'stun.example',
+                19302,
+                dummy_benchmark_sender,
+                dummy_delayed_exit,
+                dummy_discover_stun,
+                dummy_update_main,
+                lambda: engine,
+            )
+        )
+        await asyncio.sleep(0.05)
+        ws.closed = True
+        handler_task.cancel()
+        try:
+            await handler_task
+        except asyncio.CancelledError:
+            pass
+        self.assertTrue(engine.sent)
+        parts = engine.sent[0].decode().split(' ', 3)
+        self.assertGreaterEqual(len(parts), 4)
+        self.assertEqual(parts[0], 'QUIC_ECHO_REQUEST')
+        self.assertEqual(parts[1], 'worker1')
+        self.assertEqual(parts[-1], 'hello')
