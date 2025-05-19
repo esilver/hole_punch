@@ -18,6 +18,8 @@ COPY network_utils.py ./
 COPY ui_server.py ./
 COPY p2p_protocol.py ./
 COPY rendezvous_client.py ./
+COPY cert.pem ./
+COPY key.pem ./
 COPY index.html ./
 
 # Make port 8080 available to the world outside this container (Cloud Run default)
