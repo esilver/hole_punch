@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -133,6 +134,56 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error connecting to rendezvous: %v\n", err)
 			// Not exiting here, as we might still want the worker to run for other tests.
+		} else {
+			// Successfully registered, now try to discover peers
+			fmt.Println("Worker successfully registered with rendezvous.")
+			rendezvousHTTPURL := os.Getenv("RENDEZVOUS_SERVICE_URL")
+			if rendezvousHTTPURL == "" {
+				fmt.Println("RENDEZVOUS_SERVICE_URL not set, skipping peer discovery.")
+			} else {
+				peersURL := rendezvousHTTPURL + "/peers"
+				fmt.Printf("Discovering peers from: %s\n", peersURL)
+				resp, err := http.Get(peersURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error fetching peers: %v\n", err)
+				} else {
+					defer resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						bodyBytes, _ := io.ReadAll(resp.Body)
+						fmt.Fprintf(os.Stderr, "Error fetching peers: status %s, body: %s\n", resp.Status, string(bodyBytes))
+					} else {
+						// The rendezvous service returns a map[peer.ID]ma.Multiaddr
+						// For the client, it's easier to decode into map[string]string (peer.ID string to multiaddr string)
+						// and then convert as needed.
+						// var discoveredPeers map[string]string //peer.ID can't be a JSON map key directly in simple decoding
+						// The actual structure is map[peer.ID]ma.Multiaddr, so we'll decode to map[string]string
+						// and then process. The NEXT_STEPS guide implies a `peerList` which is an array/slice.
+						// Let's assume for now the /peers endpoint returns a structure that can be decoded into `peerList`.
+						// The rendezvous implementation returns map[peer.ID]ma.Multiaddr.
+						// For simplicity with the NEXT_STEPS.md snippet, we'll assume it provides a list of AddrInfo or similar.
+						// However, the actual rendezvous code returns a map.
+						// Let's adapt to what rendezvous *actually* provides.
+						// The registeredPeers map in rendezvous is map[peer.ID]ma.Multiaddr.
+						// JSON encoding of this will be map[string]string (peer.ID.String() -> ma.Multiaddr.String())
+						var peersMap map[string]string
+						if err := json.NewDecoder(resp.Body).Decode(&peersMap); err != nil {
+							fmt.Fprintf(os.Stderr, "Error decoding peers response: %v\n", err)
+						} else {
+							fmt.Printf("Discovered %d peers:\n", len(peersMap))
+							for pidStr, addrStr := range peersMap {
+								fmt.Printf("  Peer ID: %s, Addr: %s\n", pidStr, addrStr)
+								// Here you could try to convert pidStr to peer.ID and addrStr to ma.Multiaddr
+								// and then potentially to peer.AddrInfo for dialing, as suggested by step 2.2.
+							}
+							// The NEXT_STEPS.md snippet for worker (section 1.3) is:
+							// peersResp, _ := http.Get(os.Getenv("RENDEZVOUS_SERVICE_URL") + "/peers")
+							// This implies the response might be directly usable or further processed.
+							// For step 1.3, just getting the response is shown.
+							// We've added printing the decoded peers.
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -167,4 +218,4 @@ func startHealthServer() {
 			fmt.Fprintf(os.Stderr, "health server error: %v\n", err)
 		}
 	}()
-} 
+}

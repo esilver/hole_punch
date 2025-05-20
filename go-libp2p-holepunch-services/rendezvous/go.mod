@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/libp2p/go-libp2p v0.41.1
 	github.com/multiformats/go-multiaddr v0.15.0
+	github.com/soheilhy/cmux v0.1.5
 	github.com/stretchr/testify v1.10.0
 )
 

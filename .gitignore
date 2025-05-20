@@ -1,3 +1,6 @@
 .venv/
 go-libp2p-master/
 examples/
+
+# Go build cache bin files
+build-test-bin

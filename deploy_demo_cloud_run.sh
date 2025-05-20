@@ -3,7 +3,7 @@
 # It builds both images with Cloud Build, deploys rendezvous, grabs its URL,
 # then deploys the worker with RENDEZVOUS_SERVICE_URL set.
 #
-# Usage: ./deploy_demo_cloud_run.sh <PROJECT_ID> <REGION> [TAG]
+# Usage: ./deploy_demo_cloud_run.sh <PROJECT_ID> <REGION> [TAG] [NUM_WORKERS]
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
@@ -19,7 +19,7 @@ fi
 
 if [[ -z "$PROJECT_ID" ]]; then
   echo "ERROR: PROJECT_ID not supplied and no default configured (gcloud config get-value project)." >&2
-  echo "Usage: $0 <PROJECT_ID> [REGION] [TAG]" >&2
+  echo "Usage: $0 <PROJECT_ID> [REGION] [TAG] [NUM_WORKERS]" >&2
   exit 1
 fi
 
@@ -29,7 +29,19 @@ else
   REGION=$1; shift
 fi
 
+# Optional third positional arg is TAG (container image tag).
+# Optional fourth positional arg is NUM_WORKERS (default 1).
 TAG=${1:-demo}
+shift || true
+
+# If the next arg looks like an integer, treat it as NUM_WORKERS, else default 1.
+if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+  NUM_WORKERS=$1; shift
+else
+  NUM_WORKERS=1
+fi
+
+echo "Will start $NUM_WORKERS worker instance(s)."
 
 ROOT_DIR="$(cd "$(dirname "$0")"; pwd)"
 SERVICES_DIR="$ROOT_DIR/go-libp2p-holepunch-services"
@@ -64,10 +76,18 @@ deploy_service() {
     --allow-unauthenticated --session-affinity --max-instances=2 "$@"
 }
 
-# Build & deploy rendezvous
+# Build & deploy peerapi first
+PEERAPI_IMAGE=$(build_and_push peerapi)
+"$ROOT_DIR/deploy_cloud_run.sh" peerapi "$PROJECT_ID" "$REGION" "$TAG" --deploy-only --min-instances=1
+
+# Capture peerapi URL (used by both rendezvous & workers)
+PEERAPI_URL=$(gcloud run services describe peerapi --project "$PROJECT_ID" --region "$REGION" --platform managed --format='value(status.url)')
+if [[ -z "$PEERAPI_URL" ]]; then echo "Failed to obtain peerapi URL" >&2; exit 1; fi
+echo "peerapi URL: $PEERAPI_URL"
+
+# Build & deploy rendezvous (with PEER_DISCOVERY_URL)
 RV_IMAGE=$(build_and_push rendezvous)
-# Keep one rendezvous instance warm so the peer dial succeeds even after idle periods.
-"$ROOT_DIR/deploy_cloud_run.sh" rendezvous "$PROJECT_ID" "$REGION" "$TAG" --deploy-only --min-instances=1
+"$ROOT_DIR/deploy_cloud_run.sh" rendezvous "$PROJECT_ID" "$REGION" "$TAG" --deploy-only --min-instances=1 --set-env-vars "PEER_DISCOVERY_URL=$PEERAPI_URL"
 
 # -----------------------------------------------------------------------------
 # Grab the service URL (useful for browser access / debugging)
@@ -139,12 +159,15 @@ fi
 # Build & deploy worker (inject env var)
 WK_IMAGE=$(build_and_push worker)
 
-ENV_VARS=("RENDEZVOUS_SERVICE_URL=$RV_URL")
+ENV_VARS=("RENDEZVOUS_SERVICE_URL=$PEERAPI_URL")
 if [[ -n "$RV_MULTIADDR" ]]; then ENV_VARS+=("RENDEZVOUS_MULTIADDR=$RV_MULTIADDR"); fi
 
 # Join env vars with comma for gcloud flag
 ENV_VARS_JOINED=$(IFS=, ; echo "${ENV_VARS[*]}")
 
-"$ROOT_DIR/deploy_cloud_run.sh" worker "$PROJECT_ID" "$REGION" "$TAG" --deploy-only --set-env-vars "$ENV_VARS_JOINED" --min-instances=1
+# Deploy worker service with the requested baseline instances so Cloud Run spins
+# them up immediately (each worker keeps an idle HTTP listener so additional
+# scaling is unlikely without min-instances).
+"$ROOT_DIR/deploy_cloud_run.sh" worker "$PROJECT_ID" "$REGION" "$TAG" --deploy-only --set-env-vars "$ENV_VARS_JOINED" --min-instances=$NUM_WORKERS --max-instances=$NUM_WORKERS --args ""
 
 echo "\nDemo deployed!\nRendezvous HTTP URL: $RV_URL" 

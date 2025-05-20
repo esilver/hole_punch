@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -40,6 +44,17 @@ func registrationHandler(s network.Stream) {
 	registeredPeersMutex.Unlock()
 
 	fmt.Printf("Rendezvous: Worker %s registered with address %s. Total registered: %d\n", remotePeerID, remoteAddr, len(registeredPeers))
+
+	// If a peer discovery service URL is set, forward this registration.
+	if peerAPI := os.Getenv("PEER_DISCOVERY_URL"); peerAPI != "" {
+		payload := map[string]string{"id": remotePeerID.String(), "addr": remoteAddr.String()}
+		if data, err := json.Marshal(payload); err == nil {
+			_, err := http.Post(fmt.Sprintf("%s/peers", peerAPI), "application/json", bytes.NewReader(data))
+			if err != nil {
+				fmt.Printf("Rendezvous: Failed to replicate to discovery API: %v\n", err)
+			}
+		}
+	}
 
 	// Optional: Read any data sent by the worker on this stream.
 	// For example, the worker might send its list of listen addresses.
@@ -116,6 +131,71 @@ func main() {
 	h.SetStreamHandler(ProtocolIDForRegistration, registrationHandler)
 	fmt.Printf("Set stream handler for protocol: %s\n", ProtocolIDForRegistration)
 
+	// -------------------------------------------------------------------
+	// HTTP Peer-Discovery API
+	// -------------------------------------------------------------------
+	// Running an HTTP server on the SAME port as the libp2p listeners leads
+	// to 400 Bad Request responses because the websocket transport's upgrade
+	// handler rejects non-websocket traffic. To avoid this conflict, we expose
+	// the discovery API on a **separate** HTTP port. By default this is 8080
+	// or you can override with HTTP_PORT env-var.
+
+	// Optional internal HTTP peer list API (useful for local dev). Only started
+	// when ENABLE_INTERNAL_HTTP="1" (default "0" to prevent Cloud Run port clashes).
+	if os.Getenv("ENABLE_INTERNAL_HTTP") == "1" {
+		httpPort := 8080
+		if hpStr := os.Getenv("HTTP_PORT"); hpStr != "" {
+			if hp, err := strconv.Atoi(hpStr); err == nil {
+				httpPort = hp
+			}
+		}
+
+		// Register handlers on the default mux.
+		http.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
+			registeredPeersMutex.Lock()
+			defer registeredPeersMutex.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(registeredPeers); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		})
+
+		http.HandleFunc("/peers/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			idStr := strings.TrimPrefix(r.URL.Path, "/peers/")
+			pid, err := peer.Decode(idStr)
+			if err != nil {
+				http.Error(w, "Invalid peer ID", http.StatusBadRequest)
+				return
+			}
+			registeredPeersMutex.Lock()
+			delete(registeredPeers, pid)
+			registeredPeersMutex.Unlock()
+			// Propagate deletion to peer discovery service if configured.
+			if peerAPI := os.Getenv("PEER_DISCOVERY_URL"); peerAPI != "" {
+				req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/peers/%s", peerAPI, pid.String()), nil)
+				if _, err := http.DefaultClient.Do(req); err != nil {
+					fmt.Printf("Rendezvous: Failed to propagate delete to discovery API: %v\n", err)
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
+			fmt.Printf("Rendezvous: Peer %s deleted via API\n", pid)
+		})
+
+		// Start the HTTP server in a goroutine so it doesn't block.
+		go func() {
+			addr := fmt.Sprintf(":%d", httpPort)
+			fmt.Printf("Rendezvous: INTERNAL HTTP peer API listening on %s (endpoints: /peers, /peers/{id})\n", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Rendezvous HTTP server error: %v\n", err)
+			}
+		}()
+	}
+
 	// TODO: Implement rendezvous logic here.
 	// For now, the service will just start, print its addresses, and wait for a signal.
 
@@ -148,4 +228,4 @@ func getPeerAddr(p host.Host) (ma.Multiaddr, error) {
 		return nil, fmt.Errorf("failed to create full multiaddr: %w", err)
 	}
 	return fullAddr, nil
-} 
+}

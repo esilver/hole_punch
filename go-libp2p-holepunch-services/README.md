@@ -53,4 +53,45 @@ cd ../worker && go test -v
 
 * Implement `/list` protocol so workers can discover each other.
 * Enable AutoNAT / AutoRelay and attempt direct or relayed connections.
-* Containerise each service (`Dockerfile`) and deploy to Cloud Run behind Cloud NAT. 
+* Containerise each service (`Dockerfile`) and deploy to Cloud Run behind Cloud NAT.
+
+## One-command Cloud Run deploy (experimental)
+
+If you have the Google Cloud CLI installed and already ran `gcloud auth login`, you can push
+and deploy all three demo services with a single helper script:
+
+```bash
+cd go-libp2p-holepunch-services
+
+# region and project are positional arguments
+./deploy_to_cloud_run.sh us-central1 my-gcp-project
+```
+
+What the script does:
+
+1. Build and push container images for `peerapi`, `rendezvous`, and `worker` to
+   `gcr.io/<project>/go-libp2p-holepunch-demo/…:latest`.
+2. Deploy **peerapi** first, capture its public URL.
+3. Deploy **rendezvous** with the env-var `PEER_DISCOVERY_URL=<peerapi-url>` so
+   every registration is mirrored to the JSON API.
+4. Ask you to copy the rendezvous node's libp2p **multi-address** from its
+   startup logs (Cloud Run generates a fresh peer ID every time).  Paste it
+   back to the script.
+5. Deploy **worker** with both `RENDEZVOUS_MULTIADDR` *and*
+   `RENDEZVOUS_SERVICE_URL` set.
+
+After the final step Cloud Run hosts three fully-working services:
+
+* peerapi      → JSON list of peers
+* rendezvous → libp2p WebSocket listener (wss)
+* worker      → connects, registers, then fetches the peer list
+
+You can scale out additional workers via
+
+```bash
+gcloud run jobs create worker-copy --image gcr.io/<project>/go-libp2p-holepunch-demo/worker:latest \
+  --region us-central1 --tasks 5 --set-env-vars "RENDEZVOUS_MULTIADDR=…,RENDEZVOUS_SERVICE_URL=<peerapi-url>" --execute-now
+```
+
+The script is a *convenience helper* — feel free to adjust it to your CI/CD
+pipeline or replace it with Terraform. 
