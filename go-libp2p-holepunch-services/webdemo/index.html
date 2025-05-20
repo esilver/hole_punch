@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>libp2p Hole Punch Chat</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: auto; }
+    textarea { width: 100%; height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>libp2p Hole Punch Chat</h1>
+  <label>Rendezvous multiaddr:
+    <input id="rv" style="width:90%" placeholder="/ip4/1.2.3.4/tcp/40001/ws/p2p/..." />
+  </label>
+  <button id="connect">Connect</button>
+  <div id="status"></div>
+  <textarea id="log" readonly></textarea><br>
+  <input id="msg" style="width:80%" placeholder="type a message" />
+  <button id="send" disabled>Send</button>
+
+<script type="module">
+import { createLibp2p } from 'https://unpkg.com/libp2p@0.46.6/dist/index.min.js?module'
+import { webSockets } from 'https://unpkg.com/@libp2p/websockets@0.17.0/dist/index.min.js?module'
+import { webRTC } from 'https://unpkg.com/@libp2p/webrtc@0.17.0/dist/index.min.js?module'
+import { noise } from 'https://unpkg.com/@chainsafe/libp2p-noise@11.0.0/dist/index.min.js?module'
+import { mplex } from 'https://unpkg.com/@libp2p/mplex@0.16.0/dist/index.min.js?module'
+import { multiaddr } from 'https://unpkg.com/@multiformats/multiaddr@11.1.0/dist/index.min.js?module'
+
+let node
+let conn
+const status = document.getElementById('status')
+const logBox = document.getElementById('log')
+
+function log (msg) {
+  logBox.value += msg + '\n'
+  logBox.scrollTop = logBox.scrollHeight
+}
+
+document.getElementById('connect').onclick = async () => {
+  const rv = document.getElementById('rv').value.trim()
+  if (!rv) return
+  status.textContent = 'starting libp2p...'
+  node = await createLibp2p({
+    transports: [webSockets(), webRTC()],
+    streamMuxers: [mplex()],
+    connectionEncryption: [noise()]
+  })
+  await node.start()
+  status.textContent = `peer id: ${node.peerId.toString()}`
+  log('node started with id ' + node.peerId.toString())
+
+  node.handle('/chat/1.0.0', async ({ stream }) => {
+    for await (const chunk of stream.source) {
+      log('peer: ' + new TextDecoder().decode(chunk))
+    }
+  })
+
+  const ma = multiaddr(rv)
+  const reg = await node.dialProtocol(ma, '/holepunch/rendezvous/1.0.0')
+  // send empty payload just to trigger ACK
+  await reg.sink((async function * () { yield new Uint8Array() })())
+  await reg.source.getReader().read()
+  reg.close?.()
+
+  const ls = await node.dialProtocol(ma, '/holepunch/list/1.0.0')
+  const { value } = await ls.source.getReader().read()
+  const peers = new TextDecoder().decode(value).trim().split('\n').filter(Boolean)
+  if (peers.length) {
+    const peerMa = multiaddr(peers[0])
+    conn = await node.dialProtocol(peerMa, '/chat/1.0.0')
+    log('connected to peer ' + peers[0])
+  } else {
+    log('no peers found; waiting for another peer to connect')
+  }
+  ls.close?.()
+  document.getElementById('send').disabled = false
+}
+
+document.getElementById('send').onclick = async () => {
+  if (!conn) return
+  const msg = document.getElementById('msg').value
+  document.getElementById('msg').value = ''
+  log('me: ' + msg)
+  await conn.sink((async function * () { yield new TextEncoder().encode(msg) })())
+}
+</script>
+</body>
+</html>

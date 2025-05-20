@@ -49,10 +49,11 @@ cd go-libp2p-holepunch-services/rendezvous && go test -v
 cd ../worker && go test -v
 ```
 
-## Next steps
+## Features
 
-* Implement `/list` protocol so workers can discover each other.
-* Enable AutoNAT / AutoRelay and attempt direct or relayed connections.
+* `/list` protocol allows workers to discover peers directly from the rendezvous service.
+* Workers use libp2p's hole punching and AutoRelay to form direct or relayed connections.
+  Set `LIBP2P_RELAY_BOOTSTRAP` to a relay multiaddr if you provide one.
 * Containerise each service (`Dockerfile`) and deploy to Cloud Run behind Cloud NAT.
 
 ## One-command Cloud Run deploy (experimental)
@@ -95,3 +96,7 @@ gcloud run jobs create worker-copy --image gcr.io/<project>/go-libp2p-holepunch-
 
 The script is a *convenience helper* — feel free to adjust it to your CI/CD
 pipeline or replace it with Terraform. 
+## Browser demo
+
+A simple web interface lives in [`webdemo/index.html`](webdemo/index.html). Serve this directory with any static file server and open the page in two browser windows. Enter the rendezvous multiaddress printed by the service and click **Connect**. Once a second peer joins you can exchange chat messages and watch the hole punching attempts in the browser console.
+
