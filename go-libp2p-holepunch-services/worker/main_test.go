@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,4 +48,43 @@ func TestWorkerConnectsAndRegisters(t *testing.T) {
 	// Call connectAndRegisterWithRendezvous
 	err = connectAndRegisterWithRendezvous(ctx, workerHost, rendezvousMaddrStr)
 	require.NoError(t, err)
-} 
+}
+
+// TestDiscoverPeersAndDial uses the list protocol to connect two workers via the rendezvous host.
+func TestDiscoverPeersAndDial(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rvHost, err := createWorkerHost(ctx, 0)
+	require.NoError(t, err)
+	defer rvHost.Close()
+	rvHost.SetStreamHandler(ProtocolIDForRegistration, simpleRegistrationHandlerForTest)
+	rvHost.SetStreamHandler(ProtocolIDForPeerList, listHandler)
+
+	w1, err := createWorkerHost(ctx, 0)
+	require.NoError(t, err)
+	defer w1.Close()
+
+	w2, err := createWorkerHost(ctx, 0)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	addrStr := fmt.Sprintf("%s/p2p/%s", rvHost.Addrs()[0], rvHost.ID())
+	require.NoError(t, connectAndRegisterWithRendezvous(ctx, w1, addrStr))
+	require.NoError(t, connectAndRegisterWithRendezvous(ctx, w2, addrStr))
+
+	peers, err := discoverPeersViaListProtocol(ctx, w1, addrStr)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(peers), 1)
+
+	// w1 should dial w2
+	var info peer.AddrInfo
+	for _, p := range peers {
+		if p.ID == w2.ID() {
+			info = p
+			break
+		}
+	}
+	require.NotEqual(t, peer.ID(""), info.ID)
+	require.NoError(t, w1.Connect(ctx, info))
+}
