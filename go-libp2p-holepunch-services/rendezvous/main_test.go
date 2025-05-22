@@ -222,7 +222,7 @@ func TestListProtocolReturnsPeers(t *testing.T) {
 	rvHost, err := createHost(ctx, 0)
 	require.NoError(t, err)
 	defer rvHost.Close()
-	rvHost.SetStreamHandler(ProtocolIDForRegistration, simpleRegistrationHandlerForTest)
+	rvHost.SetStreamHandler(ProtocolIDForRegistration, registrationHandler)
 	rvHost.SetStreamHandler(ProtocolIDForPeerList, listHandler)
 
 	// worker1

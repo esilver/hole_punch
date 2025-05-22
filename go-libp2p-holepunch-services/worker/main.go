@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -124,7 +123,6 @@ func createWorkerHost(ctx context.Context, listenPort int) (host.Host, error) {
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.Transport(ws.New),
 		libp2p.EnableHolePunching(),
-		libp2p.EnableAutoRelay(),
 		libp2p.NATPortMap(),
 	)
 	if err != nil {
