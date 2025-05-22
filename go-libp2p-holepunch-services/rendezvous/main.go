@@ -27,6 +27,10 @@ const DefaultPort = 40001
 // ProtocolIDForRegistration is the libp2p protocol ID used by workers to register.
 const ProtocolIDForRegistration = "/holepunch/rendezvous/1.0.0"
 
+// ProtocolIDForPeerList defines the protocol workers use to request
+// a list of currently registered peers.
+const ProtocolIDForPeerList = "/holepunch/list/1.0.0"
+
 // registeredPeers stores the PeerID and last known public Multiaddr of registered workers.
 // This is a simple in-memory store, not suitable for production without persistence and proper synchronization.
 var registeredPeers = make(map[peer.ID]ma.Multiaddr)
@@ -87,6 +91,28 @@ func registrationHandler(s network.Stream) {
 	fmt.Printf("Rendezvous: Registration for %s complete. Stream closed.\n", remotePeerID)
 }
 
+// listHandler writes the list of currently registered peers to the requester.
+// Each line is a full multiaddr including the peer ID. The requesting peer is
+// omitted from the list.
+func listHandler(s network.Stream) {
+	defer s.Close()
+
+	requester := s.Conn().RemotePeer()
+	registeredPeersMutex.Lock()
+	defer registeredPeersMutex.Unlock()
+
+	for pid, addr := range registeredPeers {
+		if pid == requester {
+			continue
+		}
+		full, err := ma.NewMultiaddr(fmt.Sprintf("%s/p2p/%s", addr.String(), pid.String()))
+		if err != nil {
+			continue
+		}
+		_, _ = s.Write([]byte(full.String() + "\n"))
+	}
+}
+
 // createHost is a helper function that can be used in main.go and for testing.
 // It creates a new libp2p host with a default set of options.
 func createHost(ctx context.Context, listenPort int) (host.Host, error) {
@@ -127,9 +153,11 @@ func main() {
 		fmt.Printf("  %s/p2p/%s\n", addr, h.ID().String())
 	}
 
-	// Set the stream handler for worker registrations
+	// Set the stream handlers for worker registrations and peer listing
 	h.SetStreamHandler(ProtocolIDForRegistration, registrationHandler)
+	h.SetStreamHandler(ProtocolIDForPeerList, listHandler)
 	fmt.Printf("Set stream handler for protocol: %s\n", ProtocolIDForRegistration)
+	fmt.Printf("Set stream handler for protocol: %s\n", ProtocolIDForPeerList)
 
 	// -------------------------------------------------------------------
 	// HTTP Peer-Discovery API

@@ -49,10 +49,11 @@ cd go-libp2p-holepunch-services/rendezvous && go test -v
 cd ../worker && go test -v
 ```
 
-## Next steps
+## Features
 
-* Implement `/list` protocol so workers can discover each other.
-* Enable AutoNAT / AutoRelay and attempt direct or relayed connections.
+* `/list` protocol allows workers to discover peers directly from the rendezvous service.
+* Workers use libp2p's hole punching and AutoRelay to form direct or relayed connections.
+  Set `LIBP2P_RELAY_BOOTSTRAP` to a relay multiaddr if you provide one.
 * Containerise each service (`Dockerfile`) and deploy to Cloud Run behind Cloud NAT.
 
 ## One-command Cloud Run deploy (experimental)

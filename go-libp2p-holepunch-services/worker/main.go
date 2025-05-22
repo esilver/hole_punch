@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p"
@@ -21,6 +22,9 @@ import (
 // ProtocolIDForRegistration is the libp2p protocol ID used by workers to register with the rendezvous service.
 // This should match the one defined in the rendezvous service.
 const ProtocolIDForRegistration = "/holepunch/rendezvous/1.0.0"
+
+// ProtocolIDForPeerList matches the rendezvous service's peer list protocol.
+const ProtocolIDForPeerList = "/holepunch/list/1.0.0"
 
 // connectAndRegisterWithRendezvous connects the worker host to the rendezvous service at the given
 // multiaddress string and performs a simple registration handshake (expecting an "ACK" response).
@@ -62,6 +66,48 @@ func connectAndRegisterWithRendezvous(ctx context.Context, h host.Host, rendezvo
 	return nil
 }
 
+// discoverPeersViaListProtocol queries the rendezvous service for a list of peers
+// using the libp2p peer list protocol.
+func discoverPeersViaListProtocol(ctx context.Context, h host.Host, rendezvousAddrStr string) ([]peer.AddrInfo, error) {
+	rendezvousMaddr, err := ma.NewMultiaddr(rendezvousAddrStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rendezvous multiaddr: %w", err)
+	}
+	addrInfo, err := peer.AddrInfoFromP2pAddr(rendezvousMaddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract AddrInfo: %w", err)
+	}
+
+	s, err := h.NewStream(ctx, addrInfo.ID, ProtocolIDForPeerList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open list stream: %w", err)
+	}
+	defer s.Close()
+
+	data, err := io.ReadAll(s)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading list response: %w", err)
+	}
+
+	var peers []peer.AddrInfo
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		maddr, err := ma.NewMultiaddr(line)
+		if err != nil {
+			continue
+		}
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			continue
+		}
+		peers = append(peers, *info)
+	}
+	return peers, nil
+}
+
 // createWorkerHost creates a new libp2p host, typically configured as a client.
 // listenPort < 0 means no specific listen address by default.
 // listenPort 0 means listen on a random OS-chosen port.
@@ -77,6 +123,9 @@ func createWorkerHost(ctx context.Context, listenPort int) (host.Host, error) {
 	h, err := libp2p.New(
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.Transport(ws.New),
+		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoRelay(),
+		libp2p.NATPortMap(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
@@ -132,55 +181,22 @@ func main() {
 
 		err = connectAndRegisterWithRendezvous(ctx, h, *rendezvousAddrStr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting to rendezvous: %v\n", err)
-			// Not exiting here, as we might still want the worker to run for other tests.
+			fmt.Fprintf(os.Stderr, "Error connecting to rendezvous:%v\n", err)
 		} else {
-			// Successfully registered, now try to discover peers
 			fmt.Println("Worker successfully registered with rendezvous.")
-			rendezvousHTTPURL := os.Getenv("RENDEZVOUS_SERVICE_URL")
-			if rendezvousHTTPURL == "" {
-				fmt.Println("RENDEZVOUS_SERVICE_URL not set, skipping peer discovery.")
+
+			peers, err := discoverPeersViaListProtocol(ctx, h, *rendezvousAddrStr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Peer discovery error: %v\n", err)
 			} else {
-				peersURL := rendezvousHTTPURL + "/peers"
-				fmt.Printf("Discovering peers from: %s\n", peersURL)
-				resp, err := http.Get(peersURL)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error fetching peers: %v\n", err)
-				} else {
-					defer resp.Body.Close()
-					if resp.StatusCode != http.StatusOK {
-						bodyBytes, _ := io.ReadAll(resp.Body)
-						fmt.Fprintf(os.Stderr, "Error fetching peers: status %s, body: %s\n", resp.Status, string(bodyBytes))
+				for _, info := range peers {
+					if info.ID == h.ID() {
+						continue
+					}
+					if err := h.Connect(ctx, info); err == nil {
+						fmt.Printf("Connected to peer %s\n", info.ID)
 					} else {
-						// The rendezvous service returns a map[peer.ID]ma.Multiaddr
-						// For the client, it's easier to decode into map[string]string (peer.ID string to multiaddr string)
-						// and then convert as needed.
-						// var discoveredPeers map[string]string //peer.ID can't be a JSON map key directly in simple decoding
-						// The actual structure is map[peer.ID]ma.Multiaddr, so we'll decode to map[string]string
-						// and then process. The NEXT_STEPS guide implies a `peerList` which is an array/slice.
-						// Let's assume for now the /peers endpoint returns a structure that can be decoded into `peerList`.
-						// The rendezvous implementation returns map[peer.ID]ma.Multiaddr.
-						// For simplicity with the NEXT_STEPS.md snippet, we'll assume it provides a list of AddrInfo or similar.
-						// However, the actual rendezvous code returns a map.
-						// Let's adapt to what rendezvous *actually* provides.
-						// The registeredPeers map in rendezvous is map[peer.ID]ma.Multiaddr.
-						// JSON encoding of this will be map[string]string (peer.ID.String() -> ma.Multiaddr.String())
-						var peersMap map[string]string
-						if err := json.NewDecoder(resp.Body).Decode(&peersMap); err != nil {
-							fmt.Fprintf(os.Stderr, "Error decoding peers response: %v\n", err)
-						} else {
-							fmt.Printf("Discovered %d peers:\n", len(peersMap))
-							for pidStr, addrStr := range peersMap {
-								fmt.Printf("  Peer ID: %s, Addr: %s\n", pidStr, addrStr)
-								// Here you could try to convert pidStr to peer.ID and addrStr to ma.Multiaddr
-								// and then potentially to peer.AddrInfo for dialing, as suggested by step 2.2.
-							}
-							// The NEXT_STEPS.md snippet for worker (section 1.3) is:
-							// peersResp, _ := http.Get(os.Getenv("RENDEZVOUS_SERVICE_URL") + "/peers")
-							// This implies the response might be directly usable or further processed.
-							// For step 1.3, just getting the response is shown.
-							// We've added printing the decoded peers.
-						}
+						fmt.Printf("Failed to connect to peer %s: %v\n", info.ID, err)
 					}
 				}
 			}
