@@ -14,7 +14,9 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	tptquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	tptudp "github.com/libp2p/go-libp2p/p2p/transport/udp"
+	tptws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -116,12 +118,16 @@ func createWorkerHost(ctx context.Context, listenPort int) (host.Host, error) {
 	if listenPort >= 0 { // Use >=0 to allow explicit port 0 for random OS-chosen port, or a specific port
 		tcpAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", listenPort)
 		wsAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/ws", listenPort)
-		listenAddrs = append(listenAddrs, tcpAddr, wsAddr)
+		udpAddr := fmt.Sprintf("/ip4/0.0.0.0/udp/%d", listenPort)
+		quicAddr := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", listenPort)
+		listenAddrs = append(listenAddrs, tcpAddr, wsAddr, udpAddr, quicAddr)
 	}
 
 	h, err := libp2p.New(
 		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.Transport(ws.New),
+		libp2p.Transport(tptws.New),
+		libp2p.Transport(tptquic.NewTransport),
+		libp2p.Transport(tptudp.NewUDPTransport),
 		libp2p.EnableHolePunching(),
 		libp2p.NATPortMap(),
 	)
