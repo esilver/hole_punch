@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
+	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/stretchr/testify/require"
 	ma "github.com/multiformats/go-multiaddr"
-	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateLibp2pHost(t *testing.T) {
@@ -211,4 +211,57 @@ func TestWorkerRegistration(t *testing.T) {
 	if string(ack) != "ACK" {
 		t.Fatalf("unexpected ACK payload: %q", string(ack))
 	}
-} 
+}
+
+// TestListProtocolReturnsPeers verifies that the listHandler sends registered peers.
+func TestListProtocolReturnsPeers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Rendezvous host
+	rvHost, err := createHost(ctx, 0)
+	require.NoError(t, err)
+	defer rvHost.Close()
+	rvHost.SetStreamHandler(ProtocolIDForRegistration, registrationHandler)
+	rvHost.SetStreamHandler(ProtocolIDForPeerList, listHandler)
+
+	// worker1
+	w1, err := libp2p.New()
+	require.NoError(t, err)
+	defer w1.Close()
+
+	// worker2
+	w2, err := libp2p.New()
+	require.NoError(t, err)
+	defer w2.Close()
+
+	rvInfo := peer.AddrInfo{ID: rvHost.ID(), Addrs: rvHost.Addrs()}
+	require.NoError(t, w1.Connect(ctx, rvInfo))
+	s, err := w1.NewStream(ctx, rvHost.ID(), ProtocolIDForRegistration)
+	require.NoError(t, err)
+	io.ReadFull(s, make([]byte, 3))
+	s.Close()
+
+	require.NoError(t, w2.Connect(ctx, rvInfo))
+	s2, err := w2.NewStream(ctx, rvHost.ID(), ProtocolIDForRegistration)
+	require.NoError(t, err)
+	io.ReadFull(s2, make([]byte, 3))
+	s2.Close()
+
+	// w1 requests list
+	listStream, err := w1.NewStream(ctx, rvHost.ID(), ProtocolIDForPeerList)
+	require.NoError(t, err)
+	data, err := io.ReadAll(listStream)
+	require.NoError(t, err)
+	listStream.Close()
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	require.GreaterOrEqual(t, len(lines), 1)
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, w2.ID().String()) {
+			found = true
+		}
+	}
+	require.True(t, found, "expected w2 in peer list")
+}

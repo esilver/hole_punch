@@ -38,7 +38,7 @@ shift || true
 if [[ ${1:-} =~ ^[0-9]+$ ]]; then
   NUM_WORKERS=$1; shift
 else
-  NUM_WORKERS=1
+  NUM_WORKERS=3
 fi
 
 echo "Will start $NUM_WORKERS worker instance(s)."
@@ -62,7 +62,8 @@ build_and_push() {
   gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
   # local buildx build & push
-  docker buildx build --no-cache --pull --platform linux/amd64 -t "$image" --push "$dir"
+  # docker buildx build --no-cache --pull --platform linux/amd64 -t "$image" --push "$dir"
+  docker buildx build --pull --platform linux/amd64 -t "$image" --push "$dir"
 
   echo "$image"
 }
