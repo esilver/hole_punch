@@ -3,9 +3,6 @@ import os
 import uuid
 import websockets # For Rendezvous client AND UI server
 import signal
-import threading
-import http.server 
-import socketserver 
 import requests 
 import json
 import socket
@@ -38,6 +35,10 @@ ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
 # Benchmark related globals
 benchmark_sessions: Dict[str, Dict] = {} # Key: peer_addr_str, Value: {received_bytes, received_chunks, start_time, total_chunks (from sender)}
 BENCHMARK_CHUNK_SIZE = 1024 # 1KB
+
+# Add these constants near the top with other environment variables
+STUN_MAX_RETRIES = int(os.environ.get("STUN_MAX_RETRIES", "3"))
+STUN_RETRY_DELAY_SEC = float(os.environ.get("STUN_RETRY_DELAY_SEC", "2.0"))
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received, p2p_udp_transport
@@ -79,6 +80,7 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
     
     start_time = time.monotonic()
     bytes_sent = 0
+    update_interval = num_chunks // 10 if num_chunks >= 10 else 1
 
     try:
         for i in range(num_chunks):
@@ -91,7 +93,7 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
             data_to_send = json.dumps(payload).encode()
             p2p_udp_transport.sendto(data_to_send, (target_ip, target_port))
             bytes_sent += len(data_to_send)
-            if (i + 1) % (num_chunks // 10 if num_chunks >=10 else 1) == 0: # Update UI every 10% or each chunk
+            if (i + 1) % update_interval == 0: # Update UI every 10% or each chunk
                 progress_msg = f"Benchmark Send: Sent {i+1}/{num_chunks} chunks ({bytes_sent / 1024:.2f} KB)..."
                 print(f"Worker '{worker_id}': {progress_msg}")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
@@ -127,18 +129,22 @@ async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, pa
                 msg_type = message.get("type")
                 if msg_type == "send_p2p_message":
                     content = message.get("content")
-                    if content and current_p2p_peer_addr and p2p_udp_transport:
+                    if not current_p2p_peer_addr:
+                        await websocket.send(json.dumps({"type": "error", "message": "Not connected to a P2P peer."}))
+                    elif not content:
+                        await websocket.send(json.dumps({"type": "error", "message": "Cannot send empty message."}))
+                    elif p2p_udp_transport: # Ensure transport is also available
                         print(f"Worker '{worker_id}': Sending P2P UDP message '{content}' to peer {current_p2p_peer_id} at {current_p2p_peer_addr}")
                         p2p_message = {"type": "chat_message", "from_worker_id": worker_id, "content": content}
                         p2p_udp_transport.sendto(json.dumps(p2p_message).encode(), current_p2p_peer_addr)
-                    elif not current_p2p_peer_addr: await websocket.send(json.dumps({"type": "error", "message": "Not connected to a P2P peer."}))
-                    elif not content: await websocket.send(json.dumps({"type": "error", "message": "Cannot send empty message."}))
+                    else: # Should ideally not happen if current_p2p_peer_addr is set
+                        await websocket.send(json.dumps({"type": "error", "message": "P2P transport not available."}))
                 elif msg_type == "ui_client_hello":
                     print(f"Worker '{worker_id}': UI Client says hello.")
                     if current_p2p_peer_id:
                          await websocket.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link active with {current_p2p_peer_id[:8]}...", "peer_id": current_p2p_peer_id}))
-                elif msg_type == "start_benchmark_send": # NEW
-                    size_kb = message.get("size_kb", 1024)
+                elif msg_type == "start_benchmark_send":
+                    size_kb = message.get("size_kb", 1024) # Default to 1MB if not specified
                     if current_p2p_peer_addr:
                         print(f"Worker '{worker_id}': UI requested benchmark send of {size_kb}KB to {current_p2p_peer_id}")
                         asyncio.create_task(benchmark_send_udp_data(current_p2p_peer_addr[0], current_p2p_peer_addr[1], size_kb, websocket))
@@ -165,7 +171,6 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT}).")
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
         global current_p2p_peer_addr, current_p2p_peer_id, benchmark_sessions
-        # print(f"Worker '{self.worker_id}': ENTERED datagram_received from {addr}. Raw data length: {len(data)}") # Too verbose for every packet
         message_str = data.decode(errors='ignore')
         try:
             p2p_message = json.loads(message_str)
@@ -174,31 +179,39 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
             if from_id and current_p2p_peer_id and from_id != current_p2p_peer_id:
                 print(f"Worker '{self.worker_id}': WARNING - Received P2P message from '{from_id}' but current peer is '{current_p2p_peer_id}'. Addr: {addr}")
-            elif not from_id and msg_type not in ["benchmark_chunk", "benchmark_end"]: # Benchmark chunks might not have from_id if an old client is used.
+            elif not from_id and msg_type not in ["benchmark_chunk", "benchmark_end"]:
                 print(f"Worker '{self.worker_id}': WARNING - Received P2P message of type '{msg_type}' without 'from_worker_id'. Addr: {addr}")
 
             if msg_type == "chat_message":
                 content = p2p_message.get("content")
                 print(f"Worker '{self.worker_id}': Received P2P chat from '{from_id}' (expected: '{current_p2p_peer_id}'): '{content}'")
                 for ui_client_ws in list(ui_websocket_clients): 
-                    # print(f"WORKER '{self.worker_id}': Attempting to send to UI client: {ui_client_ws.remote_address}") # Too verbose
                     asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_message_received", "from_peer_id": from_id, "content": content}))) 
-            elif msg_type == "p2p_test_data": # Legacy, can remove if benchmark uses benchmark_chunk
+            elif msg_type == "p2p_test_data": 
                 test_data_content = p2p_message.get("data")
                 print(f"Worker '{self.worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
-            elif msg_type == "benchmark_chunk": # NEW
-                seq = p2p_message.get("seq", -1)
-                payload_b64 = p2p_message.get("payload", "")
-                # payload_bytes = base64.b64decode(payload_b64) # Not strictly needed to decode on receiver for throughput test
+            elif msg_type == "benchmark_chunk": 
                 peer_addr_str = str(addr)
-                if peer_addr_str not in benchmark_sessions:
-                    benchmark_sessions[peer_addr_str] = {"received_bytes": 0, "received_chunks": 0, "start_time": time.monotonic(), "total_chunks": -1, "from_worker_id": from_id}
-                session = benchmark_sessions[peer_addr_str]
-                session["received_bytes"] += len(message_str) # Approx size of JSON string
+                
+                session = benchmark_sessions.setdefault(peer_addr_str, {
+                    "received_bytes": 0, 
+                    "received_chunks": 0, 
+                    "start_time": time.monotonic(), 
+                    "total_chunks": -1, 
+                    "from_worker_id": from_id 
+                })
+                if from_id and session.get("from_worker_id") != from_id : 
+                    if not session.get("from_worker_id"): 
+                         session["from_worker_id"] = from_id
+                    else: 
+                        print(f"Worker '{self.worker_id}': WARNING - Benchmark session for {peer_addr_str} saw from_worker_id change from '{session.get('from_worker_id')}' to '{from_id}'.")
+
+                session["received_bytes"] += len(data) 
                 session["received_chunks"] += 1
-                if session["received_chunks"] % 100 == 0: # Log progress periodically
-                    print(f"Worker '{self.worker_id}': Benchmark data received from {from_id}@{peer_addr_str}: {session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB")
-            elif msg_type == "benchmark_end": # NEW
+                if session["received_chunks"] % 100 == 0: 
+                    log_from_id = session.get('from_worker_id', 'unknown_peer')
+                    print(f"Worker '{self.worker_id}': Benchmark data received from {log_from_id}@{peer_addr_str}: {session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB")
+            elif msg_type == "benchmark_end": 
                 total_chunks_sent = p2p_message.get("total_chunks", 0)
                 peer_addr_str = str(addr)
                 if peer_addr_str in benchmark_sessions:
@@ -206,14 +219,15 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     session["total_chunks"] = total_chunks_sent
                     duration = time.monotonic() - session["start_time"]
                     throughput_kbps = (session["received_bytes"] / 1024) / duration if duration > 0 else 0
-                    status_msg = f"Benchmark Receive from {session['from_worker_id']} Complete: Received {session['received_chunks']}/{total_chunks_sent} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
+                    log_from_id = session.get('from_worker_id', 'unknown_peer') # Use a safe default for from_id
+                    status_msg = f"Benchmark Receive from {log_from_id} Complete: Received {session['received_chunks']}/{total_chunks_sent} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
                     print(f"Worker '{self.worker_id}': {status_msg}")
                     for ui_client_ws in list(ui_websocket_clients):
                         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "benchmark_status", "message": status_msg})))
-                    del benchmark_sessions[peer_addr_str] # Clear session
+                    del benchmark_sessions[peer_addr_str] 
                 else:
                     print(f"Worker '{self.worker_id}': Received benchmark_end from unknown session/peer {addr}")     
-            elif msg_type == "p2p_keep_alive": # NEW: Handle P2P Keep-Alive
+            elif msg_type == "p2p_keep_alive": 
                 print(f"Worker '{self.worker_id}': Received P2P keep-alive from '{from_id}' at {addr}")
             elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
         except json.JSONDecodeError: print(f"Worker '{self.worker_id}': Received non-JSON UDP packet from {addr}: {message_str}")
@@ -225,42 +239,55 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
 async def discover_and_report_stun_udp_endpoint(websocket_conn_to_rendezvous):
     global our_stun_discovered_udp_ip, our_stun_discovered_udp_port, worker_id, INTERNAL_UDP_PORT
-    try:
-        stun_host = os.environ.get("STUN_HOST", DEFAULT_STUN_HOST)
-        stun_port = int(os.environ.get("STUN_PORT", DEFAULT_STUN_PORT))
-        print(f"Worker '{worker_id}': Attempting STUN discovery via {stun_host}:{stun_port} for local port {INTERNAL_UDP_PORT}.")
-
-        # Broader exception catch specifically for get_ip_info, as this was proven to be more robust
+    
+    stun_host = os.environ.get("STUN_HOST", DEFAULT_STUN_HOST)
+    stun_port = int(os.environ.get("STUN_PORT", DEFAULT_STUN_PORT))
+    
+    for attempt in range(1, STUN_MAX_RETRIES + 1):
+        print(f"Worker '{worker_id}': STUN discovery attempt {attempt}/{STUN_MAX_RETRIES} via {stun_host}:{stun_port} for local port {INTERNAL_UDP_PORT}.")
         try:
+            # The stun.get_ip_info function can raise socket.gaierror, stun.StunException, OSError, etc.
             nat_type, external_ip, external_port = stun.get_ip_info(
                 source_ip="0.0.0.0",
                 source_port=INTERNAL_UDP_PORT,
                 stun_host=stun_host,
                 stun_port=stun_port
             )
-            print(f"Worker '{worker_id}': STUN: NAT='{nat_type}', External IP='{external_ip}', Port={external_port}")
-        except Exception as stun_e: # Catch any error from stun.get_ip_info
-            print(f"Worker '{worker_id}': STUN get_ip_info failed: {type(stun_e).__name__} - {stun_e}")
-            return False # Indicate STUN failure
-
-        if external_ip and external_port:
-            our_stun_discovered_udp_ip = external_ip
-            our_stun_discovered_udp_port = external_port
-            await websocket_conn_to_rendezvous.send(json.dumps({"type": "update_udp_endpoint", "udp_ip": external_ip, "udp_port": external_port}))
-            print(f"Worker '{worker_id}': Sent STUN UDP endpoint ({external_ip}:{external_port}) to Rendezvous.")
-            return True
-        else:
-            print(f"Worker '{worker_id}': STUN discovery did not return valid external IP/Port.")
-            return False
             
-    except socket.gaierror as e_gaierror: # For DNS errors before calling stun.get_ip_info
-        print(f"Worker '{worker_id}': STUN host DNS resolution error: {e_gaierror}")
-        return False
-    except Exception as e_outer: # For other errors like socket binding
-        print(f"Worker '{worker_id}': Error in STUN setup (e.g., socket bind): {type(e_outer).__name__} - {e_outer}")
-        return False
-    finally:
-        pass # Ensure finally is not empty if all lines removed
+            if external_ip and external_port:
+                print(f"Worker '{worker_id}': STUN: NAT='{nat_type}', External IP='{external_ip}', Port={external_port}")
+                our_stun_discovered_udp_ip = external_ip
+                our_stun_discovered_udp_port = external_port
+                await websocket_conn_to_rendezvous.send(json.dumps({"type": "update_udp_endpoint", "udp_ip": external_ip, "udp_port": external_port}))
+                print(f"Worker '{worker_id}': Sent STUN UDP endpoint ({external_ip}:{external_port}) to Rendezvous.")
+                return True # Success, exit function
+            else:
+                # stun.get_ip_info succeeded but didn't return usable IP/port
+                print(f"Worker '{worker_id}': STUN attempt {attempt} succeeded but returned no valid external IP/Port.")
+                # Fall through to retry logic if not last attempt
+
+        except socket.gaierror as e_gaierror: # Specific error for DNS issues
+            print(f"Worker '{worker_id}': STUN attempt {attempt} failed: DNS resolution error for '{stun_host}': {e_gaierror}")
+        except stun.StunException as e_stun: # Catch specific STUN protocol errors from pystun3
+            print(f"Worker '{worker_id}': STUN attempt {attempt} failed: STUN protocol error: {type(e_stun).__name__} - {e_stun}")
+        except OSError as e_os: # Catch socket-related errors like "Address already in use" or network issues
+            print(f"Worker '{worker_id}': STUN attempt {attempt} failed: OS error (e.g., socket issue): {type(e_os).__name__} - {e_os}")
+        except Exception as e_general: # Catch-all for any other unexpected errors from stun.get_ip_info
+            print(f"Worker '{worker_id}': STUN attempt {attempt} failed: An unexpected error: {type(e_general).__name__} - {e_general}")
+
+        # If we've reached here, the current attempt failed (either an exception or no IP/port returned)
+        if attempt < STUN_MAX_RETRIES:
+            delay = STUN_RETRY_DELAY_SEC * (2 ** (attempt - 1)) # Exponential backoff
+            print(f"Worker '{worker_id}': Retrying STUN in {delay:.1f} seconds...")
+            await asyncio.sleep(delay)
+            # Loop will continue to the next attempt
+        else: # This was the last attempt and it failed
+            print(f"Worker '{worker_id}': STUN discovery failed after {STUN_MAX_RETRIES} attempts.")
+            return False # All retries exhausted
+
+    # Fallback, theoretically unreachable if STUN_MAX_RETRIES >= 1
+    print(f"Worker '{worker_id}': STUN discovery function unexpectedly completed loop without success or explicit failure.")
+    return False
 
 async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker_id: str):
     global worker_id, stop_signal_received, p2p_udp_transport, current_p2p_peer_addr, current_p2p_peer_id
@@ -274,9 +301,8 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     current_p2p_peer_addr = (peer_udp_ip, peer_udp_port)
     print(f"Worker '{worker_id}': Set new P2P target. Current peer ID: '{current_p2p_peer_id}', Current peer addr: {current_p2p_peer_addr}.")
 
-    local_bind_addr_tuple = p2p_udp_transport.get_extra_info('sockname') if p2p_udp_transport else ("unknown", "unknown")
     print(f"Worker '{worker_id}': Starting UDP hole punch PINGs towards '{peer_worker_id}' at {current_p2p_peer_addr}")
-    for i in range(1, 4):
+    for i in range(1, 4): # Send a few pings
         if stop_signal_received: break
         try:
             message_content = f"P2P_HOLE_PUNCH_PING_FROM_{worker_id}_NUM_{i}"
@@ -285,7 +311,6 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
         except Exception as e: print(f"Worker '{worker_id}': Error sending UDP Hole Punch PING {i}: {e}")
         await asyncio.sleep(0.5)
     print(f"Worker '{worker_id}': Finished UDP Hole Punch PING burst to '{peer_worker_id}'.")
-    # Test data packet sending removed from here, will be initiated by UI action.
     for ui_client_ws in list(ui_websocket_clients):
         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link attempt initiated with {peer_worker_id[:8]}...", "peer_id": peer_worker_id})))
 
@@ -412,15 +437,10 @@ async def send_periodic_p2p_keep_alives():
                 keep_alive_message = {"type": "p2p_keep_alive", "from_worker_id": worker_id}
                 encoded_message = json.dumps(keep_alive_message).encode()
                 p2p_udp_transport.sendto(encoded_message, current_p2p_peer_addr)
-                # print(f"Worker '{worker_id}': Sent P2P keep-alive to {current_p2p_peer_addr}") # Can be too verbose
             except Exception as e:
                 print(f"Worker '{worker_id}': Error sending P2P keep-alive: {e}")
-        elif not p2p_udp_transport:
-            # print(f"Worker '{worker_id}': P2P Keep-Alive: UDP transport not ready.") # Can be verbose if transport is often down
-            pass
-        elif not current_p2p_peer_addr:
-            # print(f"Worker '{worker_id}': P2P Keep-Alive: No current P2P peer.") # Can be verbose if no peer
-            pass
+        # No explicit print for transport not ready or no peer, to reduce verbosity.
+        # These conditions are normal states.
     print(f"Worker '{worker_id}': P2P Keep-Alive sender task stopped.")
 
 async def main_async_orchestrator():
