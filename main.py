@@ -229,6 +229,24 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     print(f"Worker '{self.worker_id}': Received benchmark_end from unknown session/peer {addr}")     
             elif msg_type == "p2p_keep_alive": 
                 print(f"Worker '{self.worker_id}': Received P2P keep-alive from '{from_id}' at {addr}")
+            elif msg_type == "p2p_pairing_test":
+                timestamp = p2p_message.get("timestamp")
+                print(f"Worker '{self.worker_id}': Received p2p_pairing_test from '{from_id}' (timestamp: {timestamp}). Sending echo.")
+                echo_message = {
+                    "type": "p2p_pairing_echo",
+                    "from_worker_id": self.worker_id, # Current worker's ID
+                    "original_timestamp": timestamp
+                }
+                if self.transport: # Ensure transport is available
+                    self.transport.sendto(json.dumps(echo_message).encode(), addr)
+                    print(f"Worker '{self.worker_id}': Sent p2p_pairing_echo to '{from_id}' at {addr}")
+            elif msg_type == "p2p_pairing_echo":
+                original_timestamp = p2p_message.get("original_timestamp")
+                rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
+                print(f"Worker '{self.worker_id}': Received p2p_pairing_echo from '{from_id}'. RTT: {rtt:.2f} ms (if timestamp valid).")
+                # Optionally send this to UI
+                for ui_client_ws in list(ui_websocket_clients):
+                    asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"})))
             elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
         except json.JSONDecodeError: print(f"Worker '{self.worker_id}': Received non-JSON UDP packet from {addr}: {message_str}")
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
@@ -314,6 +332,22 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     for ui_client_ws in list(ui_websocket_clients):
         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link attempt initiated with {peer_worker_id[:8]}...", "peer_id": peer_worker_id})))
 
+    # NEW: Determine if this worker is the initiator for the pairing test
+    if worker_id < peer_worker_id: # Lexicographical comparison
+        print(f"Worker '{worker_id}': Designated as initiator for pairing test with '{peer_worker_id}'. Sending test message.")
+        pairing_test_message = {
+            "type": "p2p_pairing_test",
+            "from_worker_id": worker_id,
+            "timestamp": time.time()
+        }
+        try:
+            p2p_udp_transport.sendto(json.dumps(pairing_test_message).encode(), current_p2p_peer_addr)
+            print(f"Worker '{worker_id}': Sent p2p_pairing_test to '{peer_worker_id}' at {current_p2p_peer_addr}")
+        except Exception as e:
+            print(f"Worker '{worker_id}': Error sending p2p_pairing_test: {e}")
+    else:
+        print(f"Worker '{worker_id}': Designated as responder for pairing test with '{peer_worker_id}'. Awaiting test message.")
+
 async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, peer_worker_id: str, max_wait_sec: float = 10.0, check_interval: float = 0.5):
     """Safely initiate a UDP hole-punch once the local UDP listener becomes active.
 
@@ -397,6 +431,29 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                                 asyncio.create_task(attempt_hole_punch_when_ready(peer_ip, int(peer_port), peer_id))
                         elif msg_type == "udp_endpoint_ack": print(f"Worker '{worker_id}': UDP Endpoint Ack: {message_data.get('status')}")
                         elif msg_type == "echo_response": print(f"Worker '{worker_id}': Echo Response: {message_data.get('processed_by_rendezvous')}")
+                        elif msg_type == "admin_chat_message":
+                            # Admin is sending a chat message to this worker
+                            admin_session_id = message_data.get("admin_session_id")
+                            content = message_data.get("content")
+                            if admin_session_id and content:
+                                print(f"Worker '{worker_id}': Received admin chat: '{content}'")
+                                # Forward to UI clients
+                                for ui_client_ws in list(ui_websocket_clients):
+                                    try:
+                                        await ui_client_ws.send(json.dumps({
+                                            "type": "admin_chat_received",
+                                            "content": content,
+                                            "admin_session_id": admin_session_id
+                                        }))
+                                    except Exception as e:
+                                        print(f"Worker '{worker_id}': Error forwarding admin chat to UI: {e}")
+                                
+                                # Auto-reply for demo purposes (workers can implement their own logic)
+                                await ws_to_rendezvous.send(json.dumps({
+                                    "type": "chat_response",
+                                    "admin_session_id": admin_session_id,
+                                    "content": f"Worker {worker_id[:8]} received: {content}"
+                                }))
                         else: print(f"Worker '{worker_id}': Unhandled message from Rendezvous: {msg_type}")
                     except asyncio.TimeoutError: 
                         # This is expected if no messages from rendezvous, allows periodic tasks.

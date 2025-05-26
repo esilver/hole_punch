@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rendezvous Admin - Worker Management</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 1rem 0;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        header h1 {
+            text-align: center;
+            font-size: 2rem;
+        }
+        
+        .connection-status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            z-index: 1000;
+        }
+        
+        .connection-status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .connection-status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        
+        .stat-card h3 {
+            color: #7f8c8d;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+        
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .connection-panel {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
+        }
+        
+        .connection-panel h3 {
+            margin-bottom: 1rem;
+            color: #2c3e50;
+        }
+        
+        .selected-workers {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+        
+        .selected-worker {
+            background-color: #e3f2fd;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .selected-worker .remove {
+            cursor: pointer;
+            color: #1565c0;
+            font-weight: bold;
+        }
+        
+        .connect-btn {
+            background-color: #27ae60;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background-color 0.2s;
+            margin-right: 1rem;
+        }
+        
+        .connect-btn:hover:not(:disabled) {
+            background-color: #229954;
+        }
+        
+        .connect-btn:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        
+        .clear-btn {
+            background-color: #e74c3c;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background-color 0.2s;
+        }
+        
+        .clear-btn:hover {
+            background-color: #c0392b;
+        }
+        
+        .workers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .worker-card {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+            cursor: pointer;
+            position: relative;
+        }
+        
+        .worker-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
+        
+        .worker-card.selected {
+            border: 2px solid #3498db;
+            background-color: #ebf5fb;
+        }
+        
+        .worker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        
+        .worker-id {
+            font-family: 'Courier New', monospace;
+            font-size: 0.875rem;
+            color: #34495e;
+            word-break: break-all;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status-disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .worker-details {
+            display: grid;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+        }
+        
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .detail-label {
+            color: #7f8c8d;
+        }
+        
+        .detail-value {
+            font-family: 'Courier New', monospace;
+            color: #2c3e50;
+            text-align: right;
+        }
+        
+        .refresh-btn {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background-color 0.2s;
+        }
+        
+        .refresh-btn:hover {
+            background-color: #2980b9;
+        }
+        
+        .refresh-btn:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+        
+        .last-updated {
+            color: #7f8c8d;
+            font-size: 0.875rem;
+        }
+        
+        .error-message {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+            display: none;
+        }
+        
+        .success-message {
+            background-color: #d4edda;
+            color: #155724;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+            display: none;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: #7f8c8d;
+        }
+        
+        .tag {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            margin-right: 0.25rem;
+        }
+        
+        .tag-udp {
+            background-color: #e3f2fd;
+            color: #1565c0;
+        }
+        
+        .tag-ready {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        
+        .event-log {
+            background: white;
+            padding: 1rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-top: 2rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .event-log h3 {
+            margin-bottom: 0.5rem;
+            color: #2c3e50;
+        }
+        
+        .event-item {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #eee;
+            font-size: 0.875rem;
+            color: #555;
+        }
+        
+        .event-time {
+            color: #7f8c8d;
+            margin-right: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status disconnected" id="wsStatus">WebSocket: Disconnected</div>
+    
+    <header>
+        <div class="container">
+            <h1>Rendezvous Service Admin</h1>
+        </div>
+    </header>
+    
+    <div class="container">
+        <div class="error-message" id="errorMessage"></div>
+        <div class="success-message" id="successMessage"></div>
+        
+        <div class="controls">
+            <button class="refresh-btn" onclick="refreshWorkers()">Refresh Workers</button>
+            <a href="/admin/chat" style="background-color: #27ae60; color: white; padding: 0.75rem 1.5rem; border-radius: 4px; text-decoration: none; font-size: 1rem; display: inline-block;">Open Chat Interface</a>
+            <div class="last-updated" id="lastUpdated"></div>
+        </div>
+        
+        <div class="stats" id="stats">
+            <div class="stat-card">
+                <h3>Total Workers</h3>
+                <div class="value" id="totalCount">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>Connected</h3>
+                <div class="value" id="connectedCount">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>Ready for Pairing</h3>
+                <div class="value" id="readyCount">-</div>
+            </div>
+        </div>
+        
+        <div class="connection-panel">
+            <h3>Manual Connection Control</h3>
+            <div class="selected-workers" id="selectedWorkers">
+                <div style="color: #7f8c8d;">Select two workers to connect them...</div>
+            </div>
+            <div>
+                <button class="connect-btn" onclick="connectSelectedWorkers()" disabled>Connect Workers</button>
+                <button class="clear-btn" onclick="clearSelection()">Clear Selection</button>
+            </div>
+        </div>
+        
+        <h2 style="margin-bottom: 1rem;">Connected Workers</h2>
+        <div class="workers-grid" id="workersGrid">
+            <div class="loading">Loading workers...</div>
+        </div>
+        
+        <div class="event-log">
+            <h3>Event Log</h3>
+            <div id="eventLog"></div>
+        </div>
+    </div>
+    
+    <script>
+        let refreshInterval;
+        let ws = null;
+        let selectedWorkers = [];
+        let workersData = {};
+        
+        // WebSocket connection
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/admin`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateConnectionStatus(true);
+                addEventLog('Connected to WebSocket');
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateConnectionStatus(false);
+                addEventLog('Disconnected from WebSocket');
+                // Reconnect after 3 seconds
+                setTimeout(connectWebSocket, 3000);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                addEventLog('WebSocket error');
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error);
+                }
+            };
+        }
+        
+        function handleWebSocketMessage(data) {
+            switch (data.type) {
+                case 'worker_connected':
+                    addEventLog(`Worker connected: ${data.worker_id.substring(0, 8)}...`);
+                    refreshWorkers();
+                    break;
+                case 'worker_disconnected':
+                    addEventLog(`Worker disconnected: ${data.worker_id.substring(0, 8)}...`);
+                    // Remove from selection if selected
+                    selectedWorkers = selectedWorkers.filter(id => id !== data.worker_id);
+                    updateSelectedWorkersDisplay();
+                    refreshWorkers();
+                    break;
+                case 'worker_udp_updated':
+                    addEventLog(`Worker UDP updated: ${data.worker_id.substring(0, 8)}... → ${data.udp_ip}:${data.udp_port}`);
+                    refreshWorkers();
+                    break;
+                case 'connection_initiated':
+                    addEventLog(`Connection initiated: ${data.worker_a_id.substring(0, 8)}... ↔ ${data.worker_b_id.substring(0, 8)}...`);
+                    break;
+            }
+        }
+        
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('wsStatus');
+            if (connected) {
+                statusEl.textContent = 'WebSocket: Connected';
+                statusEl.className = 'connection-status connected';
+            } else {
+                statusEl.textContent = 'WebSocket: Disconnected';
+                statusEl.className = 'connection-status disconnected';
+            }
+        }
+        
+        function addEventLog(message) {
+            const eventLog = document.getElementById('eventLog');
+            const time = new Date().toLocaleTimeString();
+            const eventItem = document.createElement('div');
+            eventItem.className = 'event-item';
+            eventItem.innerHTML = `<span class="event-time">${time}</span>${message}`;
+            eventLog.insertBefore(eventItem, eventLog.firstChild);
+            
+            // Keep only last 50 events
+            while (eventLog.children.length > 50) {
+                eventLog.removeChild(eventLog.lastChild);
+            }
+        }
+        
+        async function fetchWorkers() {
+            try {
+                const response = await fetch('/api/workers');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                workersData = {};
+                data.workers.forEach(worker => {
+                    workersData[worker.worker_id] = worker;
+                });
+                updateUI(data);
+                hideError();
+            } catch (error) {
+                console.error('Error fetching workers:', error);
+                showError('Failed to fetch workers: ' + error.message);
+            }
+        }
+        
+        function updateUI(data) {
+            // Update stats
+            document.getElementById('totalCount').textContent = data.total_count || 0;
+            document.getElementById('connectedCount').textContent = data.connected_count || 0;
+            document.getElementById('readyCount').textContent = data.ready_count || 0;
+            
+            // Update workers grid
+            const grid = document.getElementById('workersGrid');
+            grid.innerHTML = '';
+            
+            if (!data.workers || data.workers.length === 0) {
+                grid.innerHTML = '<div class="loading">No workers connected</div>';
+                return;
+            }
+            
+            data.workers.forEach(worker => {
+                const card = createWorkerCard(worker);
+                grid.appendChild(card);
+            });
+            
+            // Update last updated time
+            const now = new Date();
+            document.getElementById('lastUpdated').textContent = 
+                `Last updated: ${now.toLocaleTimeString()}`;
+        }
+        
+        function createWorkerCard(worker) {
+            const card = document.createElement('div');
+            card.className = 'worker-card';
+            if (selectedWorkers.includes(worker.worker_id)) {
+                card.classList.add('selected');
+            }
+            
+            const statusClass = worker.websocket_connected ? 'connected' : 'disconnected';
+            const statusText = worker.websocket_connected ? 'Connected' : 'Disconnected';
+            
+            let tags = '';
+            if (worker.has_udp_endpoint) {
+                tags += '<span class="tag tag-udp">UDP Ready</span>';
+            }
+            if (worker.ready_for_pairing) {
+                tags += '<span class="tag tag-ready">Ready for Pairing</span>';
+            }
+            
+            card.innerHTML = `
+                <div class="worker-header">
+                    <div>
+                        <div class="worker-id">${worker.worker_id}</div>
+                        <div style="margin-top: 0.5rem;">${tags}</div>
+                    </div>
+                    <span class="status-badge status-${statusClass}">${statusText}</span>
+                </div>
+                <div class="worker-details">
+                    <div class="detail-row">
+                        <span class="detail-label">WebSocket IP</span>
+                        <span class="detail-value">${worker.websocket_ip || 'N/A'}</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Public IP</span>
+                        <span class="detail-value">${worker.public_ip || 'N/A'}</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">UDP Endpoint</span>
+                        <span class="detail-value">${
+                            worker.udp_ip && worker.udp_port 
+                                ? `${worker.udp_ip}:${worker.udp_port}` 
+                                : 'Not available'
+                        }</span>
+                    </div>
+                </div>
+            `;
+            
+            // Add click handler
+            card.onclick = () => toggleWorkerSelection(worker.worker_id);
+            
+            return card;
+        }
+        
+        function toggleWorkerSelection(workerId) {
+            const worker = workersData[workerId];
+            if (!worker || !worker.websocket_connected || !worker.has_udp_endpoint) {
+                showError('Cannot select this worker - not ready for connection');
+                return;
+            }
+            
+            const index = selectedWorkers.indexOf(workerId);
+            if (index > -1) {
+                selectedWorkers.splice(index, 1);
+            } else {
+                if (selectedWorkers.length >= 2) {
+                    showError('You can only select 2 workers at a time');
+                    return;
+                }
+                selectedWorkers.push(workerId);
+            }
+            
+            updateSelectedWorkersDisplay();
+            
+            // Re-render worker cards to update selection state
+            fetchWorkers();
+        }
+        
+        function updateSelectedWorkersDisplay() {
+            const container = document.getElementById('selectedWorkers');
+            const connectBtn = document.querySelector('.connect-btn');
+            
+            if (selectedWorkers.length === 0) {
+                container.innerHTML = '<div style="color: #7f8c8d;">Select two workers to connect them...</div>';
+                connectBtn.disabled = true;
+            } else {
+                container.innerHTML = selectedWorkers.map(id => `
+                    <div class="selected-worker">
+                        <span>${id.substring(0, 8)}...</span>
+                        <span class="remove" onclick="removeFromSelection('${id}')">×</span>
+                    </div>
+                `).join('');
+                connectBtn.disabled = selectedWorkers.length !== 2;
+            }
+        }
+        
+        function removeFromSelection(workerId) {
+            selectedWorkers = selectedWorkers.filter(id => id !== workerId);
+            updateSelectedWorkersDisplay();
+            fetchWorkers();
+        }
+        
+        function clearSelection() {
+            selectedWorkers = [];
+            updateSelectedWorkersDisplay();
+            fetchWorkers();
+        }
+        
+        async function connectSelectedWorkers() {
+            if (selectedWorkers.length !== 2) return;
+            
+            const btn = document.querySelector('.connect-btn');
+            btn.disabled = true;
+            btn.textContent = 'Connecting...';
+            
+            try {
+                const response = await fetch('/api/connect', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        worker_a_id: selectedWorkers[0],
+                        worker_b_id: selectedWorkers[1]
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showSuccess(data.message);
+                    clearSelection();
+                } else {
+                    showError(data.detail || 'Failed to connect workers');
+                }
+            } catch (error) {
+                console.error('Error connecting workers:', error);
+                showError('Failed to connect workers: ' + error.message);
+            } finally {
+                btn.disabled = selectedWorkers.length !== 2;
+                btn.textContent = 'Connect Workers';
+            }
+        }
+        
+        function showError(message) {
+            const errorEl = document.getElementById('errorMessage');
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+            setTimeout(() => {
+                errorEl.style.display = 'none';
+            }, 5000);
+        }
+        
+        function showSuccess(message) {
+            const successEl = document.getElementById('successMessage');
+            successEl.textContent = message;
+            successEl.style.display = 'block';
+            setTimeout(() => {
+                successEl.style.display = 'none';
+            }, 5000);
+        }
+        
+        function hideError() {
+            const errorEl = document.getElementById('errorMessage');
+            errorEl.style.display = 'none';
+        }
+        
+        function refreshWorkers() {
+            const btn = document.querySelector('.refresh-btn');
+            btn.disabled = true;
+            btn.textContent = 'Refreshing...';
+            
+            fetchWorkers().finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Refresh Workers';
+            });
+        }
+        
+        function startAutoRefresh() {
+            // Stop using interval-based refresh since we have WebSocket
+            // refreshInterval = setInterval(fetchWorkers, 5000);
+        }
+        
+        function stopAutoRefresh() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        }
+        
+        // Initial load
+        fetchWorkers();
+        connectWebSocket();
+        
+        // Periodic WebSocket ping to keep connection alive
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 30000);
+        
+        // Stop auto-refresh when page is hidden
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopAutoRefresh();
+            } else {
+                fetchWorkers();
+            }
+        });
+    </script>
+</body>
+</html>

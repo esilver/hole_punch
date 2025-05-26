@@ -14,6 +14,14 @@ RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
 # Copy the application code into the container
 COPY main.py .
+COPY models.py .
+COPY worker_websocket.py .
+COPY admin_websocket.py .
+COPY api_endpoints.py .
+COPY pairing.py .
+COPY broadcast.py .
+COPY admin.html .
+COPY admin-chat.html .
 
 # Make port 8080 available (Cloud Run default)
 EXPOSE 8080
