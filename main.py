@@ -125,32 +125,48 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
 
 async def test_http_proxy_internal(test_message: str, ui_ws: websockets.WebSocketServerProtocol):
     """Test the HTTP proxy by making an internal request"""
-    global worker_id
+    global worker_id, current_p2p_peer_addr
+    
+    if not current_p2p_peer_addr:
+        await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": "No P2P peer connected"}))
+        return
+    
     try:
-        # Use aiohttp if available, otherwise use the raw socket approach
+        print(f"Worker '{worker_id}': Testing HTTP proxy with message: {test_message}")
         reader, writer = await asyncio.open_connection('127.0.0.1', 8080)
         
         # Send HTTP request
-        request = f"POST /echo HTTP/1.1\r\nContent-Length: {len(test_message)}\r\n\r\n{test_message}"
+        request = f"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {len(test_message)}\r\n\r\n{test_message}"
+        print(f"Worker '{worker_id}': Sending HTTP request to proxy: {request[:50]}...")
         writer.write(request.encode())
         await writer.drain()
         
-        # Read response
-        response = await reader.read(1024)
-        response_str = response.decode('utf-8', errors='ignore')
-        
-        # Parse response
-        if b"HTTP/1.1 200 OK" in response:
-            # Extract body
-            parts = response_str.split("\r\n\r\n", 1)
-            body = parts[1] if len(parts) > 1 else "No body"
-            await ui_ws.send(json.dumps({"type": "http_proxy_response", "response": body}))
-        else:
-            await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": f"Unexpected response: {response_str[:100]}"}))
+        # Read response with timeout
+        try:
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            response_str = response.decode('utf-8', errors='ignore')
+            print(f"Worker '{worker_id}': Received response from proxy: {response_str[:100]}...")
+            
+            # Parse response
+            if b"HTTP/1.1 200 OK" in response:
+                # Extract body
+                parts = response_str.split("\r\n\r\n", 1)
+                body = parts[1] if len(parts) > 1 else "No body"
+                await ui_ws.send(json.dumps({"type": "http_proxy_response", "response": body}))
+            elif b"HTTP/1.1 503" in response:
+                await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": "No peer connected (503)"}))
+            elif b"HTTP/1.1 504" in response:
+                await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": "Request timeout (504)"}))
+            else:
+                await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": f"Unexpected response: {response_str[:100]}"}))
+        except asyncio.TimeoutError:
+            await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": "Timeout waiting for proxy response"}))
         
         writer.close()
         await writer.wait_closed()
         
+    except ConnectionRefusedError:
+        await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": "HTTP proxy not running on port 8080"}))
     except Exception as e:
         error_msg = f"Failed to test HTTP proxy: {type(e).__name__}: {e}"
         print(f"Worker '{worker_id}': {error_msg}")
@@ -228,12 +244,14 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
                 if flags == HTTP_UDP_ACK:
                     # This is an ACK for a sent message
+                    print(f"Worker '{self.worker_id}': Received HTTP ACK for msg_id={msg_id} from {addr}")
                     fut = self.http_pending_requests.pop(msg_id, None)
                     if fut and not fut.done():
                         fut.set_result(b"")
                     return
                 elif flags == 0:  # Regular HTTP frame
                     payload = data[5:]
+                    print(f"Worker '{self.worker_id}': Received HTTP frame, msg_id={msg_id}, payload_start={payload[:30]}...")
                     # Send ACK
                     ack_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_ACK, msg_id)
                     self.transport.sendto(ack_frame, addr)
@@ -241,20 +259,26 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     # Check if it's an HTTP request
                     if payload.startswith(b"GET /echo") or payload.startswith(b"POST /echo"):
                         # Handle echo request
+                        print(f"Worker '{self.worker_id}': Processing echo request from {addr}")
                         parts = payload.split(b"\r\n\r\n", 1)
                         body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
                         response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
                         response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
                         self.transport.sendto(response_frame, addr)
-                        print(f"Worker '{self.worker_id}': Handled HTTP echo request from {addr}")
+                        print(f"Worker '{self.worker_id}': Sent echo response to {addr}, body={body[:30]}...")
                         return
                     elif payload.startswith(b"HTTP/1.1"):
                         # This is an HTTP response for a pending request
+                        print(f"Worker '{self.worker_id}': Received HTTP response for msg_id={msg_id}")
                         fut = self.http_pending_requests.get(msg_id)
                         if fut and not fut.done():
                             fut.set_result(payload)
+                            print(f"Worker '{self.worker_id}': Set result for msg_id={msg_id}")
+                        else:
+                            print(f"Worker '{self.worker_id}': No pending request for msg_id={msg_id}")
                         return
-            except struct.error:
+            except struct.error as e:
+                print(f"Worker '{self.worker_id}': Failed to parse as HTTP frame: {e}")
                 pass  # Not an HTTP frame, continue with JSON processing
         
         message_str = data.decode(errors='ignore')
@@ -341,19 +365,25 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         try:
             self.http_proxy_server = await asyncio.start_server(
                 self.handle_http_client, '127.0.0.1', 8080)
-            print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on localhost:8080")
+            addr = self.http_proxy_server.sockets[0].getsockname()
+            print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on {addr}")
         except Exception as e:
             print(f"Worker '{self.worker_id}': Failed to start HTTP proxy: {e}")
     
     async def handle_http_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming HTTP connections from local clients"""
         global current_p2p_peer_addr
+        client_addr = writer.get_extra_info('peername')
+        print(f"Worker '{self.worker_id}': HTTP proxy received connection from {client_addr}")
+        
         try:
             # Read the HTTP request
             request = await reader.read(HTTP_UDP_MAX - 50)  # Leave room for framing
+            print(f"Worker '{self.worker_id}': HTTP proxy received request: {request[:50]}...")
             
             if not current_p2p_peer_addr:
                 # No peer connected, return error
+                print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected")
                 error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
                 writer.write(error_response)
                 await writer.drain()
@@ -368,13 +398,17 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             self.http_pending_requests[msg_id] = fut
             
             # Send the request
+            print(f"Worker '{self.worker_id}': HTTP proxy sending frame to {current_p2p_peer_addr}, msg_id={msg_id}")
             self.transport.sendto(frame, current_p2p_peer_addr)
             
             # Wait for response with timeout
             try:
+                print(f"Worker '{self.worker_id}': HTTP proxy waiting for response, msg_id={msg_id}")
                 response = await asyncio.wait_for(fut, timeout=5.0)
+                print(f"Worker '{self.worker_id}': HTTP proxy got response: {response[:50]}...")
                 writer.write(response)
             except asyncio.TimeoutError:
+                print(f"Worker '{self.worker_id}': HTTP proxy timeout waiting for response, msg_id={msg_id}")
                 timeout_response = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 15\r\n\r\nRequest timeout"
                 writer.write(timeout_response)
             
