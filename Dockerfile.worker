@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 # Copy the application code
 COPY main.py .
 COPY index.html .
-COPY worker/ ./worker/
 
 # This worker doesn't run a Gunicorn server anymore; it runs the main.py script directly.
 # The PORT environment variable is not directly used by main.py unless you add server logic back.

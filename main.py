@@ -13,7 +13,8 @@ from websockets.server import serve as websockets_serve
 from websockets.http import Headers
 import time # For benchmark timing
 import base64 # For encoding benchmark payload
-from worker.udp_proxy import UDPHTTPProxy
+import struct
+import itertools
 
 # --- Global Variables ---
 worker_id = str(uuid.uuid4())
@@ -40,6 +41,11 @@ BENCHMARK_CHUNK_SIZE = 1024 # 1KB
 # Add these constants near the top with other environment variables
 STUN_MAX_RETRIES = int(os.environ.get("STUN_MAX_RETRIES", "3"))
 STUN_RETRY_DELAY_SEC = float(os.environ.get("STUN_RETRY_DELAY_SEC", "2.0"))
+
+# HTTP-over-UDP framing constants
+HTTP_UDP_FMT = "!B I"  # flags (1 byte), msg-id (4 bytes)
+HTTP_UDP_ACK = 0x80
+HTTP_UDP_MAX = 1200  # fits under common MTU
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received, p2p_udp_transport
@@ -163,6 +169,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, worker_id_val: str):
         self.worker_id = worker_id_val
         self.transport: Optional[asyncio.DatagramTransport] = None
+        self.http_proxy_server = None  # Will be set after connection
+        self.http_msg_counter = itertools.count().__next__
+        self.http_pending_requests = {}  # msg_id -> asyncio.Future
         print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
     def connection_made(self, transport: asyncio.DatagramTransport):
         global p2p_udp_transport 
@@ -170,8 +179,46 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         p2p_udp_transport = transport 
         local_addr = transport.get_extra_info('sockname')
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT}).")
+        # Start HTTP proxy server when UDP is ready
+        asyncio.create_task(self.start_http_proxy())
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
         global current_p2p_peer_addr, current_p2p_peer_id, benchmark_sessions
+        
+        # Check if this is an HTTP-over-UDP frame
+        if len(data) >= 5:  # Minimum frame size
+            try:
+                flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
+                if flags == HTTP_UDP_ACK:
+                    # This is an ACK for a sent message
+                    fut = self.http_pending_requests.pop(msg_id, None)
+                    if fut and not fut.done():
+                        fut.set_result(b"")
+                    return
+                elif flags == 0:  # Regular HTTP frame
+                    payload = data[5:]
+                    # Send ACK
+                    ack_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_ACK, msg_id)
+                    self.transport.sendto(ack_frame, addr)
+                    
+                    # Check if it's an HTTP request
+                    if payload.startswith(b"GET /echo") or payload.startswith(b"POST /echo"):
+                        # Handle echo request
+                        parts = payload.split(b"\r\n\r\n", 1)
+                        body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
+                        response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
+                        response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
+                        self.transport.sendto(response_frame, addr)
+                        print(f"Worker '{self.worker_id}': Handled HTTP echo request from {addr}")
+                        return
+                    elif payload.startswith(b"HTTP/1.1"):
+                        # This is an HTTP response for a pending request
+                        fut = self.http_pending_requests.get(msg_id)
+                        if fut and not fut.done():
+                            fut.set_result(payload)
+                        return
+            except struct.error:
+                pass  # Not an HTTP frame, continue with JSON processing
+        
         message_str = data.decode(errors='ignore')
         try:
             p2p_message = json.loads(message_str)
@@ -250,11 +297,63 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"})))
             elif "P2P_PING_FROM_" in message_str: print(f"Worker '{self.worker_id}': !!! P2P UDP Ping (legacy) received from {addr} !!!")
         except json.JSONDecodeError: print(f"Worker '{self.worker_id}': Received non-JSON UDP packet from {addr}: {message_str}")
+    
+    async def start_http_proxy(self):
+        """Start the HTTP proxy server on localhost:8080"""
+        try:
+            self.http_proxy_server = await asyncio.start_server(
+                self.handle_http_client, '127.0.0.1', 8080)
+            print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on localhost:8080")
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Failed to start HTTP proxy: {e}")
+    
+    async def handle_http_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle incoming HTTP connections from local clients"""
+        global current_p2p_peer_addr
+        try:
+            # Read the HTTP request
+            request = await reader.read(HTTP_UDP_MAX - 50)  # Leave room for framing
+            
+            if not current_p2p_peer_addr:
+                # No peer connected, return error
+                error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
+                writer.write(error_response)
+                await writer.drain()
+                return
+            
+            # Send request to peer via UDP
+            msg_id = self.http_msg_counter()
+            frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + request
+            
+            # Create future for response
+            fut = asyncio.create_future()
+            self.http_pending_requests[msg_id] = fut
+            
+            # Send the request
+            self.transport.sendto(frame, current_p2p_peer_addr)
+            
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(fut, timeout=5.0)
+                writer.write(response)
+            except asyncio.TimeoutError:
+                timeout_response = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 15\r\n\r\nRequest timeout"
+                writer.write(timeout_response)
+            
+            await writer.drain()
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Error handling HTTP client: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
     def connection_lost(self, exc: Optional[Exception]): 
         global p2p_udp_transport
         print(f"Worker '{self.worker_id}': P2P UDP listener connection lost: {exc if exc else 'Closed normally'}")
         if self.transport == p2p_udp_transport: p2p_udp_transport = None
+        if self.http_proxy_server:
+            self.http_proxy_server.close()
 
 async def discover_and_report_stun_udp_endpoint(websocket_conn_to_rendezvous):
     global our_stun_discovered_udp_ip, our_stun_discovered_udp_port, worker_id, INTERNAL_UDP_PORT
@@ -332,14 +431,6 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     print(f"Worker '{worker_id}': Finished UDP Hole Punch PING burst to '{peer_worker_id}'.")
     for ui_client_ws in list(ui_websocket_clients):
         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link attempt initiated with {peer_worker_id[:8]}...", "peer_id": peer_worker_id})))
-    
-    # Start the UDP-HTTP proxy
-    loop = asyncio.get_running_loop()
-    # Get the underlying socket from the transport
-    udp_sock = p2p_udp_transport.get_extra_info('socket')
-    proxy = UDPHTTPProxy(loop, udp_sock, current_p2p_peer_addr)
-    loop.create_task(proxy.run())
-    print(f"Worker '{worker_id}': UDP-HTTP proxy started on localhost:8080")
 
     # NEW: Determine if this worker is the initiator for the pairing test
     if worker_id < peer_worker_id: # Lexicographical comparison
