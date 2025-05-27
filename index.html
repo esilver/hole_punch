@@ -57,6 +57,24 @@
             </div>
             <div id="benchmarkStatus" class="mt-4 text-base text-gray-700 bg-gray-100 p-4 rounded-lg min-h-[45px] shadow-inner">Benchmark status will appear here.</div>
         </div>
+
+        <div id="httpProxySection" class="mt-8 p-6 border border-gray-200 rounded-xl bg-blue-50 shadow">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">HTTP-over-UDP Proxy Test</h3>
+            <div class="flex flex-col gap-4">
+                <div>
+                    <label for="httpTestMessage" class="block text-base font-medium text-gray-700 mb-1.5">Test Message:</label>
+                    <input type="text" id="httpTestMessage" value="Hello via HTTP-over-UDP!" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-1 focus:ring-indigo-600 focus:border-transparent outline-none text-base shadow-sm"/>
+                </div>
+                <button id="testHttpProxyButton" class="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 shadow-md hover:shadow-lg">
+                    Test HTTP Proxy
+                </button>
+                <div id="httpProxyStatus" class="mt-2 text-base text-gray-700 bg-gray-100 p-4 rounded-lg min-h-[45px] shadow-inner">HTTP proxy test results will appear here.</div>
+                <div class="text-sm text-gray-600 italic">
+                    <p>This tests the HTTP-over-UDP proxy running on localhost:8080.</p>
+                    <p>The proxy tunnels HTTP traffic through the P2P UDP connection.</p>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -69,6 +87,9 @@
         const benchmarkSizeInput = document.getElementById('benchmarkSize');
         const startBenchmarkButton = document.getElementById('startBenchmarkButton');
         const benchmarkStatusDiv = document.getElementById('benchmarkStatus');
+        const httpTestMessageInput = document.getElementById('httpTestMessage');
+        const testHttpProxyButton = document.getElementById('testHttpProxyButton');
+        const httpProxyStatusDiv = document.getElementById('httpProxyStatus');
 
         let localUiSocket = null;
         let myWorkerId = "Unknown";
@@ -118,9 +139,13 @@
                             statusDiv.textContent = "P2P Link Active.";
                             startBenchmarkButton.disabled = false;
                             startBenchmarkButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                            testHttpProxyButton.disabled = false;
+                            testHttpProxyButton.classList.remove('opacity-50', 'cursor-not-allowed');
                         } else {
                             startBenchmarkButton.disabled = true;
                             startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
+                            testHttpProxyButton.disabled = true;
+                            testHttpProxyButton.classList.add('opacity-50', 'cursor-not-allowed');
                         }
                     } else if (data.type === "p2p_message_received") {
                         addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
@@ -131,6 +156,8 @@
                             statusDiv.textContent = "P2P Link Active.";
                             startBenchmarkButton.disabled = false;
                             startBenchmarkButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                            testHttpProxyButton.disabled = false;
+                            testHttpProxyButton.classList.remove('opacity-50', 'cursor-not-allowed');
                         } else {
                              peerInfoDiv.textContent = "Peer: Not connected";
                              if (!data.message.toLowerCase().includes("lost")) {
@@ -138,6 +165,8 @@
                              }
                              startBenchmarkButton.disabled = true;
                              startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
+                             testHttpProxyButton.disabled = true;
+                             testHttpProxyButton.classList.add('opacity-50', 'cursor-not-allowed');
                         }
                     } else if (data.type === "benchmark_status") {
                         benchmarkStatusDiv.textContent = data.message;
@@ -156,6 +185,8 @@
                 addMessage("Connection to local worker backend closed. Retrying in 5s...", "system");
                 startBenchmarkButton.disabled = true;
                 startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
+                testHttpProxyButton.disabled = true;
+                testHttpProxyButton.classList.add('opacity-50', 'cursor-not-allowed');
                 setTimeout(connectToLocalBackend, 5000);
             };
 
@@ -185,6 +216,8 @@
         
         startBenchmarkButton.disabled = true; // Initially disable
         startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
+        testHttpProxyButton.disabled = true; // Initially disable
+        testHttpProxyButton.classList.add('opacity-50', 'cursor-not-allowed');
 
         startBenchmarkButton.onclick = function() {
             const sizeKb = parseInt(benchmarkSizeInput.value, 10);
@@ -203,6 +236,41 @@
             } else {
                 addMessage("Cannot start benchmark. Not connected to local backend.", "system");
                 benchmarkStatusDiv.textContent = "Not connected to local backend.";
+            }
+        };
+
+        testHttpProxyButton.onclick = async function() {
+            const testMessage = httpTestMessageInput.value.trim();
+            if (!testMessage) {
+                httpProxyStatusDiv.textContent = "Please enter a test message.";
+                return;
+            }
+            
+            httpProxyStatusDiv.textContent = "Testing HTTP proxy...";
+            testHttpProxyButton.disabled = true;
+            
+            try {
+                const response = await fetch('http://localhost:8080/echo', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'text/plain'
+                    },
+                    body: testMessage
+                });
+                
+                if (response.ok) {
+                    const responseText = await response.text();
+                    httpProxyStatusDiv.textContent = `Success! Response: ${responseText}`;
+                    addMessage(`HTTP Proxy Test Success: ${responseText}`, "system");
+                } else {
+                    httpProxyStatusDiv.textContent = `Failed: HTTP ${response.status} ${response.statusText}`;
+                    addMessage(`HTTP Proxy Test Failed: ${response.status} ${response.statusText}`, "system");
+                }
+            } catch (error) {
+                httpProxyStatusDiv.textContent = `Error: ${error.message}. Make sure the proxy is running on localhost:8080`;
+                addMessage(`HTTP Proxy Test Error: ${error.message}`, "system");
+            } finally {
+                testHttpProxyButton.disabled = false;
             }
         };
 

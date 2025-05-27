@@ -1,5 +1,5 @@
 import asyncio, itertools, time, socket, os, logging
-from udp_http import build_get, build_resp, build_ack, parse, MAX
+from worker.udp_http import build_get, build_resp, build_ack, parse, MAX
 
 log = logging.getLogger("proxy")
 
@@ -13,15 +13,28 @@ class UDPHTTPProxy:
     # ── UDP side ──────────────────────────────────────────────
     async def _udp_read(self):
         while True:
-            pkt, _ = await self.loop.sock_recvfrom(self.sock, MAX)
+            pkt, addr = await self.loop.sock_recvfrom(self.sock, MAX)
+            # Only process packets from our peer
+            if addr != self.peer:
+                continue
             flags, mid, payload = parse(pkt)
             if flags & 0x80:               # ACK only
                 fut = self.todo.pop(mid, None)
                 if fut and not fut.done(): fut.set_result(b"")
                 continue
             self.sock.sendto(build_ack(mid), self.peer)
-            fut = self.todo.get(mid)
-            if fut: fut.set_result(payload)
+            
+            # Handle incoming HTTP request from peer
+            if payload.startswith(b"GET /echo"):
+                # Extract the body from the request if any
+                parts = payload.split(b"\r\n\r\n", 1)
+                body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
+                response = build_resp(mid, body)
+                self.sock.sendto(response, self.peer)
+            else:
+                # Handle response for pending request
+                fut = self.todo.get(mid)
+                if fut: fut.set_result(payload)
 
     # ── TCP side ──────────────────────────────────────────────
     async def _handle_tcp(self, r, w):
