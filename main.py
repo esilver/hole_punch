@@ -364,7 +364,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + request
             
             # Create future for response
-            fut = asyncio.create_future()
+            fut = asyncio.get_event_loop().create_future()
             self.http_pending_requests[msg_id] = fut
             
             # Send the request
