@@ -27,16 +27,16 @@ gcloud run deploy ${SERVICE_NAME}-coordinator \
     --platform managed \
     --region ${REGION} \
     --allow-unauthenticated \
-    --memory 2Gi \
-    --cpu 2 \
+    --memory 4Gi \
+    --cpu 4 \
     --max-instances 1 \
-    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-o3khapnl3a-uc.a.run.app" \
+    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-982092720909.us-central1.run.app" \
     --set-env-vars "WORKER_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
     --set-env-vars "TRINO_PROXY_PORT=8080" \
-    --set-env-vars "INTERNAL_UDP_PORT=443" \
+    --set-env-vars "INTERNAL_UDP_PORT=8443" \
     --project ${PROJECT_ID}
 
 # Deploy worker node
@@ -47,16 +47,16 @@ gcloud run deploy ${SERVICE_NAME}-worker \
     --platform managed \
     --region ${REGION} \
     --allow-unauthenticated \
-    --memory 2Gi \
-    --cpu 2 \
+    --memory 4Gi \
+    --cpu 4 \
     --max-instances 1 \
-    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-o3khapnl3a-uc.a.run.app" \
+    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-982092720909.us-central1.run.app" \
     --set-env-vars "WORKER_ID=${WORKER_ID}" \
     --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
     --set-env-vars "TRINO_PROXY_PORT=8080" \
-    --set-env-vars "INTERNAL_UDP_PORT=443" \
+    --set-env-vars "INTERNAL_UDP_PORT=8443" \
     --project ${PROJECT_ID}
 
 echo -e "${GREEN}Deployment complete!${NC}"
