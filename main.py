@@ -27,7 +27,7 @@ current_p2p_peer_addr: Optional[Tuple[str, int]] = None
 
 DEFAULT_STUN_HOST = os.environ.get("STUN_HOST", "stun.l.google.com")
 DEFAULT_STUN_PORT = int(os.environ.get("STUN_PORT", "19302"))
-INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "443"))
+INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "8081"))
 HTTP_PORT_FOR_UI = int(os.environ.get("PORT", 8080))
 
 P2P_KEEP_ALIVE_INTERVAL_SEC = 15 # Interval in seconds to send P2P keep-alives
@@ -297,6 +297,11 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             try:
                 flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
                 
+                # Validate flags - must be a known combination
+                valid_flags = flags == 0 or flags & HTTP_UDP_ACK or flags & HTTP_UDP_CHUNK
+                if not valid_flags:
+                    raise ValueError(f"Invalid flags: {flags}")
+                
                 # Handle ACK
                 if flags & HTTP_UDP_ACK:
                     print(f"Worker '{self.worker_id}': Received HTTP ACK for msg_id={msg_id} from {addr}")
@@ -316,6 +321,11 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     
                     _, _, chunk_num, total_chunks = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
                     chunk_payload = data[HTTP_UDP_CHUNK_HEADER_SIZE:]
+                    
+                    # Validate chunk numbers
+                    if chunk_num >= total_chunks:
+                        print(f"Worker '{self.worker_id}': Invalid chunk {chunk_num}/{total_chunks} - chunk_num must be < total_chunks")
+                        return
                     
                     # Send ACK for this chunk
                     ack_frame = struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_ACK | HTTP_UDP_CHUNK, msg_id, chunk_num, total_chunks)
@@ -363,9 +373,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         else:
                             print(f"Worker '{self.worker_id}': No pending request for msg_id={msg_id}")
                         return
-            except struct.error as e:
-                print(f"Worker '{self.worker_id}': Failed to parse as HTTP frame: {e}")
-                pass  # Not an HTTP frame, continue with JSON processing
+            except (struct.error, ValueError) as e:
+                # Not an HTTP frame, continue with JSON processing
+                pass
         
         message_str = data.decode(errors='ignore')
         try:

@@ -48,7 +48,8 @@ for i in {1..30}; do
         break
     fi
     if ! kill -0 $TRINO_PID 2>/dev/null; then
-        echo "Trino process died!"
+        echo "Trino process died! Trino log:"
+        cat /tmp/trino.log
         exit 1
     fi
     echo "Waiting for Trino... ($i/30)"

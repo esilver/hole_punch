@@ -36,7 +36,15 @@ gcloud run deploy ${SERVICE_NAME}-coordinator \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
     --set-env-vars "TRINO_PROXY_PORT=8080" \
-    --set-env-vars "INTERNAL_UDP_PORT=8443" \
+    --set-env-vars "INTERNAL_UDP_PORT=8081" \
+    --set-env-vars "STUN_HOST=stun.l.google.com" \
+    --set-env-vars "STUN_PORT=19302" \
+    --set-env-vars "PING_INTERVAL_SEC=25" \
+    --set-env-vars "PING_TIMEOUT_SEC=25" \
+    --set-env-vars "STUN_RECHECK_INTERVAL_SEC=60" \
+    --vpc-egress=all-traffic \
+    --network=ip-worker-vpc \
+    --subnet=ip-worker-subnet \
     --project ${PROJECT_ID}
 
 # Deploy worker node
@@ -56,7 +64,15 @@ gcloud run deploy ${SERVICE_NAME}-worker \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
     --set-env-vars "TRINO_PROXY_PORT=8080" \
-    --set-env-vars "INTERNAL_UDP_PORT=8443" \
+    --set-env-vars "INTERNAL_UDP_PORT=8081" \
+    --set-env-vars "STUN_HOST=stun.l.google.com" \
+    --set-env-vars "STUN_PORT=19302" \
+    --set-env-vars "PING_INTERVAL_SEC=25" \
+    --set-env-vars "PING_TIMEOUT_SEC=25" \
+    --set-env-vars "STUN_RECHECK_INTERVAL_SEC=60" \
+    --vpc-egress=all-traffic \
+    --network=ip-worker-vpc \
+    --subnet=ip-worker-subnet \
     --project ${PROJECT_ID}
 
 echo -e "${GREEN}Deployment complete!${NC}"
