@@ -123,6 +123,39 @@ async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int
         if not ui_ws.closed:
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {error_msg}"}))
 
+async def test_http_proxy_internal(test_message: str, ui_ws: websockets.WebSocketServerProtocol):
+    """Test the HTTP proxy by making an internal request"""
+    global worker_id
+    try:
+        # Use aiohttp if available, otherwise use the raw socket approach
+        reader, writer = await asyncio.open_connection('127.0.0.1', 8080)
+        
+        # Send HTTP request
+        request = f"POST /echo HTTP/1.1\r\nContent-Length: {len(test_message)}\r\n\r\n{test_message}"
+        writer.write(request.encode())
+        await writer.drain()
+        
+        # Read response
+        response = await reader.read(1024)
+        response_str = response.decode('utf-8', errors='ignore')
+        
+        # Parse response
+        if b"HTTP/1.1 200 OK" in response:
+            # Extract body
+            parts = response_str.split("\r\n\r\n", 1)
+            body = parts[1] if len(parts) > 1 else "No body"
+            await ui_ws.send(json.dumps({"type": "http_proxy_response", "response": body}))
+        else:
+            await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": f"Unexpected response: {response_str[:100]}"}))
+        
+        writer.close()
+        await writer.wait_closed()
+        
+    except Exception as e:
+        error_msg = f"Failed to test HTTP proxy: {type(e).__name__}: {e}"
+        print(f"Worker '{worker_id}': {error_msg}")
+        await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": error_msg}))
+
 async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, path: str):
     global ui_websocket_clients, worker_id, current_p2p_peer_id, p2p_udp_transport, current_p2p_peer_addr
     ui_websocket_clients.add(websocket)
@@ -157,6 +190,11 @@ async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, pa
                         asyncio.create_task(benchmark_send_udp_data(current_p2p_peer_addr[0], current_p2p_peer_addr[1], size_kb, websocket))
                     else:
                         await websocket.send(json.dumps({"type": "benchmark_status", "message": "Error: No P2P peer to start benchmark with."}))
+                elif msg_type == "test_http_proxy":
+                    test_message = message.get("message", "")
+                    print(f"Worker '{worker_id}': UI requested HTTP proxy test with message: {test_message}")
+                    # Test the HTTP proxy internally
+                    asyncio.create_task(test_http_proxy_internal(test_message, websocket))
             except json.JSONDecodeError: print(f"Worker '{worker_id}': UI WebSocket received non-JSON: {message_raw}")
             except Exception as e_ui_msg: print(f"Worker '{worker_id}': Error processing UI WebSocket message: {e_ui_msg}")
     except websockets.exceptions.ConnectionClosed: print(f"Worker '{worker_id}': UI WebSocket client {websocket.remote_address} disconnected.")

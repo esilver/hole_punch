@@ -70,8 +70,9 @@
                 </button>
                 <div id="httpProxyStatus" class="mt-2 text-base text-gray-700 bg-gray-100 p-4 rounded-lg min-h-[45px] shadow-inner">HTTP proxy test results will appear here.</div>
                 <div class="text-sm text-gray-600 italic">
-                    <p>This tests the HTTP-over-UDP proxy running on localhost:8080.</p>
-                    <p>The proxy tunnels HTTP traffic through the P2P UDP connection.</p>
+                    <p>This tests the HTTP-over-UDP proxy by sending a message through the tunnel.</p>
+                    <p>The message is sent to the peer worker via UDP and echoed back.</p>
+                    <p>The proxy allows any HTTP service to communicate over the P2P connection.</p>
                 </div>
             </div>
         </div>
@@ -173,6 +174,12 @@
                         addMessage(`Benchmark: ${data.message}`, "system");
                     } else if (data.type === "error") {
                         addMessage(`Error from backend: ${data.message}`, "system");
+                    } else if (data.type === "http_proxy_response") {
+                        httpProxyStatusDiv.textContent = `Success! Response: ${data.response}`;
+                        addMessage(`HTTP Proxy Test Success: ${data.response}`, "system");
+                    } else if (data.type === "http_proxy_error") {
+                        httpProxyStatusDiv.textContent = `Error: ${data.error}`;
+                        addMessage(`HTTP Proxy Test Error: ${data.error}`, "system");
                     }
                 } catch (e) {
                     addMessage("Received non-JSON message from backend: " + event.data, "system");
@@ -249,29 +256,20 @@
             httpProxyStatusDiv.textContent = "Testing HTTP proxy...";
             testHttpProxyButton.disabled = true;
             
-            try {
-                const response = await fetch('http://localhost:8080/echo', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain'
-                    },
-                    body: testMessage
-                });
-                
-                if (response.ok) {
-                    const responseText = await response.text();
-                    httpProxyStatusDiv.textContent = `Success! Response: ${responseText}`;
-                    addMessage(`HTTP Proxy Test Success: ${responseText}`, "system");
-                } else {
-                    httpProxyStatusDiv.textContent = `Failed: HTTP ${response.status} ${response.statusText}`;
-                    addMessage(`HTTP Proxy Test Failed: ${response.status} ${response.statusText}`, "system");
-                }
-            } catch (error) {
-                httpProxyStatusDiv.textContent = `Error: ${error.message}. Make sure the proxy is running on localhost:8080`;
-                addMessage(`HTTP Proxy Test Error: ${error.message}`, "system");
-            } finally {
-                testHttpProxyButton.disabled = false;
+            // Send request through WebSocket to worker
+            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
+                localUiSocket.send(JSON.stringify({
+                    type: "test_http_proxy",
+                    message: testMessage
+                }));
+                httpProxyStatusDiv.textContent = "HTTP proxy test request sent...";
+                addMessage(`HTTP Proxy Test: Sending "${testMessage}" through tunnel`, "system");
+            } else {
+                httpProxyStatusDiv.textContent = "Not connected to local backend.";
+                addMessage("Cannot test HTTP proxy. Not connected to local backend.", "system");
             }
+            
+            testHttpProxyButton.disabled = false;
         };
 
         messageInput.addEventListener("keypress", function(event) {
