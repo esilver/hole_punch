@@ -245,9 +245,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 if flags == HTTP_UDP_ACK:
                     # This is an ACK for a sent message
                     print(f"Worker '{self.worker_id}': Received HTTP ACK for msg_id={msg_id} from {addr}")
-                    fut = self.http_pending_requests.pop(msg_id, None)
-                    if fut and not fut.done():
-                        fut.set_result(b"")
+                    # Don't remove the future on ACK - wait for the actual response
                     return
                 elif flags == 0:  # Regular HTTP frame
                     payload = data[5:]
@@ -270,7 +268,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     elif payload.startswith(b"HTTP/1.1"):
                         # This is an HTTP response for a pending request
                         print(f"Worker '{self.worker_id}': Received HTTP response for msg_id={msg_id}")
-                        fut = self.http_pending_requests.get(msg_id)
+                        fut = self.http_pending_requests.pop(msg_id, None)  # Remove it now
                         if fut and not fut.done():
                             fut.set_result(payload)
                             print(f"Worker '{self.worker_id}': Set result for msg_id={msg_id}")
