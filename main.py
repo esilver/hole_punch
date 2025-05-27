@@ -32,6 +32,12 @@ HTTP_PORT_FOR_UI = int(os.environ.get("PORT", 8080))
 
 P2P_KEEP_ALIVE_INTERVAL_SEC = 15 # Interval in seconds to send P2P keep-alives
 
+# Trino configuration
+TRINO_MODE = os.environ.get("TRINO_MODE", "").lower() in ["true", "1", "yes", "on"]
+TRINO_LOCAL_PORT = int(os.environ.get("TRINO_LOCAL_PORT", "8081"))  # Local Trino worker port
+TRINO_PROXY_PORT = int(os.environ.get("TRINO_PROXY_PORT", "8080"))  # HTTP proxy port for Trino
+TRINO_COORDINATOR_ID = os.environ.get("TRINO_COORDINATOR_ID", "")  # Worker ID of the coordinator
+
 ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
 
 # Benchmark related globals
@@ -58,6 +64,8 @@ def handle_shutdown_signal(signum, frame):
         asyncio.create_task(ws_client.close(reason="Server shutting down"))
 
 async def process_http_request(path: str, request_headers: Headers) -> Optional[Tuple[int, Headers, bytes]]:
+    global worker_id, current_p2p_peer_id, TRINO_MODE
+    
     if path == "/ui_ws": return None  
     if path == "/":
         try:
@@ -68,6 +76,41 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
         except FileNotFoundError: return (404, [("Content-Type", "text/plain")], b"index.html not found")
         except Exception as e_file: print(f"Error serving index.html: {e_file}"); return (500, [("Content-Type", "text/plain")], b"Internal Server Error")
     elif path == "/health": return (200, [("Content-Type", "text/plain")], b"OK")
+    elif path == "/v1/info" and TRINO_MODE:
+        # Trino worker info endpoint for discovery
+        info = {
+            "nodeId": worker_id,
+            "environment": "holepunch-p2p",
+            "external": f"http://localhost:{TRINO_PROXY_PORT}",
+            "internal": f"http://localhost:{TRINO_PROXY_PORT}",
+            "internalHttps": None,
+            "nodeVersion": "1.0.0",
+            "coordinator": worker_id == TRINO_COORDINATOR_ID,
+            "startTime": time.time()
+        }
+        content = json.dumps(info).encode()
+        headers = Headers([("Content-Type", "application/json"), ("Content-Length", str(len(content)))])
+        return (200, headers, content)
+    elif path == "/v1/announcement" and TRINO_MODE:
+        # Trino discovery endpoint - list all known workers
+        workers = []
+        if worker_id:
+            workers.append({
+                "id": worker_id,
+                "internalUri": f"http://localhost:{TRINO_PROXY_PORT}",
+                "nodeVersion": "1.0.0",
+                "coordinator": worker_id == TRINO_COORDINATOR_ID
+            })
+        if current_p2p_peer_id:
+            workers.append({
+                "id": current_p2p_peer_id,
+                "internalUri": f"http://localhost:{TRINO_PROXY_PORT}",
+                "nodeVersion": "1.0.0",
+                "coordinator": current_p2p_peer_id == TRINO_COORDINATOR_ID
+            })
+        content = json.dumps(workers).encode()
+        headers = Headers([("Content-Type", "application/json"), ("Content-Length", str(len(content)))])
+        return (200, headers, content)
     else: return (404, [("Content-Type", "text/plain")], b"Not Found")
 
 async def benchmark_send_udp_data(target_ip: str, target_port: int, size_kb: int, ui_ws: websockets.WebSocketServerProtocol):
@@ -255,16 +298,24 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     self.transport.sendto(ack_frame, addr)
                     
                     # Check if it's an HTTP request
-                    if payload.startswith(b"GET /echo") or payload.startswith(b"POST /echo"):
-                        # Handle echo request
-                        print(f"Worker '{self.worker_id}': Processing echo request from {addr}")
-                        parts = payload.split(b"\r\n\r\n", 1)
-                        body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
-                        response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
-                        response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
-                        self.transport.sendto(response_frame, addr)
-                        print(f"Worker '{self.worker_id}': Sent echo response to {addr}, body={body[:30]}...")
-                        return
+                    if TRINO_MODE:
+                        # In Trino mode, forward to local Trino worker
+                        if payload.startswith(b"GET ") or payload.startswith(b"POST ") or payload.startswith(b"PUT ") or payload.startswith(b"DELETE "):
+                            print(f"Worker '{self.worker_id}': Processing Trino request from {addr}")
+                            asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
+                            return
+                    else:
+                        # Echo mode
+                        if payload.startswith(b"GET /echo") or payload.startswith(b"POST /echo"):
+                            # Handle echo request
+                            print(f"Worker '{self.worker_id}': Processing echo request from {addr}")
+                            parts = payload.split(b"\r\n\r\n", 1)
+                            body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
+                            response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
+                            response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
+                            self.transport.sendto(response_frame, addr)
+                            print(f"Worker '{self.worker_id}': Sent echo response to {addr}, body={body[:30]}...")
+                            return
                     elif payload.startswith(b"HTTP/1.1"):
                         # This is an HTTP response for a pending request
                         print(f"Worker '{self.worker_id}': Received HTTP response for msg_id={msg_id}")
@@ -361,31 +412,69 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     async def start_http_proxy(self):
         """Start the HTTP proxy server on localhost:8080"""
         try:
+            proxy_port = TRINO_PROXY_PORT if TRINO_MODE else 8080
             self.http_proxy_server = await asyncio.start_server(
-                self.handle_http_client, '127.0.0.1', 8080)
+                self.handle_http_client, '127.0.0.1', proxy_port)
             addr = self.http_proxy_server.sockets[0].getsockname()
-            print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on {addr}")
+            mode = "Trino mode" if TRINO_MODE else "echo mode"
+            print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on {addr} in {mode}")
         except Exception as e:
             print(f"Worker '{self.worker_id}': Failed to start HTTP proxy: {e}")
     
     async def handle_http_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming HTTP connections from local clients"""
-        global current_p2p_peer_addr
+        global current_p2p_peer_addr, TRINO_MODE
         client_addr = writer.get_extra_info('peername')
         print(f"Worker '{self.worker_id}': HTTP proxy received connection from {client_addr}")
         
         try:
-            # Read the HTTP request
-            request = await reader.read(HTTP_UDP_MAX - 50)  # Leave room for framing
-            print(f"Worker '{self.worker_id}': HTTP proxy received request: {request[:50]}...")
+            # Read the HTTP request headers first to determine routing
+            request_line = await reader.readline()
+            headers = []
+            headers.append(request_line)
             
-            if not current_p2p_peer_addr:
-                # No peer connected, return error
-                print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected")
-                error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
-                writer.write(error_response)
-                await writer.drain()
-                return
+            # Read headers
+            content_length = 0
+            while True:
+                line = await reader.readline()
+                headers.append(line)
+                if line == b'\r\n':
+                    break
+                if line.lower().startswith(b'content-length:'):
+                    content_length = int(line.split(b':', 1)[1].strip())
+            
+            # Read body if present
+            body = b''
+            if content_length > 0:
+                body = await reader.read(content_length)
+            
+            # Reconstruct full request
+            request = b''.join(headers) + body
+            print(f"Worker '{self.worker_id}': HTTP proxy received request: {request_line.strip()}")
+            
+            if TRINO_MODE:
+                # In Trino mode, determine routing based on path
+                path = request_line.split(b' ')[1].decode('utf-8')
+                if self._is_local_trino_path(path):
+                    # Forward to local Trino worker
+                    await self._forward_to_local_trino(request, writer)
+                    return
+                else:
+                    # Forward to peer via UDP tunnel
+                    if not current_p2p_peer_addr:
+                        print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected for Trino request")
+                        error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
+                        writer.write(error_response)
+                        await writer.drain()
+                        return
+            else:
+                # Echo mode - all requests go through UDP tunnel
+                if not current_p2p_peer_addr:
+                    print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected")
+                    error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
+                    writer.write(error_response)
+                    await writer.drain()
+                    return
             
             # Send request to peer via UDP
             msg_id = self.http_msg_counter()
@@ -416,6 +505,88 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         finally:
             writer.close()
             await writer.wait_closed()
+    
+    def _is_local_trino_path(self, path: str) -> bool:
+        """Determine if a path should be handled by the local Trino worker"""
+        # These paths are typically handled by the worker itself
+        local_paths = [
+            '/v1/task',  # Task management
+            '/v1/info',  # Worker info
+            '/v1/status',  # Worker status
+            '/v1/thread',  # Thread dumps
+        ]
+        return any(path.startswith(p) for p in local_paths)
+    
+    async def _forward_to_local_trino(self, request: bytes, writer: asyncio.StreamWriter):
+        """Forward request to local Trino worker"""
+        try:
+            # Connect to local Trino worker
+            trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
+            
+            # Forward request
+            trino_writer.write(request)
+            await trino_writer.drain()
+            
+            # Read response and forward back
+            # For Trino, we need to handle streaming responses
+            while True:
+                chunk = await trino_reader.read(4096)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+            
+            trino_writer.close()
+            await trino_writer.wait_closed()
+            
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Error forwarding to local Trino: {e}")
+            error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
+            writer.write(error_response)
+            await writer.drain()
+    
+    async def _handle_remote_trino_request(self, request: bytes, msg_id: int, addr: Tuple[str, int]):
+        """Handle Trino request from remote peer by forwarding to local Trino"""
+        try:
+            # Connect to local Trino worker
+            trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
+            
+            # Forward request
+            trino_writer.write(request)
+            await trino_writer.drain()
+            
+            # Read full response
+            response_parts = []
+            while True:
+                chunk = await trino_reader.read(4096)
+                if not chunk:
+                    break
+                response_parts.append(chunk)
+            
+            response = b''.join(response_parts)
+            
+            # Send response back via UDP
+            # For large responses, we might need to chunk this
+            if len(response) + 5 <= HTTP_UDP_MAX:
+                response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
+                self.transport.sendto(response_frame, addr)
+                print(f"Worker '{self.worker_id}': Sent Trino response to {addr}, size={len(response)}")
+            else:
+                # For now, send an error for oversized responses
+                # TODO: Implement chunking for large responses
+                error_resp = b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 27\r\n\r\nResponse too large for UDP"
+                error_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + error_resp
+                self.transport.sendto(error_frame, addr)
+                print(f"Worker '{self.worker_id}': Response too large ({len(response)} bytes), sent error")
+            
+            trino_writer.close()
+            await trino_writer.wait_closed()
+            
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Error handling remote Trino request: {e}")
+            error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
+            error_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + error_response
+            self.transport.sendto(error_frame, addr)
     
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
     def connection_lost(self, exc: Optional[Exception]): 
