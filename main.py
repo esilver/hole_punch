@@ -13,6 +13,7 @@ from websockets.server import serve as websockets_serve
 from websockets.http import Headers
 import time # For benchmark timing
 import base64 # For encoding benchmark payload
+from worker.udp_proxy import UDPHTTPProxy
 
 # --- Global Variables ---
 worker_id = str(uuid.uuid4())
@@ -25,7 +26,7 @@ current_p2p_peer_addr: Optional[Tuple[str, int]] = None
 
 DEFAULT_STUN_HOST = os.environ.get("STUN_HOST", "stun.l.google.com")
 DEFAULT_STUN_PORT = int(os.environ.get("STUN_PORT", "19302"))
-INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "8081"))
+INTERNAL_UDP_PORT = int(os.environ.get("INTERNAL_UDP_PORT", "443"))
 HTTP_PORT_FOR_UI = int(os.environ.get("PORT", 8080))
 
 P2P_KEEP_ALIVE_INTERVAL_SEC = 15 # Interval in seconds to send P2P keep-alives
@@ -331,6 +332,14 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     print(f"Worker '{worker_id}': Finished UDP Hole Punch PING burst to '{peer_worker_id}'.")
     for ui_client_ws in list(ui_websocket_clients):
         asyncio.create_task(ui_client_ws.send(json.dumps({"type": "p2p_status_update", "message": f"P2P link attempt initiated with {peer_worker_id[:8]}...", "peer_id": peer_worker_id})))
+    
+    # Start the UDP-HTTP proxy
+    loop = asyncio.get_running_loop()
+    # Get the underlying socket from the transport
+    udp_sock = p2p_udp_transport.get_extra_info('socket')
+    proxy = UDPHTTPProxy(loop, udp_sock, current_p2p_peer_addr)
+    loop.create_task(proxy.run())
+    print(f"Worker '{worker_id}': UDP-HTTP proxy started on localhost:8080")
 
     # NEW: Determine if this worker is the initiator for the pairing test
     if worker_id < peer_worker_id: # Lexicographical comparison
