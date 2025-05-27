@@ -1,0 +1,52 @@
+# Multi-stage build for Trino + Holepunch worker
+FROM python:3.12-slim AS python-base
+
+# Install Java and other dependencies for Trino
+RUN apt-get update && apt-get install -y \
+    openjdk-17-jre-headless \
+    curl \
+    less \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Java environment
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# Download and install Trino
+ENV TRINO_VERSION=435
+RUN curl -o /tmp/trino-server.tar.gz https://repo1.maven.org/maven2/io/trino/trino-server/${TRINO_VERSION}/trino-server-${TRINO_VERSION}.tar.gz && \
+    tar -xzf /tmp/trino-server.tar.gz -C /opt && \
+    mv /opt/trino-server-${TRINO_VERSION} /opt/trino && \
+    rm /tmp/trino-server.tar.gz
+
+# Create Trino directories
+RUN mkdir -p /opt/trino/etc /opt/trino/data /var/log/trino
+
+# Set working directory
+WORKDIR /app
+
+# Copy Python requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
+
+# Copy application files
+COPY main.py .
+COPY index.html .
+COPY TRINO_SETUP.md .
+
+# Copy Trino configuration files
+COPY trino-config/ /opt/trino/etc/
+
+# Copy start script
+COPY start-trino.sh /app/
+RUN chmod +x /app/start-trino.sh
+
+# Expose ports (Cloud Run will override with PORT env var)
+EXPOSE 8080 8081
+
+# Set environment variables for Trino mode
+ENV TRINO_MODE=true
+ENV TRINO_LOCAL_PORT=8081
+ENV TRINO_PROXY_PORT=8080
+
+# Use the start script as entrypoint
+CMD ["/app/start-trino.sh"]

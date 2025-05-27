@@ -1,0 +1,84 @@
+#!/bin/bash
+set -e
+
+# Configuration
+PROJECT_ID="iceberg-eli"
+SERVICE_NAME="trino-p2p-service"
+REGION="us-central1"
+IMAGE_NAME="trino-p2p-worker"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Building and deploying Trino P2P workers...${NC}"
+
+# Build the Trino Docker image
+echo -e "${YELLOW}Building Docker image...${NC}"
+docker build -f Dockerfile.trino -t gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest .
+
+# Push to GCR
+echo -e "${YELLOW}Pushing image to Google Container Registry...${NC}"
+docker push gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest
+
+# Deploy coordinator (first worker)
+echo -e "${YELLOW}Deploying Trino coordinator...${NC}"
+COORDINATOR_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+gcloud run deploy ${SERVICE_NAME}-coordinator \
+    --image gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest \
+    --platform managed \
+    --region ${REGION} \
+    --allow-unauthenticated \
+    --memory 2Gi \
+    --cpu 2 \
+    --max-instances 1 \
+    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-o3khapnl3a-uc.a.run.app" \
+    --set-env-vars "WORKER_ID=${COORDINATOR_ID}" \
+    --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
+    --set-env-vars "TRINO_MODE=true" \
+    --set-env-vars "TRINO_LOCAL_PORT=8081" \
+    --set-env-vars "TRINO_PROXY_PORT=8080" \
+    --set-env-vars "INTERNAL_UDP_PORT=443" \
+    --project ${PROJECT_ID}
+
+# Deploy worker node
+echo -e "${YELLOW}Deploying Trino worker...${NC}"
+WORKER_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+gcloud run deploy ${SERVICE_NAME}-worker \
+    --image gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest \
+    --platform managed \
+    --region ${REGION} \
+    --allow-unauthenticated \
+    --memory 2Gi \
+    --cpu 2 \
+    --max-instances 1 \
+    --set-env-vars "RENDEZVOUS_SERVICE_URL=https://rendezvous-service-o3khapnl3a-uc.a.run.app" \
+    --set-env-vars "WORKER_ID=${WORKER_ID}" \
+    --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
+    --set-env-vars "TRINO_MODE=true" \
+    --set-env-vars "TRINO_LOCAL_PORT=8081" \
+    --set-env-vars "TRINO_PROXY_PORT=8080" \
+    --set-env-vars "INTERNAL_UDP_PORT=443" \
+    --project ${PROJECT_ID}
+
+echo -e "${GREEN}Deployment complete!${NC}"
+echo -e "${GREEN}Coordinator ID: ${COORDINATOR_ID}${NC}"
+echo -e "${GREEN}Worker ID: ${WORKER_ID}${NC}"
+
+# Get service URLs
+COORDINATOR_URL=$(gcloud run services describe ${SERVICE_NAME}-coordinator --region ${REGION} --format 'value(status.url)' --project ${PROJECT_ID})
+WORKER_URL=$(gcloud run services describe ${SERVICE_NAME}-worker --region ${REGION} --format 'value(status.url)' --project ${PROJECT_ID})
+
+echo -e "${GREEN}Service URLs:${NC}"
+echo -e "Coordinator: ${COORDINATOR_URL}"
+echo -e "Worker: ${WORKER_URL}"
+
+echo -e "${YELLOW}Waiting for services to start...${NC}"
+sleep 10
+
+# Test the services
+echo -e "${YELLOW}Testing Trino discovery...${NC}"
+curl -s ${COORDINATOR_URL}/v1/info | jq .
+curl -s ${COORDINATOR_URL}/v1/announcement | jq .
