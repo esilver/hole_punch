@@ -35,7 +35,7 @@ P2P_KEEP_ALIVE_INTERVAL_SEC = 15 # Interval in seconds to send P2P keep-alives
 # Trino configuration
 TRINO_MODE = os.environ.get("TRINO_MODE", "").lower() in ["true", "1", "yes", "on"]
 TRINO_LOCAL_PORT = int(os.environ.get("TRINO_LOCAL_PORT", "8081"))  # Local Trino worker port
-TRINO_PROXY_PORT = int(os.environ.get("TRINO_PROXY_PORT", "8080"))  # HTTP proxy port for Trino
+TRINO_PROXY_PORT = int(os.environ.get("TRINO_PROXY_PORT", "18080"))  # HTTP proxy port for Trino
 TRINO_COORDINATOR_ID = os.environ.get("TRINO_COORDINATOR_ID", "")  # Worker ID of the coordinator
 
 ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
@@ -49,14 +49,15 @@ STUN_MAX_RETRIES = int(os.environ.get("STUN_MAX_RETRIES", "3"))
 STUN_RETRY_DELAY_SEC = float(os.environ.get("STUN_RETRY_DELAY_SEC", "2.0"))
 
 # HTTP-over-UDP framing constants
-HTTP_UDP_FMT = "!B I"  # flags (1 byte), msg-id (4 bytes)
+HTTP_UDP_MAGIC = 0xAB  # Magic byte to identify HTTP-over-UDP frames
+HTTP_UDP_FMT = "!B B I"  # magic (1 byte), flags (1 byte), msg-id (4 bytes)
 HTTP_UDP_ACK = 0x80
 HTTP_UDP_CHUNK = 0x40  # Flag indicating this is a chunk
 HTTP_UDP_FINAL = 0x20  # Flag indicating final chunk
 HTTP_UDP_MAX = 1200  # fits under common MTU
-HTTP_UDP_HEADER_SIZE = 5  # Size of our header
-HTTP_UDP_CHUNK_FMT = "!B I H H"  # flags, msg-id, chunk_num, total_chunks
-HTTP_UDP_CHUNK_HEADER_SIZE = 9  # Size of chunk header
+HTTP_UDP_HEADER_SIZE = 6  # Size of our header (increased by 1 for magic)
+HTTP_UDP_CHUNK_FMT = "!B B I H H"  # magic, flags, msg-id, chunk_num, total_chunks
+HTTP_UDP_CHUNK_HEADER_SIZE = 10  # Size of chunk header (increased by 1 for magic)
 HTTP_UDP_MAX_PAYLOAD = HTTP_UDP_MAX - HTTP_UDP_CHUNK_HEADER_SIZE  # Max chunk payload
 CHUNK_TIMEOUT_SEC = 30.0  # Timeout for incomplete chunk reassembly
 
@@ -293,9 +294,13 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         global current_p2p_peer_addr, current_p2p_peer_id, benchmark_sessions
         
         # Check if this is an HTTP-over-UDP frame
-        if len(data) >= 5:  # Minimum frame size
+        if len(data) >= HTTP_UDP_HEADER_SIZE:  # Minimum frame size
             try:
-                flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
+                magic, flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
+                
+                # Check magic byte first
+                if magic != HTTP_UDP_MAGIC:
+                    raise ValueError(f"Invalid magic byte: {magic:#x}")
                 
                 # Validate flags - must be a known combination
                 valid_flags = flags == 0 or flags & HTTP_UDP_ACK or flags & HTTP_UDP_CHUNK
@@ -307,7 +312,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     print(f"Worker '{self.worker_id}': Received HTTP ACK for msg_id={msg_id} from {addr}")
                     # Track chunk ACKs if this is for a chunked message
                     if flags & HTTP_UDP_CHUNK and len(data) >= HTTP_UDP_CHUNK_HEADER_SIZE:
-                        _, _, chunk_num, _ = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
+                        _, _, _, chunk_num, _ = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
                         if msg_id in self.outgoing_chunk_tracking:
                             self.outgoing_chunk_tracking[msg_id]['acked_chunks'].add(chunk_num)
                             print(f"Worker '{self.worker_id}': Chunk {chunk_num} ACKed for msg_id={msg_id}")
@@ -319,7 +324,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         print(f"Worker '{self.worker_id}': Invalid chunk header size")
                         return
                     
-                    _, _, chunk_num, total_chunks = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
+                    _, _, _, chunk_num, total_chunks = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
                     chunk_payload = data[HTTP_UDP_CHUNK_HEADER_SIZE:]
                     
                     # Validate chunk numbers
@@ -328,7 +333,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         return
                     
                     # Send ACK for this chunk
-                    ack_frame = struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_ACK | HTTP_UDP_CHUNK, msg_id, chunk_num, total_chunks)
+                    ack_frame = struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_MAGIC, HTTP_UDP_ACK | HTTP_UDP_CHUNK, msg_id, chunk_num, total_chunks)
                     self.transport.sendto(ack_frame, addr)
                     
                     # Handle chunk reassembly
@@ -337,10 +342,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 
                 # Regular (non-chunked) frame
                 elif flags == 0:
-                    payload = data[5:]
+                    payload = data[HTTP_UDP_HEADER_SIZE:]
                     print(f"Worker '{self.worker_id}': Received HTTP frame, msg_id={msg_id}, payload_start={payload[:30]}...")
                     # Send ACK
-                    ack_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_ACK, msg_id)
+                    ack_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, HTTP_UDP_ACK, msg_id)
                     self.transport.sendto(ack_frame, addr)
                     
                     # Check if it's an HTTP request
@@ -358,7 +363,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                             parts = payload.split(b"\r\n\r\n", 1)
                             body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
                             response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
-                            response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
+                            response_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + response
                             self.transport.sendto(response_frame, addr)
                             print(f"Worker '{self.worker_id}': Sent echo response to {addr}, body={body[:30]}...")
                             return
@@ -525,7 +530,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
             # Send request to peer via UDP
             msg_id = self.http_msg_counter()
-            frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + request
+            frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + request
             
             # Create future for response
             fut = asyncio.get_event_loop().create_future()
@@ -538,7 +543,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             # Wait for response with timeout
             try:
                 print(f"Worker '{self.worker_id}': HTTP proxy waiting for response, msg_id={msg_id}")
-                response = await asyncio.wait_for(fut, timeout=5.0)
+                response = await asyncio.wait_for(fut, timeout=30.0)
                 print(f"Worker '{self.worker_id}': HTTP proxy got response: {response[:50]}...")
                 writer.write(response)
             except asyncio.TimeoutError:
@@ -621,7 +626,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             print(f"Worker '{self.worker_id}': Error handling remote Trino request: {e}")
             error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
-            error_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + error_response
+            error_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + error_response
             self.transport.sendto(error_frame, addr)
     
     async def _handle_incoming_chunk(self, msg_id: int, chunk_num: int, total_chunks: int, payload: bytes, is_final: bool, addr: Tuple[str, int]):
@@ -684,7 +689,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         """Send a response in chunks if it's too large"""
         if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
             # Small enough to send as regular frame
-            frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + data
+            frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + data
             self.transport.sendto(frame, addr)
             print(f"Worker '{self.worker_id}': Sent non-chunked response for msg_id={msg_id}, size={len(data)}")
             return
@@ -706,11 +711,12 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 flags |= HTTP_UDP_FINAL
             
             # Send chunk
-            chunk_frame = struct.pack(HTTP_UDP_CHUNK_FMT, flags, msg_id, chunk_num, total_chunks) + chunk_data
+            chunk_frame = struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_MAGIC, flags, msg_id, chunk_num, total_chunks) + chunk_data
             self.transport.sendto(chunk_frame, addr)
             
-            # Small delay between chunks to avoid overwhelming
-            await asyncio.sleep(0.001)
+            # Only add delay every 100 chunks to avoid overwhelming
+            if chunk_num % 100 == 99:
+                await asyncio.sleep(0.001)
         
         # TODO: Implement retransmission for un-ACKed chunks
         # For now, just clean up after a delay

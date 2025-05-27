@@ -35,7 +35,7 @@ gcloud run deploy ${SERVICE_NAME}-coordinator \
     --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
-    --set-env-vars "TRINO_PROXY_PORT=8080" \
+    --set-env-vars "TRINO_PROXY_PORT=18080" \
     --set-env-vars "INTERNAL_UDP_PORT=8081" \
     --set-env-vars "STUN_HOST=stun.l.google.com" \
     --set-env-vars "STUN_PORT=19302" \
@@ -63,7 +63,7 @@ gcloud run deploy ${SERVICE_NAME}-worker \
     --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_MODE=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
-    --set-env-vars "TRINO_PROXY_PORT=8080" \
+    --set-env-vars "TRINO_PROXY_PORT=18080" \
     --set-env-vars "INTERNAL_UDP_PORT=8081" \
     --set-env-vars "STUN_HOST=stun.l.google.com" \
     --set-env-vars "STUN_PORT=19302" \
