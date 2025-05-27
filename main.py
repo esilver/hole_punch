@@ -60,6 +60,7 @@ HTTP_UDP_CHUNK_FMT = "!B B I H H"  # magic, flags, msg-id, chunk_num, total_chun
 HTTP_UDP_CHUNK_HEADER_SIZE = 10  # Size of chunk header (increased by 1 for magic)
 HTTP_UDP_MAX_PAYLOAD = HTTP_UDP_MAX - HTTP_UDP_CHUNK_HEADER_SIZE  # Max chunk payload
 CHUNK_TIMEOUT_SEC = 30.0  # Timeout for incomplete chunk reassembly
+PROXY_REQUEST_TIMEOUT_SEC = 30.0 # Timeout for HTTP proxy client requests
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received, p2p_udp_transport
@@ -280,11 +281,27 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         self.worker_id = worker_id_val
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.http_proxy_server = None  # Will be set after connection
-        self.http_msg_counter = itertools.count().__next__
-        self.http_pending_requests = {}  # msg_id -> asyncio.Future
+        # Start msg_id counter from a random value to avoid collisions between workers
+        import random
+        start_id = random.randint(1000, 1000000)
+        self.http_msg_counter = itertools.count(start_id).__next__
+        self.http_pending_requests: Dict[int, asyncio.Future] = {}  # msg_id -> asyncio.Future
         self.incoming_chunks = {}  # msg_id -> {chunks: {chunk_num: data}, total: int, received: set, start_time: float}
         self.outgoing_chunk_tracking = {}  # msg_id -> {acked_chunks: set, total: int}
         print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
+
+    async def _execute_handler_safely(self, coro, handler_name: str):
+        try:
+            await coro
+        except asyncio.CancelledError:
+            print(f"Worker '{self.worker_id}': {handler_name} task was cancelled.")
+            # Re-raise if cancellation needs to propagate, but often for created tasks,
+            # just logging is fine if they are meant to be independent.
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Unhandled exception in {handler_name}: {type(e).__name__} - {e}")
+            import traceback
+            traceback.print_exc()
+
     def connection_made(self, transport: asyncio.DatagramTransport):
         global p2p_udp_transport 
         self.transport = transport
@@ -348,7 +365,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 # Regular (non-chunked) frame
                 elif flags == 0:
                     payload = data[HTTP_UDP_HEADER_SIZE:]
-                    print(f"Worker '{self.worker_id}': Received HTTP frame, msg_id={msg_id}, payload_start={payload[:30]}...")
+                    print(f"Worker '{self.worker_id}': Received HTTP frame, msg_id={msg_id}, from {addr}, size={len(payload)}, payload_start={payload[:50]}...")
                     # Send ACK
                     ack_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, HTTP_UDP_ACK, msg_id)
                     self.transport.sendto(ack_frame, addr)
@@ -358,7 +375,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         # In Trino mode, forward to local Trino worker
                         if payload.startswith(b"GET ") or payload.startswith(b"POST ") or payload.startswith(b"PUT ") or payload.startswith(b"DELETE "):
                             print(f"Worker '{self.worker_id}': Processing Trino request from {addr}")
-                            asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
+                            # asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
+                            handler_coro = self._handle_remote_trino_request(payload, msg_id, addr)
+                            task_name = f"RemoteTrinoRequest(msg_id={msg_id}, peer={addr})"
+                            asyncio.create_task(self._execute_handler_safely(handler_coro, task_name))
                             return
                     else:
                         # Echo mode
@@ -375,13 +395,17 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     
                     if payload.startswith(b"HTTP/1.1"):
                         # This is an HTTP response for a pending request
-                        print(f"Worker '{self.worker_id}': Received HTTP response for msg_id={msg_id}")
-                        fut = self.http_pending_requests.pop(msg_id, None)  # Remove it now
-                        if fut and not fut.done():
-                            fut.set_result(payload)
-                            print(f"Worker '{self.worker_id}': Set result for msg_id={msg_id}")
+                        print(f"Worker '{self.worker_id}': Received non-chunked HTTP response for msg_id={msg_id}")
+                        fut = self.http_pending_requests.pop(msg_id, None)
+                        if fut:
+                            if not fut.done():
+                                fut.set_result(payload)
+                                print(f"Worker '{self.worker_id}': Set result for non-chunked msg_id={msg_id}. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
+                            else:
+                                print(f"Worker '{self.worker_id}': Future for non-chunked msg_id={msg_id} was already done. Exception: {fut.exception()}. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
                         else:
-                            print(f"Worker '{self.worker_id}': No pending request for msg_id={msg_id}")
+                            # This case implies the future was already removed (e.g. timed out by handle_http_client)
+                            print(f"Worker '{self.worker_id}': Late non-chunked HTTP response for msg_id={msg_id}. No pending future. Data: {payload[:60]}")
                         return
             except (struct.error, ValueError) as e:
                 # Not an HTTP frame, continue with JSON processing
@@ -483,10 +507,19 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         global current_p2p_peer_addr, TRINO_MODE
         client_addr = writer.get_extra_info('peername')
         print(f"Worker '{self.worker_id}': HTTP proxy received connection from {client_addr}")
-        
+        request_line_strip = b"" # For logging
+        msg_id = -1 # For logging in finally
+        request_summary_for_logs = ""
+
         try:
             # Read the HTTP request headers first to determine routing
             request_line = await reader.readline()
+            if not request_line: # Connection closed prematurely
+                print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} closed before request line.")
+                return
+            request_line_strip = request_line.strip()
+            request_summary_for_logs = request_line_strip[:80].decode('utf-8', 'ignore') # For log messages
+
             headers = []
             headers.append(request_line)
             
@@ -494,6 +527,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             content_length = 0
             while True:
                 line = await reader.readline()
+                if not line: # Connection closed prematurely
+                    print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} closed while reading headers for req: {request_summary_for_logs}")
+                    return
                 headers.append(line)
                 if line == b'\r\n':
                     break
@@ -504,64 +540,128 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             body = b''
             if content_length > 0:
                 body = await reader.read(content_length)
-            
+                if len(body) < content_length:
+                    print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} closed while reading body for req: {request_summary_for_logs}. Expected {content_length}, got {len(body)}")
+                    return
+
             # Reconstruct full request
             request = b''.join(headers) + body
-            print(f"Worker '{self.worker_id}': HTTP proxy received request: {request_line.strip()}")
+            print(f"Worker '{self.worker_id}': HTTP proxy received full request: {request_summary_for_logs}")
             
             if TRINO_MODE:
                 # In Trino mode, determine routing based on path
                 path = request_line.split(b' ')[1].decode('utf-8')
                 if self._is_local_trino_path(path):
                     # Forward to local Trino worker
+                    print(f"Worker '{self.worker_id}': HTTP proxy forwarding req {request_summary_for_logs} to LOCAL Trino.")
                     await self._forward_to_local_trino(request, writer)
-                    return
+                    return # Local handling complete
                 else:
                     # Forward to peer via UDP tunnel
                     if not current_p2p_peer_addr:
-                        print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected for Trino request")
-                        error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
+                        print(f"Worker '{self.worker_id}': HTTP proxy - no peer for Trino req {request_summary_for_logs}")
+                        error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 17\\r\\n\\r\\nNo peer connected"
                         writer.write(error_response)
                         await writer.drain()
                         return
-            else:
-                # Echo mode - all requests go through UDP tunnel
+            else: # Echo mode
                 if not current_p2p_peer_addr:
-                    print(f"Worker '{self.worker_id}': HTTP proxy - no peer connected")
-                    error_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nNo peer connected"
+                    print(f"Worker '{self.worker_id}': HTTP proxy - no peer for echo req {request_summary_for_logs}")
+                    error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 17\\r\\n\\r\\nNo peer connected"
                     writer.write(error_response)
                     await writer.drain()
                     return
             
             # Send request to peer via UDP
-            msg_id = self.http_msg_counter()
+            msg_id = self.http_msg_counter() # Assign here for logging
             frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + request
             
-            # Create future for response
             fut = asyncio.get_event_loop().create_future()
             self.http_pending_requests[msg_id] = fut
+            print(f"Worker '{self.worker_id}': HTTP proxy CREATED future for msg_id={msg_id} (req: {request_summary_for_logs}). Pending: {list(self.http_pending_requests.keys())}")
             
-            # Send the request
-            print(f"Worker '{self.worker_id}': HTTP proxy sending frame to {current_p2p_peer_addr}, msg_id={msg_id}")
+            if not self.transport:
+                 print(f"Worker '{self.worker_id}': HTTP proxy NO TRANSPORT to send msg_id={msg_id} (req: {request_summary_for_logs}) to peer.")
+                 self.http_pending_requests.pop(msg_id, None) # Clean up future
+                 # fut.cancel() # Or fut.set_exception(...)
+                 error_response = b"HTTP/1.1 500 Internal Server Error\\r\\nContent-Length: 28\\r\\n\\r\\nUDP transport not available"
+                 writer.write(error_response)
+                 await writer.drain()
+                 return
+
             self.transport.sendto(frame, current_p2p_peer_addr)
+            print(f"Worker '{self.worker_id}': HTTP proxy SENT frame to {current_p2p_peer_addr}, msg_id={msg_id} (req: {request_summary_for_logs})")
             
-            # Wait for response with timeout
             try:
-                print(f"Worker '{self.worker_id}': HTTP proxy waiting for response, msg_id={msg_id}")
-                response = await asyncio.wait_for(fut, timeout=30.0)
-                print(f"Worker '{self.worker_id}': HTTP proxy got response: {response[:50]}...")
+                print(f"Worker '{self.worker_id}': HTTP proxy WAITING for response, msg_id={msg_id} (req: {request_summary_for_logs}), timeout={PROXY_REQUEST_TIMEOUT_SEC}s. Pending: {list(self.http_pending_requests.keys())}")
+                response = await asyncio.wait_for(fut, timeout=PROXY_REQUEST_TIMEOUT_SEC)
+                print(f"Worker '{self.worker_id}': HTTP proxy GOT response for msg_id={msg_id} (req: {request_summary_for_logs}). Resp: {response[:60].decode('utf-8','ignore')}... Pending after success: {list(self.http_pending_requests.keys())}")
                 writer.write(response)
-            except asyncio.TimeoutError:
-                print(f"Worker '{self.worker_id}': HTTP proxy timeout waiting for response, msg_id={msg_id}")
-                timeout_response = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 15\r\n\r\nRequest timeout"
+            except asyncio.TimeoutError: # This is specifically for wait_for timing out
+                log_prefix_immediate = f"Worker '{self.worker_id}': HTTP proxy TIMEOUT (by asyncio.wait_for) for msg_id={msg_id} (req: {request_summary_for_logs})."
+                print(f"{log_prefix_immediate} Attempting to process future state.")
+
+                popped_fut_on_timeout = self.http_pending_requests.pop(msg_id, None)
+                future_was_done = False
+                future_was_cancelled_by_us = False
+                future_exception_info = "NoExceptionRetrieved"
+
+                try:
+                    if fut.done():
+                        future_was_done = True
+                        try:
+                            actual_exception = fut.exception()
+                            future_exception_info = f"{type(actual_exception).__name__} - {actual_exception}"
+                            print(f"{log_prefix_immediate} Future was ALREADY DONE. Actual exception on future: {future_exception_info}. Popped now: {popped_fut_on_timeout is not None}.")
+                        except Exception as e_fut_exc:
+                            future_exception_info = f"Error getting future exception: {e_fut_exc}"
+                            print(f"{log_prefix_immediate} Future was ALREADY DONE but errored on .exception(): {e_fut_exc}. Popped now: {popped_fut_on_timeout is not None}.")
+                    else: 
+                        print(f"{log_prefix_immediate} Future was PENDING and wait_for timed it out. Attempting to cancel. Popped now: {popped_fut_on_timeout is not None}.")
+                        try:
+                            if not fut.cancelled(): 
+                                fut.cancel()
+                                future_was_cancelled_by_us = True
+                                print(f"{log_prefix_immediate} Future cancellation initiated.")
+                        except Exception as e_fut_cancel:
+                            print(f"{log_prefix_immediate} Error during future cancellation: {e_fut_cancel}.")
+                except Exception as e_outer_fut_check:
+                     print(f"{log_prefix_immediate} Error checking/processing future state: {e_outer_fut_check}.")
+
+                print(f"{log_prefix_immediate} Summary: Done={future_was_done}, CancelledByUs={future_was_cancelled_by_us}, ExceptionInfo='{future_exception_info}'. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
+                timeout_response = b"HTTP/1.1 504 Gateway Timeout\\r\\nContent-Length: 15\\r\\n\\r\\nRequest timeout"
                 writer.write(timeout_response)
+            except Exception as e_wait: # Handles exceptions if 'fut' itself completes with an error
+                # This means 'fut' completed with an exception (e.g., set by _chunk_cleanup_task or other logic)
+                # and that exception was re-raised by 'await fut' (implicitly by wait_for).
+                self.http_pending_requests.pop(msg_id, None) # Ensure cleanup
+                print(f"Worker '{self.worker_id}': HTTP proxy request for msg_id={msg_id} (req: {request_summary_for_logs}) future completed with EXCEPTION: {type(e_wait).__name__} - {e_wait}. Pending: {list(self.http_pending_requests.keys())}")
+                error_response_body = f"Proxied request failed: {type(e_wait).__name__}".encode('utf-8')
+                error_response = f"HTTP/1.1 502 Bad Gateway\\r\\nContent-Length: {len(error_response_body)}\\r\\n\\r\\n".encode('utf-8') + error_response_body
+                writer.write(error_response)
             
             await writer.drain()
-        except Exception as e:
-            print(f"Worker '{self.worker_id}': Error handling HTTP client: {e}")
+        except ConnectionRefusedError:
+             print(f"Worker '{self.worker_id}': HTTP proxy ConnectionRefusedError for req {request_summary_for_logs}, msg_id={msg_id}")
+             if not writer.is_closing():
+                error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 20\\r\\n\\r\\nConnection refused" # Should be rare here
+                writer.write(error_response)
+                await writer.drain()
+        except Exception as e_http_client:
+            print(f"Worker '{self.worker_id}': HTTP proxy EXCEPTION in handle_http_client for msg_id={msg_id} (req: {request_summary_for_logs}): {type(e_http_client).__name__} - {e_http_client}")
+            if not writer.is_closing():
+                try:
+                    err_resp = b"HTTP/1.1 500 Internal Server Error\\r\\nContent-Length: 22\\r\\n\\r\\nProxy internal error"
+                    writer.write(err_resp)
+                    await writer.drain()
+                except Exception as e_final_err:
+                    print(f"Worker '{self.worker_id}': HTTP proxy failed to send 500 error for req {request_summary_for_logs}: {e_final_err}")
         finally:
-            writer.close()
-            await writer.wait_closed()
+            # Ensure writer is closed.
+            if not writer.is_closing():
+                writer.close()
+                # await writer.wait_closed() # wait_closed() can hang if the other side RSTs
+            print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} CLEANUP. (Processed msg_id={msg_id}, req: {request_summary_for_logs})")
     
     def _is_local_trino_path(self, path: str) -> bool:
         """Determine if a path should be handled by the local Trino worker"""
@@ -571,6 +671,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             '/v1/info',  # Worker info
             '/v1/status',  # Worker status
             '/v1/thread',  # Thread dumps
+            # '/v1/service',  # Service discovery - removed to test UDP tunneling
         ]
         return any(path.startswith(p) for p in local_paths)
     
@@ -604,36 +705,88 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     
     async def _handle_remote_trino_request(self, request: bytes, msg_id: int, addr: Tuple[str, int]):
         """Handle Trino request from remote peer by forwarding to local Trino"""
+        print(f"Worker '{self.worker_id}': _handle_remote_trino_request START for msg_id={msg_id}")
+        print(f"Worker '{self.worker_id}': Request preview: {request[:100]}")
         try:
             # Connect to local Trino worker
+            print(f"Worker '{self.worker_id}': Attempting to connect to local Trino on 127.0.0.1:{TRINO_LOCAL_PORT}")
             trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
+            print(f"Worker '{self.worker_id}': Successfully connected to local Trino")
             
             # Forward request
             trino_writer.write(request)
             await trino_writer.drain()
+            print(f"Worker '{self.worker_id}': Forwarded request to local Trino")
             
-            # Read full response
+            # Read response with timeout to avoid hanging
             response_parts = []
-            while True:
-                chunk = await trino_reader.read(4096)
-                if not chunk:
-                    break
-                response_parts.append(chunk)
+            total_read = 0
+            read_timeout = 5.0  # 5 second timeout for reading
+            
+            try:
+                # Read response in chunks with timeout
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(trino_reader.read(8192), timeout=read_timeout)
+                        if not chunk:
+                            print(f"Worker '{self.worker_id}': End of response stream")
+                            break
+                        response_parts.append(chunk)
+                        total_read += len(chunk)
+                        print(f"Worker '{self.worker_id}': Read chunk from Trino, size={len(chunk)}, total={total_read}")
+                        # For smaller responses, use shorter timeout after first chunk
+                        if total_read > 0:
+                            read_timeout = 1.0
+                    except asyncio.TimeoutError:
+                        print(f"Worker '{self.worker_id}': Read timeout after {total_read} bytes - assuming response complete")
+                        break
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error reading response: {type(e).__name__}: {e}")
+                # Continue with what we have
             
             response = b''.join(response_parts)
+            print(f"Worker '{self.worker_id}': Got full response from Trino, size={len(response)}")
             
             # Send response back via UDP using chunking if needed
+            print(f"Worker '{self.worker_id}': Sending response back via UDP for msg_id={msg_id}")
             await self._send_chunked_response(response, msg_id, addr)
+            print(f"Worker '{self.worker_id}': Response sent successfully for msg_id={msg_id}")
             
             trino_writer.close()
             await trino_writer.wait_closed()
             
+        except ConnectionRefusedError as e:
+            print(f"Worker '{self.worker_id}': ConnectionRefusedError - Trino not running on port {TRINO_LOCAL_PORT}? (msg_id={msg_id})")
+            error_response_body = b"Trino service not available on port " + str(TRINO_LOCAL_PORT).encode()
+            error_response = f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: {len(error_response_body)}\r\n\r\n".encode() + error_response_body
+            
+            if self.transport:
+                try:
+                    print(f"Worker '{self.worker_id}': Sending 502 error response for msg_id={msg_id}")
+                    error_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + error_response
+                    self.transport.sendto(error_frame, addr)
+                    print(f"Worker '{self.worker_id}': 502 error response SENT for msg_id={msg_id}")
+                except Exception as send_exc:
+                    print(f"Worker '{self.worker_id}': Failed to send error response for msg_id={msg_id}: {send_exc}")
+            else:
+                print(f"Worker '{self.worker_id}': Transport not available to send error response for msg_id={msg_id}")
+                
         except Exception as e:
-            print(f"Worker '{self.worker_id}': Error handling remote Trino request: {e}")
-            error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
-            error_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + error_response
-            self.transport.sendto(error_frame, addr)
-    
+            print(f"Worker '{self.worker_id}': Error handling remote Trino request: {type(e).__name__}: {e} (msg_id={msg_id})")
+            error_response_body = f"Local Trino processing error: {type(e).__name__}".encode()
+            error_response = f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: {len(error_response_body)}\r\n\r\n".encode() + error_response_body
+            
+            if self.transport:
+                try:
+                    print(f"Worker '{self.worker_id}': Sending 502 error response for msg_id={msg_id}")
+                    error_frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + error_response
+                    self.transport.sendto(error_frame, addr)
+                    print(f"Worker '{self.worker_id}': 502 error response SENT for msg_id={msg_id}")
+                except Exception as send_exc:
+                    print(f"Worker '{self.worker_id}': Failed to send error response for msg_id={msg_id}: {send_exc}")
+            else:
+                print(f"Worker '{self.worker_id}': Transport not available to send error response for msg_id={msg_id}")
+
     async def _handle_incoming_chunk(self, msg_id: int, chunk_num: int, total_chunks: int, payload: bytes, is_final: bool, addr: Tuple[str, int]):
         """Handle incoming chunk and reassemble when complete"""
         current_time = time.time()
@@ -669,29 +822,42 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             del self.incoming_chunks[msg_id]
             
             # Process the complete message
-            if msg_id in self.http_pending_requests:
+            fut_for_response = self.http_pending_requests.pop(msg_id, None) # Try to pop it
+            if fut_for_response:
                 # This is a response to our request
-                fut = self.http_pending_requests.pop(msg_id)
-                if not fut.done():
-                    fut.set_result(complete_data)
+                if not fut_for_response.done():
+                    fut_for_response.set_result(complete_data)
+                    print(f"Worker '{self.worker_id}': Set reassembled result for msg_id={msg_id}. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
+                else:
+                    print(f"Worker '{self.worker_id}': Future for reassembled msg_id={msg_id} was already done when trying to set result. Exception: {fut_for_response.exception()}. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
             else:
-                # This is a new request - process it
-                print(f"Worker '{self.worker_id}': Processing reassembled request")
-                # The complete_data should be an HTTP request
-                if complete_data.startswith(b"GET ") or complete_data.startswith(b"POST ") or complete_data.startswith(b"PUT ") or complete_data.startswith(b"DELETE "):
-                    if TRINO_MODE:
-                        asyncio.create_task(self._handle_remote_trino_request(complete_data, msg_id, addr))
-                    else:
-                        # Handle echo mode
-                        if complete_data.startswith(b"GET /echo") or complete_data.startswith(b"POST /echo"):
-                            parts = complete_data.split(b"\r\n\r\n", 1)
-                            body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
-                            response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
-                            # Send chunked response back
-                            await self._send_chunked_response(response, msg_id, addr)
-    
+                # This means msg_id was not in http_pending_requests (e.g. timed out by handle_http_client), 
+                # so it's either a new incoming request from peer, or a late response to a timed-out one.
+                print(f"Worker '{self.worker_id}': Reassembled data for msg_id={msg_id} (not in pending_requests). Processing as potential new req/late resp. Data: {complete_data[:100]}")
+                # The complete_data should be an HTTP request if it's a new one, or an HTTP response if it's late.
+                if TRINO_MODE and (complete_data.startswith(b"GET ") or complete_data.startswith(b"POST ") or complete_data.startswith(b"PUT ") or complete_data.startswith(b"DELETE ")):
+                    handler_coro = self._handle_remote_trino_request(complete_data, msg_id, addr)
+                    task_name = f"ReassembledTrinoRequest(msg_id={msg_id}, peer={addr})"
+                    asyncio.create_task(self._execute_handler_safely(handler_coro, task_name))
+                elif not TRINO_MODE and (complete_data.startswith(b"GET /echo") or complete_data.startswith(b"POST /echo")):
+                    parts = complete_data.split(b"\r\n\r\n", 1)
+                    body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
+                    response = f"HTTP/1.1 200 OK\\r\\nContent-Length:{len(body)}\\r\\n\\r\\n".encode() + body
+                    try:
+                        await self._send_chunked_response(response, msg_id, addr)
+                    except Exception as e_echo_send:
+                        print(f"Worker '{self.worker_id}': Error sending chunked echo response for reassembled msg_id={msg_id}: {e_echo_send}")
+                # else: it's neither a Trino request nor an Echo request, and no pending future. Could be a late HTTP response.
+                # If it was a late HTTP response, it will simply be ignored here if no future. No specific handling needed for that.
+
     async def _send_chunked_response(self, data: bytes, msg_id: int, addr: Tuple[str, int]):
         """Send a response in chunks if it's too large"""
+        print(f"Worker '{self.worker_id}': _send_chunked_response for msg_id={msg_id} to {addr}. Data prefix: {data[:100]}")
+
+        if not self.transport:
+            print(f"Worker '{self.worker_id}': Transport unavailable in _send_chunked_response for msg_id={msg_id}. Cannot send response.")
+            raise ConnectionError(f"UDP transport not available for _send_chunked_response, msg_id={msg_id}")
+
         if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
             # Small enough to send as regular frame
             frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + data
@@ -747,10 +913,15 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 del self.incoming_chunks[msg_id]
                 
                 # If this was a pending request, fail it
-                if msg_id in self.http_pending_requests:
-                    fut = self.http_pending_requests.pop(msg_id)
-                    if not fut.done():
-                        fut.set_exception(asyncio.TimeoutError("Chunk reassembly timeout"))
+                # Check before pop, then pop it.
+                fut_to_timeout = self.http_pending_requests.pop(msg_id, None)
+                if fut_to_timeout: # If it was indeed in pending_requests
+                    if not fut_to_timeout.done():
+                        print(f"Worker '{self.worker_id}': Chunk reassembly timeout for msg_id={msg_id}. Setting TimeoutError on its future. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
+                        fut_to_timeout.set_exception(asyncio.TimeoutError(f"Chunk reassembly timeout for msg_id={msg_id}"))
+                    else: # Future was already done
+                         print(f"Worker '{self.worker_id}': Chunk reassembly timeout for msg_id={msg_id}, but its future was already done. Exception: {fut_to_timeout.exception()}. Remaining pending_requests: {list(self.http_pending_requests.keys())}")
+                # else: msg_id was not in http_pending_requests, so no corresponding client future to fail.
     
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
     def connection_lost(self, exc: Optional[Exception]): 
