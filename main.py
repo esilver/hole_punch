@@ -316,7 +316,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                             self.transport.sendto(response_frame, addr)
                             print(f"Worker '{self.worker_id}': Sent echo response to {addr}, body={body[:30]}...")
                             return
-                    elif payload.startswith(b"HTTP/1.1"):
+                    
+                    if payload.startswith(b"HTTP/1.1"):
                         # This is an HTTP response for a pending request
                         print(f"Worker '{self.worker_id}': Received HTTP response for msg_id={msg_id}")
                         fut = self.http_pending_requests.pop(msg_id, None)  # Remove it now
