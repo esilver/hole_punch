@@ -36,8 +36,8 @@ COPY TRINO_SETUP.md .
 # Copy Trino configuration files
 COPY trino-config/ /opt/trino/etc/
 
-# Copy start script
-COPY start-trino.sh /app/
+# Copy start script and make executable
+COPY start-trino.sh /app/start-trino.sh
 RUN chmod +x /app/start-trino.sh
 
 # Expose ports (Cloud Run will override with PORT env var)

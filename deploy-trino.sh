@@ -15,13 +15,9 @@ NC='\033[0m' # No Color
 
 echo -e "${GREEN}Building and deploying Trino P2P workers...${NC}"
 
-# Build the Trino Docker image
-echo -e "${YELLOW}Building Docker image...${NC}"
-docker build -f Dockerfile.trino -t gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest .
-
-# Push to GCR
-echo -e "${YELLOW}Pushing image to Google Container Registry...${NC}"
-docker push gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest
+# Build the Trino Docker image for amd64/linux platform and push
+echo -e "${YELLOW}Building Docker image for amd64/linux and pushing to GCR...${NC}"
+docker buildx build --platform linux/amd64 -f Dockerfile.trino -t gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest --push .
 
 # Deploy coordinator (first worker)
 echo -e "${YELLOW}Deploying Trino coordinator...${NC}"
