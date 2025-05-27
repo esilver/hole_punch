@@ -51,7 +51,14 @@ STUN_RETRY_DELAY_SEC = float(os.environ.get("STUN_RETRY_DELAY_SEC", "2.0"))
 # HTTP-over-UDP framing constants
 HTTP_UDP_FMT = "!B I"  # flags (1 byte), msg-id (4 bytes)
 HTTP_UDP_ACK = 0x80
+HTTP_UDP_CHUNK = 0x40  # Flag indicating this is a chunk
+HTTP_UDP_FINAL = 0x20  # Flag indicating final chunk
 HTTP_UDP_MAX = 1200  # fits under common MTU
+HTTP_UDP_HEADER_SIZE = 5  # Size of our header
+HTTP_UDP_CHUNK_FMT = "!B I H H"  # flags, msg-id, chunk_num, total_chunks
+HTTP_UDP_CHUNK_HEADER_SIZE = 9  # Size of chunk header
+HTTP_UDP_MAX_PAYLOAD = HTTP_UDP_MAX - HTTP_UDP_CHUNK_HEADER_SIZE  # Max chunk payload
+CHUNK_TIMEOUT_SEC = 30.0  # Timeout for incomplete chunk reassembly
 
 def handle_shutdown_signal(signum, frame):
     global stop_signal_received, p2p_udp_transport
@@ -269,6 +276,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         self.http_proxy_server = None  # Will be set after connection
         self.http_msg_counter = itertools.count().__next__
         self.http_pending_requests = {}  # msg_id -> asyncio.Future
+        self.incoming_chunks = {}  # msg_id -> {chunks: {chunk_num: data}, total: int, received: set, start_time: float}
+        self.outgoing_chunk_tracking = {}  # msg_id -> {acked_chunks: set, total: int}
         print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
     def connection_made(self, transport: asyncio.DatagramTransport):
         global p2p_udp_transport 
@@ -278,6 +287,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': P2P UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT}).")
         # Start HTTP proxy server when UDP is ready
         asyncio.create_task(self.start_http_proxy())
+        # Start chunk cleanup task
+        asyncio.create_task(self._chunk_cleanup_task())
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
         global current_p2p_peer_addr, current_p2p_peer_id, benchmark_sessions
         
@@ -285,12 +296,37 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         if len(data) >= 5:  # Minimum frame size
             try:
                 flags, msg_id = struct.unpack_from(HTTP_UDP_FMT, data)
-                if flags == HTTP_UDP_ACK:
-                    # This is an ACK for a sent message
+                
+                # Handle ACK
+                if flags & HTTP_UDP_ACK:
                     print(f"Worker '{self.worker_id}': Received HTTP ACK for msg_id={msg_id} from {addr}")
-                    # Don't remove the future on ACK - wait for the actual response
+                    # Track chunk ACKs if this is for a chunked message
+                    if flags & HTTP_UDP_CHUNK and len(data) >= HTTP_UDP_CHUNK_HEADER_SIZE:
+                        _, _, chunk_num, _ = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
+                        if msg_id in self.outgoing_chunk_tracking:
+                            self.outgoing_chunk_tracking[msg_id]['acked_chunks'].add(chunk_num)
+                            print(f"Worker '{self.worker_id}': Chunk {chunk_num} ACKed for msg_id={msg_id}")
                     return
-                elif flags == 0:  # Regular HTTP frame
+                
+                # Handle chunked frames
+                if flags & HTTP_UDP_CHUNK:
+                    if len(data) < HTTP_UDP_CHUNK_HEADER_SIZE:
+                        print(f"Worker '{self.worker_id}': Invalid chunk header size")
+                        return
+                    
+                    _, _, chunk_num, total_chunks = struct.unpack_from(HTTP_UDP_CHUNK_FMT, data)
+                    chunk_payload = data[HTTP_UDP_CHUNK_HEADER_SIZE:]
+                    
+                    # Send ACK for this chunk
+                    ack_frame = struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_ACK | HTTP_UDP_CHUNK, msg_id, chunk_num, total_chunks)
+                    self.transport.sendto(ack_frame, addr)
+                    
+                    # Handle chunk reassembly
+                    asyncio.create_task(self._handle_incoming_chunk(msg_id, chunk_num, total_chunks, chunk_payload, flags & HTTP_UDP_FINAL, addr))
+                    return
+                
+                # Regular (non-chunked) frame
+                elif flags == 0:
                     payload = data[5:]
                     print(f"Worker '{self.worker_id}': Received HTTP frame, msg_id={msg_id}, payload_start={payload[:30]}...")
                     # Send ACK
@@ -566,19 +602,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
             response = b''.join(response_parts)
             
-            # Send response back via UDP
-            # For large responses, we might need to chunk this
-            if len(response) + 5 <= HTTP_UDP_MAX:
-                response_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + response
-                self.transport.sendto(response_frame, addr)
-                print(f"Worker '{self.worker_id}': Sent Trino response to {addr}, size={len(response)}")
-            else:
-                # For now, send an error for oversized responses
-                # TODO: Implement chunking for large responses
-                error_resp = b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 27\r\n\r\nResponse too large for UDP"
-                error_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + error_resp
-                self.transport.sendto(error_frame, addr)
-                print(f"Worker '{self.worker_id}': Response too large ({len(response)} bytes), sent error")
+            # Send response back via UDP using chunking if needed
+            await self._send_chunked_response(response, msg_id, addr)
             
             trino_writer.close()
             await trino_writer.wait_closed()
@@ -588,6 +613,123 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
             error_frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + error_response
             self.transport.sendto(error_frame, addr)
+    
+    async def _handle_incoming_chunk(self, msg_id: int, chunk_num: int, total_chunks: int, payload: bytes, is_final: bool, addr: Tuple[str, int]):
+        """Handle incoming chunk and reassemble when complete"""
+        current_time = time.time()
+        
+        # Initialize tracking for this message if needed
+        if msg_id not in self.incoming_chunks:
+            self.incoming_chunks[msg_id] = {
+                'chunks': {},
+                'total': total_chunks,
+                'received': set(),
+                'start_time': current_time
+            }
+            print(f"Worker '{self.worker_id}': Starting chunk reassembly for msg_id={msg_id}, expecting {total_chunks} chunks")
+        
+        chunk_info = self.incoming_chunks[msg_id]
+        
+        # Store this chunk
+        chunk_info['chunks'][chunk_num] = payload
+        chunk_info['received'].add(chunk_num)
+        
+        print(f"Worker '{self.worker_id}': Received chunk {chunk_num}/{total_chunks} for msg_id={msg_id}, size={len(payload)}")
+        
+        # Check if we have all chunks
+        if len(chunk_info['received']) == chunk_info['total']:
+            # Reassemble the complete message
+            complete_data = b''
+            for i in range(chunk_info['total']):
+                complete_data += chunk_info['chunks'][i]
+            
+            print(f"Worker '{self.worker_id}': Reassembled complete message for msg_id={msg_id}, total size={len(complete_data)}")
+            
+            # Clean up tracking
+            del self.incoming_chunks[msg_id]
+            
+            # Process the complete message
+            if msg_id in self.http_pending_requests:
+                # This is a response to our request
+                fut = self.http_pending_requests.pop(msg_id)
+                if not fut.done():
+                    fut.set_result(complete_data)
+            else:
+                # This is a new request - process it
+                print(f"Worker '{self.worker_id}': Processing reassembled request")
+                # The complete_data should be an HTTP request
+                if complete_data.startswith(b"GET ") or complete_data.startswith(b"POST ") or complete_data.startswith(b"PUT ") or complete_data.startswith(b"DELETE "):
+                    if TRINO_MODE:
+                        asyncio.create_task(self._handle_remote_trino_request(complete_data, msg_id, addr))
+                    else:
+                        # Handle echo mode
+                        if complete_data.startswith(b"GET /echo") or complete_data.startswith(b"POST /echo"):
+                            parts = complete_data.split(b"\r\n\r\n", 1)
+                            body = parts[1] if len(parts) > 1 else b"Echo from remote peer"
+                            response = f"HTTP/1.1 200 OK\r\nContent-Length:{len(body)}\r\n\r\n".encode() + body
+                            # Send chunked response back
+                            await self._send_chunked_response(response, msg_id, addr)
+    
+    async def _send_chunked_response(self, data: bytes, msg_id: int, addr: Tuple[str, int]):
+        """Send a response in chunks if it's too large"""
+        if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
+            # Small enough to send as regular frame
+            frame = struct.pack(HTTP_UDP_FMT, 0, msg_id) + data
+            self.transport.sendto(frame, addr)
+            print(f"Worker '{self.worker_id}': Sent non-chunked response for msg_id={msg_id}, size={len(data)}")
+            return
+        
+        # Need to chunk the response
+        total_chunks = (len(data) + HTTP_UDP_MAX_PAYLOAD - 1) // HTTP_UDP_MAX_PAYLOAD
+        self.outgoing_chunk_tracking[msg_id] = {'acked_chunks': set(), 'total': total_chunks}
+        
+        print(f"Worker '{self.worker_id}': Sending chunked response for msg_id={msg_id}, size={len(data)}, chunks={total_chunks}")
+        
+        for chunk_num in range(total_chunks):
+            start = chunk_num * HTTP_UDP_MAX_PAYLOAD
+            end = min(start + HTTP_UDP_MAX_PAYLOAD, len(data))
+            chunk_data = data[start:end]
+            
+            # Set final flag on last chunk
+            flags = HTTP_UDP_CHUNK
+            if chunk_num == total_chunks - 1:
+                flags |= HTTP_UDP_FINAL
+            
+            # Send chunk
+            chunk_frame = struct.pack(HTTP_UDP_CHUNK_FMT, flags, msg_id, chunk_num, total_chunks) + chunk_data
+            self.transport.sendto(chunk_frame, addr)
+            
+            # Small delay between chunks to avoid overwhelming
+            await asyncio.sleep(0.001)
+        
+        # TODO: Implement retransmission for un-ACKed chunks
+        # For now, just clean up after a delay
+        await asyncio.sleep(1.0)
+        if msg_id in self.outgoing_chunk_tracking:
+            del self.outgoing_chunk_tracking[msg_id]
+    
+    async def _chunk_cleanup_task(self):
+        """Periodically clean up incomplete chunk reassembly"""
+        while True:
+            await asyncio.sleep(10.0)  # Check every 10 seconds
+            current_time = time.time()
+            expired_msgs = []
+            
+            for msg_id, chunk_info in self.incoming_chunks.items():
+                if current_time - chunk_info['start_time'] > CHUNK_TIMEOUT_SEC:
+                    expired_msgs.append(msg_id)
+            
+            for msg_id in expired_msgs:
+                chunk_info = self.incoming_chunks[msg_id]
+                print(f"Worker '{self.worker_id}': Timing out incomplete chunk reassembly for msg_id={msg_id}, "
+                      f"received {len(chunk_info['received'])}/{chunk_info['total']} chunks")
+                del self.incoming_chunks[msg_id]
+                
+                # If this was a pending request, fail it
+                if msg_id in self.http_pending_requests:
+                    fut = self.http_pending_requests.pop(msg_id)
+                    if not fut.done():
+                        fut.set_exception(asyncio.TimeoutError("Chunk reassembly timeout"))
     
     def error_received(self, exc: Exception): print(f"Worker '{self.worker_id}': P2P UDP listener error: {exc}")
     def connection_lost(self, exc: Optional[Exception]): 
