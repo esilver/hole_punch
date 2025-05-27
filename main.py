@@ -69,7 +69,12 @@ def handle_shutdown_signal(signum, frame):
         try: p2p_udp_transport.close(); print(f"Worker '{worker_id}': P2P UDP transport closed.")
         except Exception as e: print(f"Worker '{worker_id}': Error closing P2P UDP transport: {e}")
     for ws_client in list(ui_websocket_clients):
-        asyncio.create_task(ws_client.close(reason="Server shutting down"))
+        async def safe_close(ws):
+            try:
+                await ws.close(reason="Server shutting down")
+            except Exception:
+                pass  # Ignore errors during shutdown
+        asyncio.create_task(safe_close(ws_client))
 
 async def process_http_request(path: str, request_headers: Headers) -> Optional[Tuple[int, Headers, bytes]]:
     global worker_id, current_p2p_peer_id, TRINO_MODE
