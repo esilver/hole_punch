@@ -35,7 +35,7 @@ P2P_KEEP_ALIVE_INTERVAL_SEC = 15 # Interval in seconds to send P2P keep-alives
 # Trino configuration
 TRINO_MODE = os.environ.get("TRINO_MODE", "").lower() in ["true", "1", "yes", "on"]
 TRINO_LOCAL_PORT = int(os.environ.get("TRINO_LOCAL_PORT", "8081"))  # Local Trino worker port
-TRINO_PROXY_PORT = int(os.environ.get("TRINO_PROXY_PORT", "18080"))  # HTTP proxy port for Trino
+TRINO_PROXY_PORT = int(os.environ.get("TRINO_PROXY_PORT", "8080"))  # HTTP proxy port for Trino
 TRINO_COORDINATOR_ID = os.environ.get("TRINO_COORDINATOR_ID", "")  # Worker ID of the coordinator
 
 ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
@@ -307,7 +307,191 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         self.http_pending_requests: Dict[int, asyncio.Future] = {}  # msg_id -> asyncio.Future
         self.incoming_chunks = {}  # msg_id -> {chunks: {chunk_num: data}, total: int, received: set, start_time: float}
         self.outgoing_chunk_tracking = {}  # msg_id -> {acked_chunks: set, total: int}
+        # Initialize connection pool for Trino
+        self.trino_connections = asyncio.Queue(maxsize=10)  # Connection pool
+        self.creating_connections = 0
+        self.max_trino_connections = 10
+        
         print(f"Worker '{self.worker_id}': P2PUDPProtocol instance created.")
+    
+    async def _read_full_trino_response(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bytes:
+        """Read complete response from Trino"""
+        response_chunks = []
+        total_size = 0
+        max_response_size = 10 * 1024 * 1024  # 10MB limit
+        
+        try:
+            while True:
+                chunk = await asyncio.wait_for(reader.read(8192), timeout=5.0)
+                if not chunk:
+                    break
+                response_chunks.append(chunk)
+                total_size += len(chunk)
+                if total_size > max_response_size:
+                    print(f"Worker '{self.worker_id}': Response too large ({total_size} bytes), truncating")
+                    break
+        except asyncio.TimeoutError:
+            print(f"Worker '{self.worker_id}': Timeout reading Trino response after {total_size} bytes")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        
+        return b''.join(response_chunks)
+    
+    async def _process_trino_response(self, response: bytes, request_line: str) -> bytes:
+        """Process Trino response before sending to client"""
+        if not response:
+            return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+        
+        # Parse response
+        header_end = response.find(b'\r\n\r\n')
+        if header_end == -1:
+            return response  # Malformed response, return as-is
+        
+        headers = response[:header_end + 4]
+        body = response[header_end + 4:]
+        
+        # Convert 503 to 404
+        if headers.startswith(b'HTTP/1.1 503'):
+            print(f"Worker '{self.worker_id}': Converting 503 to 404 in routed response")
+            headers = headers.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found', 1)
+            headers = headers.replace(b'HTTP/1.1 503', b'HTTP/1.1 404', 1)
+        
+        # Add response processing here
+        # - Rate limiting
+        # - Response caching for static assets
+        # - Response compression
+        # - Metrics collection
+        
+        # Log response for debugging
+        status_line = headers.split(b'\r\n')[0].decode('utf-8', 'ignore')
+        print(f"Worker '{self.worker_id}': Processed response for {request_line}: {status_line}, size={len(response)}")
+        
+        # For static assets, add cache headers
+        if any(ext in request_line for ext in ['.css', '.js', '.png', '.jpg', '.svg']):
+            # Add cache control header
+            cache_header = b'Cache-Control: public, max-age=3600\r\n'
+            headers = headers[:-2] + cache_header + b'\r\n'
+        
+        return headers + body
+    
+    async def _rewrite_task_uris(self, response: bytes) -> bytes:
+        """Rewrite internal task URIs to use proxy URLs"""
+        try:
+            # Only process JSON responses
+            if not response or b'application/json' not in response:
+                return response
+            
+            # Find JSON body
+            header_end = response.find(b'\r\n\r\n')
+            if header_end == -1:
+                return response
+            
+            headers = response[:header_end + 4]
+            body = response[header_end + 4:]
+            
+            if not body:
+                return response
+            
+            # Try to parse JSON and rewrite URIs
+            try:
+                import json
+                data = json.loads(body)
+                
+                # Rewrite task URIs in statement responses
+                if isinstance(data, dict):
+                    # Rewrite nextUri if present
+                    if 'nextUri' in data and '://' in data['nextUri']:
+                        # Extract the path from the URI
+                        uri = data['nextUri']
+                        if ']:' in uri:  # IPv6 address
+                            # Replace IPv6 task URIs with proxy URLs
+                            print(f"Worker '{self.worker_id}': Rewriting IPv6 URI: {uri}")
+                            # Extract path after the IPv6 address
+                            path_start = uri.find('/', uri.find(']:'))
+                            if path_start > 0:
+                                path = uri[path_start:]
+                                data['nextUri'] = f"http://localhost:{HTTP_PORT_FOR_UI}{path}"
+                    
+                    # Rewrite infoUri if present
+                    if 'infoUri' in data and '://' in data['infoUri']:
+                        uri = data['infoUri']
+                        if ']:' in uri:  # IPv6 address
+                            print(f"Worker '{self.worker_id}': Rewriting IPv6 infoUri: {uri}")
+                            path_start = uri.find('/', uri.find(']:'))
+                            if path_start > 0:
+                                path = uri[path_start:]
+                                data['infoUri'] = f"http://localhost:{HTTP_PORT_FOR_UI}{path}"
+                
+                # Rebuild response with modified JSON
+                new_body = json.dumps(data).encode('utf-8')
+                
+                # Update Content-Length header
+                new_headers = []
+                for line in headers.split(b'\r\n'):
+                    if line.lower().startswith(b'content-length:'):
+                        new_headers.append(f'Content-Length: {len(new_body)}'.encode())
+                    else:
+                        new_headers.append(line)
+                
+                return b'\r\n'.join(new_headers) + new_body
+                
+            except json.JSONDecodeError:
+                # Not JSON or malformed, return as-is
+                return response
+                
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Error rewriting task URIs: {e}")
+            return response
+    
+    async def _get_trino_connection(self) -> Tuple[Optional[asyncio.StreamReader], Optional[asyncio.StreamWriter]]:
+        """Get a connection from the pool or create a new one"""
+        # Try to get existing connection
+        if not self.trino_connections.empty():
+            try:
+                reader, writer = self.trino_connections.get_nowait()
+                # Check if connection is still alive
+                if not writer.is_closing():
+                    return reader, writer
+            except:
+                pass
+        
+        # Create new connection if under limit
+        if self.creating_connections < self.max_trino_connections:
+            self.creating_connections += 1
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT),
+                    timeout=5.0
+                )
+                self.creating_connections -= 1
+                return reader, writer
+            except Exception as e:
+                self.creating_connections -= 1
+                print(f"Worker '{self.worker_id}': Failed to create Trino connection: {e}")
+                return None, None
+        
+        # Wait for a connection to be available
+        try:
+            reader, writer = await asyncio.wait_for(self.trino_connections.get(), timeout=5.0)
+            if not writer.is_closing():
+                return reader, writer
+        except asyncio.TimeoutError:
+            print(f"Worker '{self.worker_id}': Timeout waiting for Trino connection")
+        
+        return None, None
+    
+    async def _return_trino_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Return a connection to the pool"""
+        if not writer.is_closing() and self.trino_connections.qsize() < self.max_trino_connections:
+            try:
+                self.trino_connections.put_nowait((reader, writer))
+            except:
+                writer.close()
+                await writer.wait_closed()
+        else:
+            writer.close()
+            await writer.wait_closed()
 
     async def _execute_handler_safely(self, coro, handler_name: str):
         try:
@@ -316,6 +500,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             print(f"Worker '{self.worker_id}': {handler_name} task was cancelled.")
             # Re-raise if cancellation needs to propagate, but often for created tasks,
             # just logging is fine if they are meant to be independent.
+        except GeneratorExit:
+            print(f"Worker '{self.worker_id}': {handler_name} received GeneratorExit")
+            # Don't re-raise GeneratorExit
+            return
         except Exception as e:
             print(f"Worker '{self.worker_id}': Unhandled exception in {handler_name}: {type(e).__name__} - {e}")
             # Only print traceback if we have a valid event loop
@@ -537,6 +725,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             addr = self.http_proxy_server.sockets[0].getsockname()
             mode = "Trino mode" if TRINO_MODE else "echo mode"
             print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on {addr} in {mode}")
+            print(f"Worker '{self.worker_id}': *** SERVICE READY TO ACCEPT REQUESTS ***")
         except Exception as e:
             print(f"Worker '{self.worker_id}': Failed to start HTTP proxy: {e}")
     
@@ -545,30 +734,54 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         global current_p2p_peer_addr, TRINO_MODE
         client_addr = writer.get_extra_info('peername')
         print(f"Worker '{self.worker_id}': HTTP proxy received connection from {client_addr}")
+        
+        # Log timestamp for debugging Cloud Run issues
+        import datetime
+        print(f"Worker '{self.worker_id}': Connection time: {datetime.datetime.now().isoformat()}")
         request_line_strip = b"" # For logging
         msg_id = -1 # For logging in finally
         request_summary_for_logs = ""
 
         try:
-            # Read the HTTP request headers first to determine routing
-            request_line = await reader.readline()
+            # Read the HTTP request headers first to determine routing with timeout
+            try:
+                request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            except asyncio.TimeoutError:
+                print(f"Worker '{self.worker_id}': Timeout reading request line from {client_addr}")
+                writer.close()
+                return
+                
             if not request_line: # Connection closed prematurely
                 print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} closed before request line.")
+                writer.close()
                 return
             request_line_strip = request_line.strip()
             request_summary_for_logs = request_line_strip[:80].decode('utf-8', 'ignore') # For log messages
             
             # Handle health check directly in proxy
             if b"GET /health" in request_line or b"GET / " in request_line:
-                health_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+                health_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
                 writer.write(health_response)
                 await writer.drain()
                 writer.close()
+                await writer.wait_closed()
                 print(f"Worker '{self.worker_id}': Handled health check request")
                 return
+            
+            # Log UI requests specifically for debugging
+            if b"/ui" in request_line:
+                path = request_line.split(b' ')[1].decode('utf-8', 'ignore') if b' ' in request_line else 'unknown'
+                print(f"Worker '{self.worker_id}': UI request detected: {path}")
+                print(f"Worker '{self.worker_id}': Is coordinator: {os.environ.get('IS_COORDINATOR', 'false')}")
+                print(f"Worker '{self.worker_id}': Current peer: {current_p2p_peer_addr}")
                 
-            # Handle incorrect GET requests to /v1/statement
-            if b"GET /v1/statement" in request_line:
+                # Special handling for UI API endpoints that might have connection issues
+                if "/ui/api/" in path:
+                    print(f"Worker '{self.worker_id}': UI API endpoint detected, will monitor response closely")
+            
+                
+            # Handle incorrect GET requests to /v1/statement (exact path only)
+            if request_line.startswith(b"GET ") and request_line.split(b" ")[1] == b"/v1/statement":
                 error_msg = "Method Not Allowed. Use POST to submit queries to /v1/statement"
                 error_response = f"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: {len(error_msg)}\r\n\r\n{error_msg}".encode()
                 writer.write(error_response)
@@ -610,7 +823,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
             # Reconstruct full request
             request = b''.join(headers) + body
-            print(f"Worker '{self.worker_id}': HTTP proxy received full request: {request_summary_for_logs}")
+            request_size = len(request)
+            print(f"Worker '{self.worker_id}': HTTP proxy received full request: {request_summary_for_logs} (size: {request_size} bytes)")
             
             if TRINO_MODE:
                 # In Trino mode, determine routing based on path
@@ -665,11 +879,18 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     print(f"Worker '{self.worker_id}': Path {path} not local. I am {'COORDINATOR' if is_coordinator else 'WORKER'}. Forwarding to peer.")
                     
                     # Special case: if we're a worker and this is a coordinator-only path, but no peer is connected
-                    if not is_coordinator and any(path.startswith(p) for p in ['/v1/statement', '/v1/query', '/v1/cluster']):
+                    coordinator_paths = ['/v1/statement', '/v1/query', '/v1/cluster', '/ui']
+                    if not is_coordinator and any(path.startswith(p) for p in coordinator_paths):
                         if not current_p2p_peer_addr:
                             print(f"Worker '{self.worker_id}': No coordinator connected for {path}")
                             print(f"Worker '{self.worker_id}': Current P2P state: peer_id={current_p2p_peer_id}, peer_addr={current_p2p_peer_addr}")
-                            error_msg = "Worker node: No coordinator available. This endpoint requires coordinator access."
+                            
+                            # For UI paths, return a more specific error
+                            if path.startswith('/ui'):
+                                error_msg = "Trino UI requires coordinator connection. No coordinator currently available."
+                            else:
+                                error_msg = "Worker node: No coordinator available. This endpoint requires coordinator access."
+                            
                             # Use 404 instead of 503 to avoid Cloud Run shutdown
                             error_response = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {len(error_msg)}\r\n\r\n{error_msg}".encode()
                             writer.write(error_response)
@@ -708,6 +929,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                  return
 
             # Use the new generic sender so large POST bodies are chunked
+            print(f"Worker '{self.worker_id}': Sending request to peer {current_p2p_peer_addr}, size={len(request)} bytes")
             await self._send_http_over_udp(request, msg_id, current_p2p_peer_addr)
             print(f"Worker '{self.worker_id}': HTTP proxy SENT request to {current_p2p_peer_addr}, msg_id={msg_id} (req: {request_summary_for_logs})")
             
@@ -715,7 +937,23 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 print(f"Worker '{self.worker_id}': HTTP proxy WAITING for response, msg_id={msg_id} (req: {request_summary_for_logs}), timeout={PROXY_REQUEST_TIMEOUT_SEC}s. Pending: {list(self.http_pending_requests.keys())}")
                 response = await asyncio.wait_for(fut, timeout=PROXY_REQUEST_TIMEOUT_SEC)
                 print(f"Worker '{self.worker_id}': HTTP proxy GOT response for msg_id={msg_id} (req: {request_summary_for_logs}). Resp: {response[:60].decode('utf-8','ignore')}... Pending after success: {list(self.http_pending_requests.keys())}")
-                writer.write(response)
+                
+                # Validate response before sending
+                if not response:
+                    print(f"Worker '{self.worker_id}': Empty response for msg_id={msg_id}")
+                    error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 14\r\n\r\nEmpty response"
+                    writer.write(error_response)
+                elif not response.startswith(b'HTTP/'):
+                    print(f"Worker '{self.worker_id}': Invalid response format for msg_id={msg_id}: {response[:50]}")
+                    error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 22\r\n\r\nInvalid response format"
+                    writer.write(error_response)
+                else:
+                    # Response looks valid, check for 503 and convert to 404
+                    if response.startswith(b'HTTP/1.1 503'):
+                        print(f"Worker '{self.worker_id}': Converting 503 to 404 in proxy response for msg_id={msg_id}")
+                        response = response.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found', 1)
+                        response = response.replace(b'HTTP/1.1 503', b'HTTP/1.1 404', 1)
+                    writer.write(response)
             except asyncio.TimeoutError: # This is specifically for wait_for timing out
                 log_prefix_immediate = f"Worker '{self.worker_id}': HTTP proxy TIMEOUT (by asyncio.wait_for) for msg_id={msg_id} (req: {request_summary_for_logs})."
                 print(f"{log_prefix_immediate} Attempting to process future state.")
@@ -760,6 +998,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 writer.write(error_response)
             
             await writer.drain()
+            
+            # Important: Don't close the writer here - let the finally block handle it
+            # This ensures the response is fully sent before closing
+            
         except ConnectionRefusedError:
              print(f"Worker '{self.worker_id}': HTTP proxy ConnectionRefusedError for req {request_summary_for_logs}, msg_id={msg_id}")
              if not writer.is_closing():
@@ -776,10 +1018,17 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 except Exception as e_final_err:
                     print(f"Worker '{self.worker_id}': HTTP proxy failed to send 500 error for req {request_summary_for_logs}: {e_final_err}")
         finally:
-            # Ensure writer is closed.
-            if not writer.is_closing():
-                writer.close()
-                # await writer.wait_closed() # wait_closed() can hang if the other side RSTs
+            # Ensure writer is properly closed
+            try:
+                if not writer.is_closing():
+                    writer.close()
+                    # Try to wait for close with timeout
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        print(f"Worker '{self.worker_id}': Timeout waiting for writer close")
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error closing writer: {e}")
             print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} CLEANUP. (Processed msg_id={msg_id}, req: {request_summary_for_logs})")
     
     def _is_worker_communication_path(self, path: str) -> bool:
@@ -840,9 +1089,28 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             request_line = request.split(b'\r\n')[0].decode('utf-8', 'ignore')
             print(f"Worker '{self.worker_id}': Forwarding to local Trino on port {TRINO_LOCAL_PORT}: {request_line}")
             
-            # Check if this is the coordinator's own announcement
+            # Check if we should use response routing
+            route_responses = os.environ.get("ROUTE_TRINO_RESPONSES", "false").lower() == "true"
+            
+            # Log all announcement requests
+            if b"PUT /v1/announcement/" in request:
+                print(f"Worker '{self.worker_id}': Processing announcement request")
+                # Extract and log the announcement body
+                if b'\r\n\r\n' in request:
+                    body_start = request.find(b'\r\n\r\n') + 4
+                    body = request[body_start:]
+                    if body:
+                        try:
+                            body_str = body.decode('utf-8', 'ignore')[:300]
+                            print(f"Worker '{self.worker_id}': Announcement body: {body_str}")
+                        except:
+                            pass
+            
+            # Check if we need to rewrite announcements
             is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
-            if is_coordinator and b"PUT /v1/announcement/" in request and b"http://" in request:
+            
+            # Rewrite any announcement to ensure proxy URLs are used
+            if b"PUT /v1/announcement/" in request and b"http://" in request:
                 # Intercept and rewrite the coordinator's own announcement
                 request_str = request.decode('utf-8', errors='ignore')
                 lines = request_str.split('\r\n')
@@ -863,11 +1131,22 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         # Rewrite coordinator's own URLs to use proxy
                         if 'services' in announcement:
                             for service in announcement['services']:
-                                if 'properties' in service and service.get('properties', {}).get('coordinator', 'false') == 'true':
-                                    # This is the coordinator's own announcement
-                                    service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
-                                    service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
-                                    print(f"Worker '{self.worker_id}': Rewrote coordinator's own announcement URLs to use proxy")
+                                if 'properties' in service:
+                                    # Get the node ID from the service
+                                    node_id = service.get('nodeId', '')
+                                    
+                                    if service.get('properties', {}).get('coordinator', 'false') == 'true':
+                                        # Coordinator announcement
+                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        service['properties']['internal-address'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        print(f"Worker '{self.worker_id}': Rewrote coordinator announcement URLs to use proxy")
+                                    else:
+                                        # Worker announcement
+                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        service['properties']['internal-address'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        print(f"Worker '{self.worker_id}': Rewrote worker {node_id} announcement URLs to use proxy")
                         
                         # Reconstruct request with modified body
                         new_body = json.dumps(announcement)
@@ -886,31 +1165,151 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     except Exception as e:
                         print(f"Worker '{self.worker_id}': Failed to rewrite coordinator announcement: {e}")
             
-            # Connect to local Trino worker
-            trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
+            # Add X-Forwarded headers to track original client
+            client_info = writer.get_extra_info('peername')
+            if client_info:
+                # Insert X-Forwarded headers before sending to Trino
+                header_end = request.find(b'\r\n\r\n')
+                if header_end > 0:
+                    headers = request[:header_end]
+                    body = request[header_end:]
+                    # Add forwarding headers
+                    forwarded_headers = f"\r\nX-Forwarded-For: {client_info[0]}\r\nX-Forwarded-Port: {client_info[1]}".encode()
+                    request = headers + forwarded_headers + body
+            
+            # Get connection from pool or create new one
+            trino_reader, trino_writer = await self._get_trino_connection()
+            if not trino_writer:
+                print(f"Worker '{self.worker_id}': Cannot get Trino connection")
+                error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 36\r\n\r\nLocal Trino not available on port " + str(TRINO_LOCAL_PORT).encode()
+                writer.write(error_response)
+                await writer.drain()
+                return
             
             # Forward request
             trino_writer.write(request)
             await trino_writer.drain()
             
+            # Check if this is a response that needs task URI rewriting
+            needs_uri_rewrite = any(path in request_line for path in ['/v1/statement', '/v1/task'])
+            
             # Read response and forward back
             # For Trino, we need to handle streaming responses
             first_chunk = True
             total_bytes = 0
-            while True:
-                chunk = await trino_reader.read(4096)
-                if not chunk:
-                    break
-                if first_chunk:
-                    # Log the response status
-                    response_line = chunk.split(b'\r\n')[0].decode('utf-8', 'ignore')
-                    print(f"Worker '{self.worker_id}': Trino response: {response_line}")
-                    first_chunk = False
-                total_bytes += len(chunk)
-                writer.write(chunk)
+            response_body = b""
+            error_occurred = False
+            response_buffered = False
+            
+            # Check if we should buffer the response for flow control
+            buffer_response = os.environ.get("BUFFER_TRINO_RESPONSES", "false").lower() == "true"
+            
+            if route_responses:
+                # Route response through our processing pipeline
+                response = await self._read_full_trino_response(trino_reader, trino_writer)
+                processed_response = await self._process_trino_response(response, request_line)
+                writer.write(processed_response)
                 await writer.drain()
+                return
+            
+            # For statement responses, we need to buffer and rewrite task URIs
+            if needs_uri_rewrite:
+                response = await self._read_full_trino_response(trino_reader, trino_writer)
+                # Rewrite any internal task URIs to use proxy URLs
+                response = await self._rewrite_task_uris(response)
+                writer.write(response)
+                await writer.drain()
+                return
+            
+            try:
+                if buffer_response:
+                    # Buffer entire response before sending
+                    response_chunks = []
+                    while True:
+                        chunk = await trino_reader.read(4096)
+                        if not chunk:
+                            break
+                        response_chunks.append(chunk)
+                        total_bytes += len(chunk)
+                    
+                    # Process complete response
+                    response_body = b''.join(response_chunks)
+                    
+                    # Convert 503 to 404 if needed
+                    if response_body.startswith(b'HTTP/1.1 503'):
+                        print(f"Worker '{self.worker_id}': Converting 503 to 404 to avoid Cloud Run restart")
+                        response_body = response_body.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found', 1)
+                        response_body = response_body.replace(b'HTTP/1.1 503', b'HTTP/1.1 404', 1)
+                    
+                    # Send complete response with flow control
+                    # For large responses, send in chunks to avoid blocking
+                    chunk_size = 65536  # 64KB chunks
+                    for i in range(0, len(response_body), chunk_size):
+                        chunk = response_body[i:i + chunk_size]
+                        writer.write(chunk)
+                        await writer.drain()
+                        # Small delay for very large responses to avoid overwhelming
+                        if len(response_body) > 1024 * 1024:  # > 1MB
+                            await asyncio.sleep(0.001)
+                    response_buffered = True
+                else:
+                    # Original streaming behavior
+                    while True:
+                        chunk = await trino_reader.read(4096)
+                        if not chunk:
+                            break
+                        if first_chunk:
+                            # Log the response status
+                            response_line = chunk.split(b'\r\n')[0].decode('utf-8', 'ignore')
+                            print(f"Worker '{self.worker_id}': Trino response: {response_line}")
+                            
+                            # Convert 503 to 404 to avoid Cloud Run restarts
+                            if b'HTTP/1.1 503' in chunk:
+                                print(f"Worker '{self.worker_id}': Converting 503 to 404 to avoid Cloud Run restart")
+                                chunk = chunk.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found')
+                                chunk = chunk.replace(b'HTTP/1.1 503', b'HTTP/1.1 404')
+                            
+                            first_chunk = False
+                        total_bytes += len(chunk)
+                        response_body += chunk  # Accumulate for logging
+                        writer.write(chunk)
+                        await writer.drain()
+                        # Add small delay for large responses to prevent overwhelming downstream
+                        if total_bytes > 1024 * 1024 and total_bytes % (256 * 1024) == 0:  # Every 256KB after 1MB
+                            await asyncio.sleep(0.001)
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error reading/writing response: {e}")
+                error_occurred = True
+                # If we haven't sent any response yet, send an error
+                if first_chunk:
+                    error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 28\r\n\r\nError reading from Trino"
+                    writer.write(error_response)
+                    await writer.drain()
+            
+            # Log response body for critical endpoints
+            if any(endpoint in request_line for endpoint in ['/v1/info', '/v1/status', '/v1/node', '/v1/announcement', '/v1/info/state', '/v1/task']):
+                if b'\r\n\r\n' in response_body:
+                    body_start = response_body.find(b'\r\n\r\n') + 4
+                    body = response_body[body_start:]
+                    if body:
+                        try:
+                            body_str = body.decode('utf-8', 'ignore')[:500]  # First 500 chars
+                            print(f"Worker '{self.worker_id}': Response body for {request_line}: {body_str}")
+                        except:
+                            print(f"Worker '{self.worker_id}': Could not decode response body for {request_line}")
+            
+            # Special logging for task requests
+            if '/v1/task' in request_line:
+                print(f"Worker '{self.worker_id}': TASK REQUEST - {request_line} - Response: {response_line if 'response_line' in locals() else 'N/A'} - Size: {total_bytes} bytes")
             
             print(f"Worker '{self.worker_id}': Forwarded {total_bytes} bytes from Trino")
+            
+            # Ensure all data is sent before closing Trino connection
+            try:
+                await writer.drain()
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error in final drain: {e}")
+                
             trino_writer.close()
             await trino_writer.wait_closed()
             
@@ -925,6 +1324,13 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         start_time = time.time()
         print(f"Worker '{self.worker_id}': _handle_remote_trino_request START for msg_id={msg_id} at {time.strftime('%H:%M:%S', time.localtime(start_time))}")
         print(f"Worker '{self.worker_id}': Request preview: {request[:100]}")
+        
+        # Extract request line for logging
+        request_line = request.split(b'\r\n')[0].decode('utf-8', 'ignore') if b'\r\n' in request else request[:100].decode('utf-8', 'ignore')
+        
+        # Special logging for task requests
+        if '/v1/task' in request_line:
+            print(f"Worker '{self.worker_id}': REMOTE TASK REQUEST - {request_line} - msg_id={msg_id}")
         
         # Important: ANY request that comes via UDP tunnel should be forwarded to local Trino
         # We should NOT apply routing logic here - that was already done by the sender
@@ -1033,6 +1439,28 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             response = b''.join(response_parts)
             print(f"Worker '{self.worker_id}': Got full response from Trino, size={len(response)}")
             
+            # Convert 503 to 404 to avoid Cloud Run restarts
+            if response.startswith(b'HTTP/1.1 503'):
+                print(f"Worker '{self.worker_id}': Converting 503 to 404 in remote response to avoid Cloud Run restart")
+                response = response.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found', 1)
+                response = response.replace(b'HTTP/1.1 503', b'HTTP/1.1 404', 1)
+            
+            # Log response for task requests
+            if '/v1/task' in request_line:
+                response_status = response.split(b'\r\n')[0].decode('utf-8', 'ignore') if b'\r\n' in response else 'Unknown'
+                print(f"Worker '{self.worker_id}': REMOTE TASK RESPONSE - {request_line} - Status: {response_status} - Size: {len(response)} bytes - msg_id={msg_id}")
+                
+                # Log response body for task requests
+                if b'\r\n\r\n' in response:
+                    body_start = response.find(b'\r\n\r\n') + 4
+                    body = response[body_start:]
+                    if body:
+                        try:
+                            body_str = body.decode('utf-8', 'ignore')[:500]
+                            print(f"Worker '{self.worker_id}': TASK RESPONSE BODY: {body_str}")
+                        except:
+                            print(f"Worker '{self.worker_id}': Could not decode task response body")
+            
             # Send response back via UDP using chunking if needed
             print(f"Worker '{self.worker_id}': Sending response back via UDP for msg_id={msg_id}")
             await self._send_chunked_response(response, msg_id, addr)
@@ -1079,15 +1507,17 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             print(f"Worker '{self.worker_id}': Transport unavailable in _send_http_over_udp, msg_id={msg_id}")
             return
 
-        if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
+        data_size = len(data)
+        if data_size + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
             # Fits in a single packet
+            print(f"Worker '{self.worker_id}': Sending single packet, msg_id={msg_id}, size={data_size} bytes")
             frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + data
             self.transport.sendto(frame, addr)
             return
 
-        total_chunks = (len(data) + HTTP_UDP_MAX_PAYLOAD - 1) // HTTP_UDP_MAX_PAYLOAD
+        total_chunks = (data_size + HTTP_UDP_MAX_PAYLOAD - 1) // HTTP_UDP_MAX_PAYLOAD
         self.outgoing_chunk_tracking[msg_id] = {"acked_chunks": set(), "total": total_chunks}
-        print(f"Worker '{self.worker_id}': Sending chunked request, msg_id={msg_id}, chunks={total_chunks}")
+        print(f"Worker '{self.worker_id}': Sending CHUNKED data, msg_id={msg_id}, size={data_size} bytes, chunks={total_chunks}")
 
         for chunk_num in range(total_chunks):
             start = chunk_num * HTTP_UDP_MAX_PAYLOAD
