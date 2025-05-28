@@ -17,7 +17,7 @@ import struct
 import itertools
 
 # --- Global Variables ---
-worker_id = str(uuid.uuid4())
+worker_id = os.environ.get("WORKER_ID", str(uuid.uuid4()))
 stop_signal_received = False
 p2p_udp_transport: Optional[asyncio.DatagramTransport] = None
 our_stun_discovered_udp_ip: Optional[str] = None
