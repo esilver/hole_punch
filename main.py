@@ -693,7 +693,6 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
             # Send request to peer via UDP
             msg_id = self.http_msg_counter() # Assign here for logging
-            frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + request
             
             fut = asyncio.get_event_loop().create_future()
             self.http_pending_requests[msg_id] = fut
@@ -708,8 +707,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                  await writer.drain()
                  return
 
-            self.transport.sendto(frame, current_p2p_peer_addr)
-            print(f"Worker '{self.worker_id}': HTTP proxy SENT frame to {current_p2p_peer_addr}, msg_id={msg_id} (req: {request_summary_for_logs})")
+            # Use the new generic sender so large POST bodies are chunked
+            await self._send_http_over_udp(request, msg_id, current_p2p_peer_addr)
+            print(f"Worker '{self.worker_id}': HTTP proxy SENT request to {current_p2p_peer_addr}, msg_id={msg_id} (req: {request_summary_for_logs})")
             
             try:
                 print(f"Worker '{self.worker_id}': HTTP proxy WAITING for response, msg_id={msg_id} (req: {request_summary_for_logs}), timeout={PROXY_REQUEST_TIMEOUT_SEC}s. Pending: {list(self.http_pending_requests.keys())}")
@@ -1072,6 +1072,39 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     print(f"Worker '{self.worker_id}': Failed to send error response for msg_id={msg_id}: {send_exc}")
             else:
                 print(f"Worker '{self.worker_id}': Transport not available to send error response for msg_id={msg_id}")
+
+    async def _send_http_over_udp(self, data: bytes, msg_id: int, addr: Tuple[str, int]):
+        """Send an HTTP request (or response) over UDP, chunking if needed"""
+        if not self.transport or self.transport.is_closing():
+            print(f"Worker '{self.worker_id}': Transport unavailable in _send_http_over_udp, msg_id={msg_id}")
+            return
+
+        if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
+            # Fits in a single packet
+            frame = struct.pack(HTTP_UDP_FMT, HTTP_UDP_MAGIC, 0, msg_id) + data
+            self.transport.sendto(frame, addr)
+            return
+
+        total_chunks = (len(data) + HTTP_UDP_MAX_PAYLOAD - 1) // HTTP_UDP_MAX_PAYLOAD
+        self.outgoing_chunk_tracking[msg_id] = {"acked_chunks": set(), "total": total_chunks}
+        print(f"Worker '{self.worker_id}': Sending chunked request, msg_id={msg_id}, chunks={total_chunks}")
+
+        for chunk_num in range(total_chunks):
+            start = chunk_num * HTTP_UDP_MAX_PAYLOAD
+            end = min(start + HTTP_UDP_MAX_PAYLOAD, len(data))
+            flags = HTTP_UDP_CHUNK | (HTTP_UDP_FINAL if chunk_num == total_chunks - 1 else 0)
+            chunk_frame = (
+                struct.pack(HTTP_UDP_CHUNK_FMT, HTTP_UDP_MAGIC, flags, msg_id, chunk_num, total_chunks)
+                + data[start:end]
+            )
+            self.transport.sendto(chunk_frame, addr)
+            if chunk_num % 100 == 99:
+                # tiny yield to avoid flooding the socket
+                await asyncio.sleep(0.001)
+
+        # Best-effort cleanup – same behaviour as _send_chunked_response
+        await asyncio.sleep(1.0)
+        self.outgoing_chunk_tracking.pop(msg_id, None)
 
     async def _handle_incoming_chunk(self, msg_id: int, chunk_num: int, total_chunks: int, payload: bytes, is_final: bool, addr: Tuple[str, int]):
         """Handle incoming chunk and reassemble when complete"""
