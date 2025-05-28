@@ -17,8 +17,9 @@ sed -i "s/NODE_ID_PLACEHOLDER/$WORKER_ID/g" /opt/trino/etc/node.properties
 if [ "${IS_COORDINATOR,,}" = "true" ] || [ "${IS_COORDINATOR}" = "1" ] || [ "${IS_COORDINATOR,,}" = "yes" ] || [ "${IS_COORDINATOR,,}" = "on" ]; then
     echo "This worker is the COORDINATOR"
     sed -i "s/coordinator=false/coordinator=true/g" /opt/trino/etc/config.properties
-    # Coordinator needs to handle discovery
-    sed -i "s/discovery-server.enabled=false/discovery-server.enabled=true/g" /opt/trino/etc/config.properties
+    sed -i "s/node-scheduler.include-coordinator=false/node-scheduler.include-coordinator=true/g" /opt/trino/etc/config.properties
+else
+    echo "This is a WORKER node"
 fi
 
 # Start Trino in the background

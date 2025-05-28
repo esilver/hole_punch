@@ -617,8 +617,19 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 path = request_line.split(b' ')[1].decode('utf-8')
                 is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
                 
-                # Check if this is a proxy path to a specific worker
-                if path.startswith('/proxy/worker/'):
+                # Check if this is a proxy path
+                if path.startswith('/proxy/coordinator'):
+                    # Coordinator proxy path - route locally if we're the coordinator
+                    actual_path = path.replace('/proxy/coordinator', '', 1) or '/'
+                    
+                    # Rewrite the request to remove the proxy prefix
+                    request_line = request_line.replace(path.encode(), actual_path.encode())
+                    headers[0] = request_line
+                    request = b''.join(headers) + body
+                    
+                    is_local = is_coordinator
+                    print(f"Worker '{self.worker_id}': Proxy request to coordinator, path: {actual_path}, is_local: {is_local}")
+                elif path.startswith('/proxy/worker/'):
                     # Extract target worker ID and rewrite path
                     parts = path.split('/', 4)  # ['', 'proxy', 'worker', '<node-id>', '<actual-path>']
                     if len(parts) >= 4:
@@ -916,9 +927,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                                         service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
                                         service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
                                     else:
-                                        # Coordinator keeps direct URLs
-                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}"
-                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}"
+                                        # Coordinator also needs proxy URLs for proper routing
+                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
                         
                         # Reconstruct request with modified body
                         new_body = json.dumps(announcement)
