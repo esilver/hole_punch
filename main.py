@@ -1092,8 +1092,9 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                         try:
                             await asyncio.sleep(20)  # Send every 20 seconds
                             if not ws_to_rendezvous.closed:
-                                await ws_to_rendezvous.send(json.dumps({"type": "keep_alive", "worker_id": worker_id}))
-                                print(f"Worker '{worker_id}': Sent keep-alive to rendezvous")
+                                # Use echo_request which the rendezvous service handles
+                                await ws_to_rendezvous.send(json.dumps({"type": "echo_request", "payload": "keepalive"}))
+                                print(f"Worker '{worker_id}': Sent echo keepalive to rendezvous")
                         except websockets.exceptions.ConnectionClosed:
                             print(f"Worker '{worker_id}': WebSocket closed, stopping keep-alive")
                             break
@@ -1134,7 +1135,12 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                                 # Always schedule an attempt, letting the helper wait until the listener is ready.
                                 asyncio.create_task(attempt_hole_punch_when_ready(peer_ip, int(peer_port), peer_id))
                         elif msg_type == "udp_endpoint_ack": print(f"Worker '{worker_id}': UDP Endpoint Ack: {message_data.get('status')}")
-                        elif msg_type == "echo_response": print(f"Worker '{worker_id}': Echo Response: {message_data.get('processed_by_rendezvous')}")
+                        elif msg_type == "echo_response": 
+                            original_payload = message_data.get('original_payload', '')
+                            if original_payload == 'keepalive':
+                                print(f"Worker '{worker_id}': Received keepalive echo response")
+                            else:
+                                print(f"Worker '{worker_id}': Echo Response: {message_data.get('processed_by_rendezvous')}")
                         elif msg_type == "admin_chat_message":
                             # Admin is sending a chat message to this worker
                             admin_session_id = message_data.get("admin_session_id")
