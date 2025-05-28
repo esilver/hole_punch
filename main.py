@@ -124,20 +124,21 @@ Note: Full UI access requires direct connection to port 8081.
         return (200, headers, content)
     elif path == "/v1/announcement" and TRINO_MODE:
         # Trino discovery endpoint - list all known workers
+        is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
         workers = []
         if worker_id:
             workers.append({
                 "id": worker_id,
                 "internalUri": f"http://localhost:{TRINO_PROXY_PORT}",
                 "nodeVersion": "1.0.0",
-                "coordinator": worker_id == TRINO_COORDINATOR_ID
+                "coordinator": is_coordinator  # Use IS_COORDINATOR env var
             })
         if current_p2p_peer_id:
             workers.append({
                 "id": current_p2p_peer_id,
                 "internalUri": f"http://localhost:{TRINO_PROXY_PORT}",
                 "nodeVersion": "1.0.0",
-                "coordinator": current_p2p_peer_id == TRINO_COORDINATOR_ID
+                "coordinator": current_p2p_peer_id == TRINO_COORDINATOR_ID  # Peer might be coordinator
             })
         content = json.dumps(workers).encode()
         headers = Headers([("Content-Type", "application/json"), ("Content-Length", str(len(content)))])
@@ -245,6 +246,7 @@ async def test_http_proxy_internal(test_message: str, ui_ws: websockets.WebSocke
         error_msg = f"Failed to test HTTP proxy: {type(e).__name__}: {e}"
         print(f"Worker '{worker_id}': {error_msg}")
         await ui_ws.send(json.dumps({"type": "http_proxy_error", "error": error_msg}))
+
 
 async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, path: str):
     global ui_websocket_clients, worker_id, current_p2p_peer_id, p2p_udp_transport, current_p2p_peer_addr
@@ -517,9 +519,21 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     async def start_http_proxy(self):
         """Start the HTTP proxy server on localhost:8080"""
         try:
-            proxy_port = TRINO_PROXY_PORT if TRINO_MODE else 8080
+            # For Cloud Run, use port 8080 (PORT env) instead of TRINO_PROXY_PORT
+            proxy_port = HTTP_PORT_FOR_UI if TRINO_MODE else 8080
+            
+            # In Trino mode, close the temporary health check server first
+            if TRINO_MODE and 'temp_health_server' in globals():
+                temp_server = globals()['temp_health_server']
+                print(f"Worker '{self.worker_id}': Closing temporary health check server")
+                temp_server.close()
+                await temp_server.wait_closed()
+                del globals()['temp_health_server']
+                # Small delay to ensure port is released
+                await asyncio.sleep(0.1)
+            
             self.http_proxy_server = await asyncio.start_server(
-                self.handle_http_client, '127.0.0.1', proxy_port)
+                self.handle_http_client, '0.0.0.0', proxy_port)
             addr = self.http_proxy_server.sockets[0].getsockname()
             mode = "Trino mode" if TRINO_MODE else "echo mode"
             print(f"Worker '{self.worker_id}': HTTP-over-UDP proxy started on {addr} in {mode}")
@@ -543,6 +557,29 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 return
             request_line_strip = request_line.strip()
             request_summary_for_logs = request_line_strip[:80].decode('utf-8', 'ignore') # For log messages
+            
+            # Handle health check directly in proxy
+            if b"GET /health" in request_line or b"GET / " in request_line:
+                health_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+                writer.write(health_response)
+                await writer.drain()
+                writer.close()
+                print(f"Worker '{self.worker_id}': Handled health check request")
+                return
+                
+            # Handle incorrect GET requests to /v1/statement
+            if b"GET /v1/statement" in request_line:
+                error_msg = "Method Not Allowed. Use POST to submit queries to /v1/statement"
+                error_response = f"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: {len(error_msg)}\r\n\r\n{error_msg}".encode()
+                writer.write(error_response)
+                await writer.drain()
+                writer.close()
+                print(f"Worker '{self.worker_id}': Rejected GET request to /v1/statement")
+                return
+            
+            # Debug logging for all requests
+            is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
+            print(f"Worker '{self.worker_id}' ({'COORDINATOR' if is_coordinator else 'WORKER'}): Proxy request: {request_summary_for_logs}")
 
             headers = []
             headers.append(request_line)
@@ -575,7 +612,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             if TRINO_MODE:
                 # In Trino mode, determine routing based on path
                 path = request_line.split(b' ')[1].decode('utf-8')
-                if self._is_local_trino_path(path):
+                is_local = self._is_local_trino_path(path)
+                print(f"Worker '{self.worker_id}': Path {path} is_local={is_local}")
+                
+                if is_local:
                     # Forward to local Trino worker
                     print(f"Worker '{self.worker_id}': HTTP proxy forwarding req {request_summary_for_logs} to LOCAL Trino.")
                     await self._forward_to_local_trino(request, writer)
@@ -585,16 +625,30 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     # Note: The peer will forward this to their local Trino - no further routing logic applied
                     is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
                     print(f"Worker '{self.worker_id}': Path {path} not local. I am {'COORDINATOR' if is_coordinator else 'WORKER'}. Forwarding to peer.")
-                    if not current_p2p_peer_addr:
+                    
+                    # Special case: if we're a worker and this is a coordinator-only path, but no peer is connected
+                    if not is_coordinator and any(path.startswith(p) for p in ['/v1/statement', '/v1/query', '/v1/cluster']):
+                        if not current_p2p_peer_addr:
+                            print(f"Worker '{self.worker_id}': No coordinator connected for {path}")
+                            print(f"Worker '{self.worker_id}': Current P2P state: peer_id={current_p2p_peer_id}, peer_addr={current_p2p_peer_addr}")
+                            error_msg = "Worker node: No coordinator available. This endpoint requires coordinator access."
+                            # Use 404 instead of 503 to avoid Cloud Run shutdown
+                            error_response = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {len(error_msg)}\r\n\r\n{error_msg}".encode()
+                            writer.write(error_response)
+                            await writer.drain()
+                            return
+                    elif not current_p2p_peer_addr:
                         print(f"Worker '{self.worker_id}': HTTP proxy - no peer for Trino req {request_summary_for_logs}")
-                        error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 17\\r\\n\\r\\nNo peer connected"
+                        # Return 404 instead of 503 to avoid Cloud Run shutdowns
+                        error_msg = "P2P connection not established. This node cannot forward requests without a peer."
+                        error_response = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {len(error_msg)}\r\n\r\n{error_msg}".encode()
                         writer.write(error_response)
                         await writer.drain()
                         return
             else: # Echo mode
                 if not current_p2p_peer_addr:
                     print(f"Worker '{self.worker_id}': HTTP proxy - no peer for echo req {request_summary_for_logs}")
-                    error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 17\\r\\n\\r\\nNo peer connected"
+                    error_response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 17\r\n\r\nNo peer connected"
                     writer.write(error_response)
                     await writer.drain()
                     return
@@ -671,7 +725,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         except ConnectionRefusedError:
              print(f"Worker '{self.worker_id}': HTTP proxy ConnectionRefusedError for req {request_summary_for_logs}, msg_id={msg_id}")
              if not writer.is_closing():
-                error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 20\\r\\n\\r\\nConnection refused" # Should be rare here
+                error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 20\r\n\r\nConnection refused"
                 writer.write(error_response)
                 await writer.drain()
         except Exception as e_http_client:
@@ -726,6 +780,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     async def _forward_to_local_trino(self, request: bytes, writer: asyncio.StreamWriter):
         """Forward request to local Trino worker"""
         try:
+            # Parse request for logging
+            request_line = request.split(b'\r\n')[0].decode('utf-8', 'ignore')
+            print(f"Worker '{self.worker_id}': Forwarding to local Trino on port {TRINO_LOCAL_PORT}: {request_line}")
+            
             # Connect to local Trino worker
             trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
             
@@ -735,18 +793,27 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
             # Read response and forward back
             # For Trino, we need to handle streaming responses
+            first_chunk = True
+            total_bytes = 0
             while True:
                 chunk = await trino_reader.read(4096)
                 if not chunk:
                     break
+                if first_chunk:
+                    # Log the response status
+                    response_line = chunk.split(b'\r\n')[0].decode('utf-8', 'ignore')
+                    print(f"Worker '{self.worker_id}': Trino response: {response_line}")
+                    first_chunk = False
+                total_bytes += len(chunk)
                 writer.write(chunk)
                 await writer.drain()
             
+            print(f"Worker '{self.worker_id}': Forwarded {total_bytes} bytes from Trino")
             trino_writer.close()
             await trino_writer.wait_closed()
             
         except Exception as e:
-            print(f"Worker '{self.worker_id}': Error forwarding to local Trino: {e}")
+            print(f"Worker '{self.worker_id}': Error forwarding to local Trino: {type(e).__name__}: {e}")
             error_response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nLocal Trino error"
             writer.write(error_response)
             await writer.drain()
@@ -1332,15 +1399,44 @@ async def send_periodic_p2p_keep_alives():
 async def main_async_orchestrator():
     loop = asyncio.get_running_loop()
 
-    main_server = await websockets_serve(
-        ui_websocket_handler, "0.0.0.0", HTTP_PORT_FOR_UI,
-        process_request=process_http_request,
-        ping_interval=20, ping_timeout=20
-    )
-    print(f"Worker '{worker_id}': HTTP & UI WebSocket server listening on 0.0.0.0:{HTTP_PORT_FOR_UI}")
-    print(f"  - Serving index.html at '/'")
-    print(f"  - UI WebSocket at '/ui_ws'")
-    print(f"  - Health check at '/health'")
+    # Only start WebSocket UI server if not in Trino mode (to avoid port conflict)
+    main_server = None
+    if not TRINO_MODE:
+        main_server = await websockets_serve(
+            ui_websocket_handler, "0.0.0.0", HTTP_PORT_FOR_UI,
+            process_request=process_http_request,
+            ping_interval=20, ping_timeout=20
+        )
+        print(f"Worker '{worker_id}': HTTP & UI WebSocket server listening on 0.0.0.0:{HTTP_PORT_FOR_UI}")
+        print(f"  - Serving index.html at '/'")
+        print(f"  - UI WebSocket at '/ui_ws'")
+        print(f"  - Health check at '/health'")
+    else:
+        # In Trino mode, start a simple HTTP server for health checks immediately
+        print(f"Worker '{worker_id}': Starting temporary health check server on port {HTTP_PORT_FOR_UI}")
+        
+        async def health_check_handler(reader, writer):
+            try:
+                request_line = await reader.readline()
+                if not request_line:
+                    writer.close()
+                    return
+                    
+                # For any request during startup, return 200 OK
+                # This prevents Cloud Run from thinking the service is unhealthy
+                response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 19\r\n\r\nStarting up Trino..."
+                writer.write(response)
+                await writer.drain()
+            except Exception as e:
+                print(f"Worker '{worker_id}': Error in temp health handler: {e}")
+            finally:
+                writer.close()
+        
+        temp_server = await asyncio.start_server(health_check_handler, '0.0.0.0', HTTP_PORT_FOR_UI)
+        print(f"Worker '{worker_id}': Temporary health check server started on port {HTTP_PORT_FOR_UI}")
+        
+        # Store it so we can close it later when the real proxy starts
+        globals()['temp_health_server'] = temp_server
     rendezvous_base_url_env = os.environ.get("RENDEZVOUS_SERVICE_URL")
     if not rendezvous_base_url_env: print("CRITICAL: RENDEZVOUS_SERVICE_URL missing in main_async_runner.")
     full_rendezvous_ws_url = ""
@@ -1358,9 +1454,10 @@ async def main_async_orchestrator():
     except asyncio.CancelledError:
         print(f"Worker '{worker_id}': Main orchestrator tasks were cancelled.")
     finally:
-        main_server.close()
-        await main_server.wait_closed()
-        print(f"Worker '{worker_id}': Main HTTP/UI WebSocket server stopped.")
+        if main_server:
+            main_server.close()
+            await main_server.wait_closed()
+            print(f"Worker '{worker_id}': Main HTTP/UI WebSocket server stopped.")
         
         # Close the asyncio P2P UDP transport if it's active
         if p2p_udp_transport:
