@@ -218,7 +218,7 @@ async def test_http_proxy_internal(test_message: str, ui_ws: websockets.WebSocke
         
         # Read response with timeout
         try:
-            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            response = await asyncio.wait_for(reader.read(1024), timeout=0.5)
             response_str = response.decode('utf-8', errors='ignore')
             print(f"Worker '{worker_id}': Received response from proxy: {response_str[:100]}...")
             
@@ -322,7 +322,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         
         try:
             while True:
-                chunk = await asyncio.wait_for(reader.read(8192), timeout=5.0)
+                chunk = await asyncio.wait_for(reader.read(8192), timeout=0.5)
                 if not chunk:
                     break
                 response_chunks.append(chunk)
@@ -400,6 +400,27 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 
                 # Rewrite task URIs in statement responses
                 if isinstance(data, dict):
+                    # Rewrite self URL in task responses
+                    if 'self' in data and 'localhost:8081' in data['self']:
+                        # This is a task response with localhost:8081 self URL
+                        # Need to rewrite to use proxy URL
+                        print(f"Worker '{self.worker_id}': Rewriting task self URL: {data['self']}")
+                        # Extract task ID from the URL
+                        task_path = data['self'].replace('http://localhost:8081', '')
+                        # Get node ID from the response
+                        node_id = data.get('nodeId', self.worker_id)
+                        data['self'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}{task_path}"
+                        print(f"Worker '{self.worker_id}': Rewrote to: {data['self']}")
+                    
+                    # Also check nested taskStatus object
+                    if 'taskStatus' in data and isinstance(data['taskStatus'], dict):
+                        if 'self' in data['taskStatus'] and 'localhost:8081' in data['taskStatus']['self']:
+                            print(f"Worker '{self.worker_id}': Rewriting nested task self URL: {data['taskStatus']['self']}")
+                            task_path = data['taskStatus']['self'].replace('http://localhost:8081', '')
+                            node_id = data['taskStatus'].get('nodeId', self.worker_id)
+                            data['taskStatus']['self'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}{task_path}"
+                            print(f"Worker '{self.worker_id}': Rewrote to: {data['taskStatus']['self']}")
+                    
                     # Rewrite nextUri if present
                     if 'nextUri' in data and '://' in data['nextUri']:
                         # Extract the path from the URI
@@ -462,7 +483,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT),
-                    timeout=5.0
+                    timeout=30.0
                 )
                 self.creating_connections -= 1
                 return reader, writer
@@ -473,7 +494,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         
         # Wait for a connection to be available
         try:
-            reader, writer = await asyncio.wait_for(self.trino_connections.get(), timeout=5.0)
+            reader, writer = await asyncio.wait_for(self.trino_connections.get(), timeout=1.0)
             if not writer.is_closing():
                 return reader, writer
         except asyncio.TimeoutError:
@@ -745,7 +766,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         try:
             # Read the HTTP request headers first to determine routing with timeout
             try:
-                request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                request_line = await asyncio.wait_for(reader.readline(), timeout=0.5)
             except asyncio.TimeoutError:
                 print(f"Worker '{self.worker_id}': Timeout reading request line from {client_addr}")
                 writer.close()
@@ -811,7 +832,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 if line.lower().startswith(b'content-length:'):
                     content_length = int(line.split(b':', 1)[1].strip())
                 elif line.lower().startswith(b'host:'):
-                    host_header = line.split(b':', 1)[1].strip().decode('utf-8', 'ignore')
+                    host_value = line.split(b':', 1)[1].strip().decode('utf-8', 'ignore')
+                    # Remove port from host header if present
+                    host_header = host_value.split(':')[0]
             
             # Read body if present
             body = b''
@@ -858,6 +881,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         # Always route proxy paths through P2P (worker requests)
                         is_local = False
                         print(f"Worker '{self.worker_id}': Proxy request to worker {target_node_id}, path: {actual_path}")
+                        print(f"Worker '{self.worker_id}': Current P2P peer: {current_p2p_peer_id}, peer addr: {current_p2p_peer_addr}")
+                        print(f"Worker '{self.worker_id}': Request will be sent via UDP to peer")
                     else:
                         # Malformed proxy path
                         is_local = self._is_local_trino_path(path)
@@ -870,7 +895,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 if is_local:
                     # Forward to local Trino worker
                     print(f"Worker '{self.worker_id}': HTTP proxy forwarding req {request_summary_for_logs} to LOCAL Trino.")
-                    await self._forward_to_local_trino(request, writer)
+                    await self._forward_to_local_trino(request, writer, host_header)
                     return # Local handling complete
                 else:
                     # Forward to peer via UDP tunnel
@@ -930,6 +955,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
 
             # Use the new generic sender so large POST bodies are chunked
             print(f"Worker '{self.worker_id}': Sending request to peer {current_p2p_peer_addr}, size={len(request)} bytes")
+            print(f"Worker '{self.worker_id}': Request path: {path}, rewritten from: {original_path if 'original_path' in locals() else 'N/A'}")
             await self._send_http_over_udp(request, msg_id, current_p2p_peer_addr)
             print(f"Worker '{self.worker_id}': HTTP proxy SENT request to {current_p2p_peer_addr}, msg_id={msg_id} (req: {request_summary_for_logs})")
             
@@ -1082,7 +1108,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
         return False
     
-    async def _forward_to_local_trino(self, request: bytes, writer: asyncio.StreamWriter):
+    async def _forward_to_local_trino(self, request: bytes, writer: asyncio.StreamWriter, host_header: str = None):
         """Forward request to local Trino worker"""
         try:
             # Parse request for logging
@@ -1174,7 +1200,10 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     headers = request[:header_end]
                     body = request[header_end:]
                     # Add forwarding headers
-                    forwarded_headers = f"\r\nX-Forwarded-For: {client_info[0]}\r\nX-Forwarded-Port: {client_info[1]}".encode()
+                    forwarded_headers = f"\r\nX-Forwarded-For: {client_info[0]}\r\nX-Forwarded-Port: 443\r\nX-Forwarded-Proto: https".encode()
+                    # Add X-Forwarded-Host if we have it
+                    if host_header:
+                        forwarded_headers += f"\r\nX-Forwarded-Host: {host_header}".encode()
                     request = headers + forwarded_headers + body
             
             # Get connection from pool or create new one
@@ -1241,6 +1270,13 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         response_body = response_body.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found', 1)
                         response_body = response_body.replace(b'HTTP/1.1 503', b'HTTP/1.1 404', 1)
                     
+                    # Fix redirect Location headers with wrong ports
+                    if response_body.startswith(b'HTTP/1.1 303') or response_body.startswith(b'HTTP/1.1 302') or response_body.startswith(b'HTTP/1.1 301'):
+                        print(f"Worker '{self.worker_id}': Fixing redirect in buffered response")
+                        import re
+                        response_body = re.sub(rb'(Location: https://[^:]+\.run\.app):\d+', rb'\1', response_body)
+                        print(f"Worker '{self.worker_id}': Fixed Location header in buffered response")
+                    
                     # Send complete response with flow control
                     # For large responses, send in chunks to avoid blocking
                     chunk_size = 65536  # 64KB chunks
@@ -1268,6 +1304,25 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                                 print(f"Worker '{self.worker_id}': Converting 503 to 404 to avoid Cloud Run restart")
                                 chunk = chunk.replace(b'HTTP/1.1 503 Service Unavailable', b'HTTP/1.1 404 Not Found')
                                 chunk = chunk.replace(b'HTTP/1.1 503', b'HTTP/1.1 404')
+                            
+                            # Fix redirect Location headers with wrong ports
+                            if b'HTTP/1.1 303' in chunk or b'HTTP/1.1 302' in chunk or b'HTTP/1.1 301' in chunk:
+                                print(f"Worker '{self.worker_id}': Detected redirect response")
+                                # Look for Location header
+                                lines = chunk.split(b'\r\n')
+                                new_lines = []
+                                for line in lines:
+                                    if line.lower().startswith(b'location:'):
+                                        location = line.decode('utf-8', 'ignore')
+                                        print(f"Worker '{self.worker_id}': Original Location: {location}")
+                                        # Remove any port number after the hostname
+                                        import re
+                                        fixed_location = re.sub(r'(\.run\.app):\d+', r'\1', location)
+                                        print(f"Worker '{self.worker_id}': Fixed Location: {fixed_location}")
+                                        new_lines.append(fixed_location.encode())
+                                    else:
+                                        new_lines.append(line)
+                                chunk = b'\r\n'.join(new_lines)
                             
                             first_chunk = False
                         total_bytes += len(chunk)
@@ -1382,10 +1437,16 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                                     if is_worker_announcement:
                                         service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
                                         service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        service['properties']['internal-address'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        # NEW: update top-level internalUri for worker announcement
+                                        announcement['internalUri'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
                                     else:
                                         # Coordinator also needs proxy URLs for proper routing
                                         service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
                                         service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        service['properties']['internal-address'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                        # NEW: update top-level internalUri for coordinator announcement
+                                        announcement['internalUri'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
                         
                         # Reconstruct request with modified body
                         new_body = json.dumps(announcement)
@@ -1403,6 +1464,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         request = '\r\n'.join(new_headers) + '\r\n' + new_body
                         request = request.encode('utf-8')
                         print(f"Worker '{self.worker_id}': Rewrote announcement URLs to use proxy")
+                        print(f"Worker '{self.worker_id}': Announcement after rewriting: {new_body[:500]}")
                     except Exception as e:
                         print(f"Worker '{self.worker_id}': Failed to rewrite announcement: {e}")
             
@@ -1460,6 +1522,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                             print(f"Worker '{self.worker_id}': TASK RESPONSE BODY: {body_str}")
                         except:
                             print(f"Worker '{self.worker_id}': Could not decode task response body")
+            
+            # Rewrite task URIs in response before sending back
+            response = await self._rewrite_task_uris(response)
             
             # Send response back via UDP using chunking if needed
             print(f"Worker '{self.worker_id}': Sending response back via UDP for msg_id={msg_id}")

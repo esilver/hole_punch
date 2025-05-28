@@ -2,8 +2,9 @@
 
 # Configuration
 COORDINATOR_URL="https://trino-p2p-service-coordinator-982092720909.us-central1.run.app"
-QUERY="SELECT nationkey, name FROM nation LIMIT 5"
-
+# QUERY="SELECT * FROM tpch.sf1000.lineitem LIMIT 10"
+# QUERY="SELECT * FROM system.runtime.nodes"
+QUERY="SELECT count(*) FROM nation"
 # Submit query
 echo "Submitting query: $QUERY"
 RESPONSE=$(curl -s -X POST \
