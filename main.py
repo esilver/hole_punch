@@ -803,6 +803,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             '/v1/status',  # Worker status
             '/v1/thread',  # Thread dumps
             '/v1/service',  # Service discovery - handled locally by each node
+            '/v1/memory',  # Memory pool information
+            '/v1/stats',  # Runtime statistics
         ]
         
         # Special handling for announcement paths
@@ -817,6 +819,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             '/ui',  # Trino UI
             '/v1/cluster',  # Cluster overview
             '/v1/query',  # Query information
+            '/v1/node',  # Node management (active nodes list)
+            '/v1/worker',  # Worker nodes information
         ]
         
         # Check common paths first
