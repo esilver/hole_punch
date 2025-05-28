@@ -836,6 +836,52 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             request_line = request.split(b'\r\n')[0].decode('utf-8', 'ignore')
             print(f"Worker '{self.worker_id}': Forwarding to local Trino on port {TRINO_LOCAL_PORT}: {request_line}")
             
+            # Check if this is the coordinator's own announcement
+            is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
+            if is_coordinator and b"PUT /v1/announcement/" in request and b"http://" in request:
+                # Intercept and rewrite the coordinator's own announcement
+                request_str = request.decode('utf-8', errors='ignore')
+                lines = request_str.split('\r\n')
+                
+                # Find the JSON body (after empty line)
+                body_start = -1
+                for i, line in enumerate(lines):
+                    if line == '' and i < len(lines) - 1:
+                        body_start = i + 1
+                        break
+                
+                if body_start > 0 and body_start < len(lines):
+                    try:
+                        import json
+                        body = '\r\n'.join(lines[body_start:])
+                        announcement = json.loads(body)
+                        
+                        # Rewrite coordinator's own URLs to use proxy
+                        if 'services' in announcement:
+                            for service in announcement['services']:
+                                if 'properties' in service and service.get('properties', {}).get('coordinator', 'false') == 'true':
+                                    # This is the coordinator's own announcement
+                                    service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                    service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/coordinator"
+                                    print(f"Worker '{self.worker_id}': Rewrote coordinator's own announcement URLs to use proxy")
+                        
+                        # Reconstruct request with modified body
+                        new_body = json.dumps(announcement)
+                        
+                        # Update Content-Length in headers
+                        new_headers = []
+                        for line in lines[:body_start]:
+                            if line.lower().startswith('content-length:'):
+                                new_headers.append(f'Content-Length: {len(new_body)}')
+                            else:
+                                new_headers.append(line)
+                        
+                        # Reconstruct the full request
+                        request = '\r\n'.join(new_headers) + '\r\n' + new_body
+                        request = request.encode('utf-8')
+                    except Exception as e:
+                        print(f"Worker '{self.worker_id}': Failed to rewrite coordinator announcement: {e}")
+            
             # Connect to local Trino worker
             trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
             
