@@ -92,6 +92,13 @@ echo -e "${YELLOW}Waiting for services to start...${NC}"
 sleep 10
 
 # Test the services
-echo -e "${YELLOW}Testing Trino discovery...${NC}"
+echo -e "${YELLOW}Testing Trino coordinator info...${NC}"
 curl -s ${COORDINATOR_URL}/v1/info | jq .
-curl -s ${COORDINATOR_URL}/v1/announcement | jq .
+
+echo -e "${YELLOW}Testing Trino service discovery...${NC}"
+curl -s -H "X-Trino-User: admin" ${COORDINATOR_URL}/v1/service/trino/general | jq .
+
+# Optional: Submit a test query
+echo -e "${YELLOW}Submitting test query...${NC}"
+QUERY_RESPONSE=$(curl -s -X POST -H "X-Trino-User: admin" -H "X-Trino-Schema: sf1" -H "X-Trino-Catalog: tpch" -H "Content-Type: application/json" -d "SELECT 'Trino P2P is working!' as message" ${COORDINATOR_URL}/v1/statement)
+echo "$QUERY_RESPONSE" | jq '.id, .stats.state'
