@@ -88,7 +88,7 @@ echo -e "${GREEN}Service URLs:${NC}"
 echo -e "Coordinator: ${COORDINATOR_URL}"
 echo -e "Worker: ${WORKER_URL}"
 
-echo -e "${YELLOW}Waiting for services to start...${NC}"
+echo -e "${YELLOW}Waiting for services to start and establish P2P connection...${NC}"
 sleep 10
 
 # Test the services
