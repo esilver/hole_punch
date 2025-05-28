@@ -299,8 +299,12 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             # just logging is fine if they are meant to be independent.
         except Exception as e:
             print(f"Worker '{self.worker_id}': Unhandled exception in {handler_name}: {type(e).__name__} - {e}")
-            import traceback
-            traceback.print_exc()
+            # Only print traceback if we have a valid event loop
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass  # Ignore errors during traceback printing
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         global p2p_udp_transport 
@@ -854,9 +858,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         """Send a response in chunks if it's too large"""
         print(f"Worker '{self.worker_id}': _send_chunked_response for msg_id={msg_id} to {addr}. Data prefix: {data[:100]}")
 
-        if not self.transport:
-            print(f"Worker '{self.worker_id}': Transport unavailable in _send_chunked_response for msg_id={msg_id}. Cannot send response.")
-            raise ConnectionError(f"UDP transport not available for _send_chunked_response, msg_id={msg_id}")
+        if not self.transport or self.transport.is_closing():
+            print(f"Worker '{self.worker_id}': Transport unavailable or closing in _send_chunked_response for msg_id={msg_id}. Cannot send response.")
+            return  # Silently return instead of raising to avoid cascading errors
 
         if len(data) + HTTP_UDP_HEADER_SIZE <= HTTP_UDP_MAX:
             # Small enough to send as regular frame
@@ -1075,6 +1079,24 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 # Initial STUN discovery
                 stun_success_initial = await discover_and_report_stun_udp_endpoint(ws_to_rendezvous)
 
+                # Create a keep-alive task for the WebSocket
+                async def send_ws_keepalive():
+                    """Send periodic keep-alive messages to prevent WebSocket timeout"""
+                    while not stop_signal_received:
+                        try:
+                            await asyncio.sleep(20)  # Send every 20 seconds
+                            if not ws_to_rendezvous.closed:
+                                await ws_to_rendezvous.send(json.dumps({"type": "keep_alive", "worker_id": worker_id}))
+                                print(f"Worker '{worker_id}': Sent keep-alive to rendezvous")
+                        except websockets.exceptions.ConnectionClosed:
+                            print(f"Worker '{worker_id}': WebSocket closed, stopping keep-alive")
+                            break
+                        except Exception as e:
+                            print(f"Worker '{worker_id}': Error sending WebSocket keep-alive: {e}")
+                            break
+                
+                keepalive_task = asyncio.create_task(send_ws_keepalive())
+
                 if stun_success_initial and not udp_listener_active:
                     try:
                         # The socket main_udp_sock is already bound.
@@ -1150,6 +1172,15 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
         finally: 
+            # Cancel the WebSocket keepalive task if it exists
+            if 'keepalive_task' in locals() and not keepalive_task.done():
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except asyncio.CancelledError:
+                    pass
+                print(f"Worker '{worker_id}': Cancelled WebSocket keepalive task")
+            
             if p2p_listener_transport_local_ref: 
                 print(f"Worker '{worker_id}': Closing local P2P UDP transport (asyncio wrapper) from this WS session.")
                 p2p_listener_transport_local_ref.close()
