@@ -586,6 +586,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             
             # Read headers
             content_length = 0
+            host_header = None
             while True:
                 line = await reader.readline()
                 if not line: # Connection closed prematurely
@@ -596,6 +597,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     break
                 if line.lower().startswith(b'content-length:'):
                     content_length = int(line.split(b':', 1)[1].strip())
+                elif line.lower().startswith(b'host:'):
+                    host_header = line.split(b':', 1)[1].strip().decode('utf-8', 'ignore')
             
             # Read body if present
             body = b''
@@ -612,7 +615,31 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             if TRINO_MODE:
                 # In Trino mode, determine routing based on path
                 path = request_line.split(b' ')[1].decode('utf-8')
-                is_local = self._is_local_trino_path(path)
+                is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
+                
+                # Check if this is a proxy path to a specific worker
+                if path.startswith('/proxy/worker/'):
+                    # Extract target worker ID and rewrite path
+                    parts = path.split('/', 4)  # ['', 'proxy', 'worker', '<node-id>', '<actual-path>']
+                    if len(parts) >= 4:
+                        target_node_id = parts[3]
+                        actual_path = '/' + parts[4] if len(parts) > 4 else '/'
+                        
+                        # Rewrite the request to remove the proxy prefix
+                        request_line = request_line.replace(path.encode(), actual_path.encode())
+                        headers[0] = request_line
+                        request = b''.join(headers) + body
+                        
+                        # Always route proxy paths through P2P (worker requests)
+                        is_local = False
+                        print(f"Worker '{self.worker_id}': Proxy request to worker {target_node_id}, path: {actual_path}")
+                    else:
+                        # Malformed proxy path
+                        is_local = self._is_local_trino_path(path)
+                else:
+                    # Normal routing logic
+                    is_local = self._is_local_trino_path(path)
+                
                 print(f"Worker '{self.worker_id}': Path {path} is_local={is_local}")
                 
                 if is_local:
@@ -744,6 +771,15 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 # await writer.wait_closed() # wait_closed() can hang if the other side RSTs
             print(f"Worker '{self.worker_id}': HTTP proxy connection from {client_addr} CLEANUP. (Processed msg_id={msg_id}, req: {request_summary_for_logs})")
     
+    def _is_worker_communication_path(self, path: str) -> bool:
+        """Determine if this path is used for coordinator-to-worker communication"""
+        worker_paths = [
+            '/v1/task',  # Task execution
+            '/v1/info/state',  # Worker state checks
+            '/v1/thread',  # Thread dumps for diagnostics
+        ]
+        return any(path.startswith(p) for p in worker_paths)
+    
     def _is_local_trino_path(self, path: str) -> bool:
         """Determine if a path should be handled by the local Trino worker"""
         # Check if this is the coordinator
@@ -842,6 +878,61 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 print(f"Worker '{self.worker_id}': Successfully connected to local Trino")
             except asyncio.TimeoutError:
                 raise ConnectionError(f"Timeout connecting to Trino on port {TRINO_LOCAL_PORT}")
+            
+            # Check if this is an announcement request that needs URL rewriting
+            if b"PUT /v1/announcement/" in request and b"http://" in request:
+                # Parse and modify the announcement to use proxy URLs
+                request_str = request.decode('utf-8', errors='ignore')
+                lines = request_str.split('\r\n')
+                
+                # Find the JSON body (after empty line)
+                body_start = -1
+                for i, line in enumerate(lines):
+                    if line == '' and i < len(lines) - 1:
+                        body_start = i + 1
+                        break
+                
+                if body_start > 0 and body_start < len(lines):
+                    try:
+                        import json
+                        body = '\r\n'.join(lines[body_start:])
+                        announcement = json.loads(body)
+                        
+                        # Rewrite URLs to use proxy with worker-specific path
+                        # This allows coordinator to route to specific workers
+                        if 'services' in announcement:
+                            for service in announcement['services']:
+                                if 'properties' in service:
+                                    # Use path prefix to identify target worker
+                                    node_id = service.get('nodeId', 'unknown')
+                                    # Only rewrite for workers, not coordinator
+                                    is_worker_announcement = service.get('properties', {}).get('coordinator', 'true') == 'false'
+                                    if is_worker_announcement:
+                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}/proxy/worker/{node_id}"
+                                    else:
+                                        # Coordinator keeps direct URLs
+                                        service['properties']['http'] = f"http://localhost:{HTTP_PORT_FOR_UI}"
+                                        service['properties']['http-external'] = f"http://localhost:{HTTP_PORT_FOR_UI}"
+                        
+                        # Reconstruct request with modified body
+                        new_body = json.dumps(announcement)
+                        
+                        # Update Content-Length in headers
+                        new_headers = []
+                        for line in lines[:body_start]:
+                            if line.lower().startswith('content-length:'):
+                                new_headers.append(f'Content-Length: {len(new_body)}')
+                            else:
+                                new_headers.append(line)
+                        
+                        # Reconstruct the full request with proper line endings
+                        # Need empty line between headers and body
+                        request = '\r\n'.join(new_headers) + '\r\n' + new_body
+                        request = request.encode('utf-8')
+                        print(f"Worker '{self.worker_id}': Rewrote announcement URLs to use proxy")
+                    except Exception as e:
+                        print(f"Worker '{self.worker_id}': Failed to rewrite announcement: {e}")
             
             # Forward request
             trino_writer.write(request)
