@@ -90,6 +90,23 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
         except FileNotFoundError: return (404, [("Content-Type", "text/plain")], b"index.html not found")
         except Exception as e_file: print(f"Error serving index.html: {e_file}"); return (500, [("Content-Type", "text/plain")], b"Internal Server Error")
     elif path == "/health": return (200, [("Content-Type", "text/plain")], b"OK")
+    elif path == "/trino-proxy-status":
+        # Provide status about Trino proxy access
+        is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
+        content = f"""
+Trino Proxy Status:
+- Node Type: {'Coordinator' if is_coordinator else 'Worker'}
+- Proxy Port: {TRINO_PROXY_PORT}
+- Local Trino Port: {TRINO_LOCAL_PORT}
+
+To access Trino UI:
+1. The UI runs on the coordinator at port 8081
+2. Use the coordinator's public URL with port 18080 for API access
+3. Example query: curl -X POST {'{coordinator-url}'}/v1/statement -d 'SELECT 1'
+
+Note: Full UI access requires direct connection to port 8081.
+""".encode()
+        return (200, [("Content-Type", "text/plain"), ("Content-Length", str(len(content)))], content)
     elif path == "/v1/info" and TRINO_MODE:
         # Trino worker info endpoint for discovery
         info = {
@@ -301,8 +318,13 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             print(f"Worker '{self.worker_id}': Unhandled exception in {handler_name}: {type(e).__name__} - {e}")
             # Only print traceback if we have a valid event loop
             try:
-                import traceback
-                traceback.print_exc()
+                loop = asyncio.get_running_loop()
+                if loop and not loop.is_closed():
+                    import traceback
+                    traceback.print_exc()
+            except RuntimeError:
+                # No running event loop
+                pass
             except Exception:
                 pass  # Ignore errors during traceback printing
 
@@ -379,10 +401,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         # In Trino mode, forward to local Trino worker
                         if payload.startswith(b"GET ") or payload.startswith(b"POST ") or payload.startswith(b"PUT ") or payload.startswith(b"DELETE "):
                             print(f"Worker '{self.worker_id}': Processing Trino request from {addr}")
-                            # asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
-                            handler_coro = self._handle_remote_trino_request(payload, msg_id, addr)
-                            task_name = f"RemoteTrinoRequest(msg_id={msg_id}, peer={addr})"
-                            asyncio.create_task(self._execute_handler_safely(handler_coro, task_name))
+                            # Process immediately without wrapper for better performance
+                            asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
                             return
                     else:
                         # Echo mode
@@ -672,15 +692,36 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     
     def _is_local_trino_path(self, path: str) -> bool:
         """Determine if a path should be handled by the local Trino worker"""
-        # These paths are typically handled by the worker itself
-        local_paths = [
+        # Check if this is the coordinator
+        is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
+        
+        # These paths are handled by all nodes (coordinator and workers)
+        common_paths = [
             '/v1/task',  # Task management
             '/v1/info',  # Worker info
             '/v1/status',  # Worker status
             '/v1/thread',  # Thread dumps
-            # '/v1/service',  # Service discovery - removed to test UDP tunneling
+            '/v1/announcement',  # Service announcements - each node handles its own
+            '/v1/service',  # Service discovery - handled locally by each node
         ]
-        return any(path.startswith(p) for p in local_paths)
+        
+        # These paths are only handled by the coordinator
+        coordinator_only_paths = [
+            '/v1/statement',  # Query submission (SQL queries)
+            '/ui',  # Trino UI
+            '/v1/cluster',  # Cluster overview
+            '/v1/query',  # Query information
+        ]
+        
+        # Check common paths first
+        if any(path.startswith(p) for p in common_paths):
+            return True
+            
+        # Check coordinator-only paths
+        if is_coordinator and any(path.startswith(p) for p in coordinator_only_paths):
+            return True
+            
+        return False
     
     async def _forward_to_local_trino(self, request: bytes, writer: asyncio.StreamWriter):
         """Forward request to local Trino worker"""
@@ -712,16 +753,23 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
     
     async def _handle_remote_trino_request(self, request: bytes, msg_id: int, addr: Tuple[str, int]):
         """Handle Trino request from remote peer by forwarding to local Trino"""
-        print(f"Worker '{self.worker_id}': _handle_remote_trino_request START for msg_id={msg_id}")
+        start_time = time.time()
+        print(f"Worker '{self.worker_id}': _handle_remote_trino_request START for msg_id={msg_id} at {time.strftime('%H:%M:%S', time.localtime(start_time))}")
         print(f"Worker '{self.worker_id}': Request preview: {request[:100]}")
         
         # Important: ANY request that comes via UDP tunnel should be forwarded to local Trino
         # We should NOT apply routing logic here - that was already done by the sender
         try:
-            # Connect to local Trino worker
+            # Connect to local Trino worker with timeout
             print(f"Worker '{self.worker_id}': Attempting to connect to local Trino on 127.0.0.1:{TRINO_LOCAL_PORT}")
-            trino_reader, trino_writer = await asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT)
-            print(f"Worker '{self.worker_id}': Successfully connected to local Trino")
+            try:
+                trino_reader, trino_writer = await asyncio.wait_for(
+                    asyncio.open_connection('127.0.0.1', TRINO_LOCAL_PORT),
+                    timeout=2.0  # 2 second timeout for connection
+                )
+                print(f"Worker '{self.worker_id}': Successfully connected to local Trino")
+            except asyncio.TimeoutError:
+                raise ConnectionError(f"Timeout connecting to Trino on port {TRINO_LOCAL_PORT}")
             
             # Forward request
             trino_writer.write(request)
@@ -731,7 +779,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             # Read response with timeout to avoid hanging
             response_parts = []
             total_read = 0
-            read_timeout = 5.0  # 5 second timeout for reading
+            read_timeout = 2.0  # Reduced initial timeout
             
             try:
                 # Read response in chunks with timeout
@@ -744,9 +792,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         response_parts.append(chunk)
                         total_read += len(chunk)
                         print(f"Worker '{self.worker_id}': Read chunk from Trino, size={len(chunk)}, total={total_read}")
-                        # For smaller responses, use shorter timeout after first chunk
-                        if total_read > 0:
-                            read_timeout = 1.0
+                        # For subsequent chunks, use very short timeout
+                        read_timeout = 0.5
                     except asyncio.TimeoutError:
                         print(f"Worker '{self.worker_id}': Read timeout after {total_read} bytes - assuming response complete")
                         break
@@ -976,8 +1023,12 @@ async def discover_and_report_stun_udp_endpoint(websocket_conn_to_rendezvous):
 
         except socket.gaierror as e_gaierror: # Specific error for DNS issues
             print(f"Worker '{worker_id}': STUN attempt {attempt} failed: DNS resolution error for '{stun_host}': {e_gaierror}")
-        except stun.StunException as e_stun: # Catch specific STUN protocol errors from pystun3
-            print(f"Worker '{worker_id}': STUN attempt {attempt} failed: STUN protocol error: {type(e_stun).__name__} - {e_stun}")
+        except AttributeError as e_attr:
+            # Handle case where StunException doesn't exist
+            if "StunException" in str(e_attr):
+                print(f"Worker '{worker_id}': STUN library doesn't have StunException attribute")
+            else:
+                raise  # Re-raise if it's a different AttributeError
         except OSError as e_os: # Catch socket-related errors like "Address already in use" or network issues
             print(f"Worker '{worker_id}': STUN attempt {attempt} failed: OS error (e.g., socket issue): {type(e_os).__name__} - {e_os}")
         except Exception as e_general: # Catch-all for any other unexpected errors from stun.get_ip_info
@@ -1148,20 +1199,25 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 keepalive_task = asyncio.create_task(send_ws_keepalive())
 
                 if stun_success_initial and not udp_listener_active:
-                    try:
-                        # The socket main_udp_sock is already bound.
-                        # We pass this existing, bound socket to create_datagram_endpoint.
-                        _transport, _protocol = await loop.create_datagram_endpoint(
-                            lambda: P2PUDPProtocol(worker_id),
-                            local_addr=('0.0.0.0', INTERNAL_UDP_PORT)
-                        )
-                        p2p_listener_transport_local_ref = _transport
-                        await asyncio.sleep(0.1)
-                        if p2p_udp_transport: print(f"Worker '{worker_id}': Asyncio P2P UDP listener appears active on 0.0.0.0:{INTERNAL_UDP_PORT}.")
-                        else: print(f"Worker '{worker_id}': P2P UDP listener transport not set globally after create_datagram_endpoint on 0.0.0.0:{INTERNAL_UDP_PORT}.")
+                    # Check if we already have a global UDP transport running
+                    if p2p_udp_transport and not p2p_udp_transport.is_closing():
+                        print(f"Worker '{worker_id}': P2P UDP transport already active, skipping creation.")
                         udp_listener_active = True
-                    except Exception as e_udp_listen:
-                        print(f"Worker '{worker_id}': Failed to create P2P UDP datagram endpoint on 0.0.0.0:{INTERNAL_UDP_PORT}: {e_udp_listen}")
+                        p2p_listener_transport_local_ref = p2p_udp_transport
+                    else:
+                        try:
+                            # Create new UDP listener
+                            _transport, _protocol = await loop.create_datagram_endpoint(
+                                lambda: P2PUDPProtocol(worker_id),
+                                local_addr=('0.0.0.0', INTERNAL_UDP_PORT)
+                            )
+                            p2p_listener_transport_local_ref = _transport
+                            # Check immediately without sleep
+                            if p2p_udp_transport: print(f"Worker '{worker_id}': Asyncio P2P UDP listener appears active on 0.0.0.0:{INTERNAL_UDP_PORT}.")
+                            else: print(f"Worker '{worker_id}': P2P UDP listener transport not set globally after create_datagram_endpoint on 0.0.0.0:{INTERNAL_UDP_PORT}.")
+                            udp_listener_active = True
+                        except Exception as e_udp_listen:
+                            print(f"Worker '{worker_id}': Failed to create P2P UDP datagram endpoint on 0.0.0.0:{INTERNAL_UDP_PORT}: {e_udp_listen}")
                 
                 while not stop_signal_received:
                     try:
@@ -1239,15 +1295,23 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                     pass
                 print(f"Worker '{worker_id}': Cancelled WebSocket keepalive task")
             
-            if p2p_listener_transport_local_ref: 
-                print(f"Worker '{worker_id}': Closing local P2P UDP transport (asyncio wrapper) from this WS session.")
+            # Don't close the UDP transport when WebSocket reconnects - they're independent!
+            # The UDP transport should remain open for P2P communication
+            if stop_signal_received and p2p_listener_transport_local_ref:
+                # Only close on shutdown
+                print(f"Worker '{worker_id}': Closing local P2P UDP transport due to shutdown.")
                 p2p_listener_transport_local_ref.close()
-                # If this transport was the global one, clear the global reference
                 if p2p_udp_transport == p2p_listener_transport_local_ref:
                     p2p_udp_transport = None
-                udp_listener_active = False # Allow re-creation of transport on next connection
-        if not stop_signal_received: await asyncio.sleep(10)
-        else: break
+            
+            # Always reset this flag so we can properly check UDP state on reconnect
+            udp_listener_active = False
+            
+        if not stop_signal_received: 
+            print(f"Worker '{worker_id}': Waiting 10 seconds before reconnection attempt...")
+            await asyncio.sleep(10)
+        else: 
+            break
 
 async def send_periodic_p2p_keep_alives():
     global worker_id, stop_signal_received, p2p_udp_transport, current_p2p_peer_addr
