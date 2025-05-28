@@ -34,6 +34,7 @@ gcloud run deploy ${SERVICE_NAME}-coordinator \
     --set-env-vars "WORKER_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_COORDINATOR_ID=${COORDINATOR_ID}" \
     --set-env-vars "TRINO_MODE=true" \
+    --set-env-vars "IS_COORDINATOR=true" \
     --set-env-vars "TRINO_LOCAL_PORT=8081" \
     --set-env-vars "TRINO_PROXY_PORT=18080" \
     --set-env-vars "INTERNAL_UDP_PORT=8081" \

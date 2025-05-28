@@ -14,7 +14,7 @@ echo "Worker ID: $WORKER_ID"
 sed -i "s/NODE_ID_PLACEHOLDER/$WORKER_ID/g" /opt/trino/etc/node.properties
 
 # Set coordinator mode based on environment
-if [ "$TRINO_COORDINATOR_ID" = "$WORKER_ID" ]; then
+if [ "${IS_COORDINATOR,,}" = "true" ] || [ "${IS_COORDINATOR}" = "1" ] || [ "${IS_COORDINATOR,,}" = "yes" ] || [ "${IS_COORDINATOR,,}" = "on" ]; then
     echo "This worker is the COORDINATOR"
     sed -i "s/coordinator=false/coordinator=true/g" /opt/trino/etc/config.properties
     # Coordinator needs to handle discovery

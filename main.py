@@ -99,7 +99,7 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
             "internal": f"http://localhost:{TRINO_PROXY_PORT}",
             "internalHttps": None,
             "nodeVersion": "1.0.0",
-            "coordinator": worker_id == TRINO_COORDINATOR_ID,
+            "coordinator": os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"],
             "startTime": time.time()
         }
         content = json.dumps(info).encode()
@@ -563,7 +563,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 else:
                     # Forward to peer via UDP tunnel
                     # Note: The peer will forward this to their local Trino - no further routing logic applied
-                    is_coordinator = (self.worker_id == TRINO_COORDINATOR_ID)
+                    is_coordinator = os.environ.get("IS_COORDINATOR", "").lower() in ["true", "1", "yes", "on"]
                     print(f"Worker '{self.worker_id}': Path {path} not local. I am {'COORDINATOR' if is_coordinator else 'WORKER'}. Forwarding to peer.")
                     if not current_p2p_peer_addr:
                         print(f"Worker '{self.worker_id}': HTTP proxy - no peer for Trino req {request_summary_for_logs}")
@@ -951,11 +951,15 @@ async def discover_and_report_stun_udp_endpoint(websocket_conn_to_rendezvous):
         print(f"Worker '{worker_id}': STUN discovery attempt {attempt}/{STUN_MAX_RETRIES} via {stun_host}:{stun_port} for local port {INTERNAL_UDP_PORT}.")
         try:
             # The stun.get_ip_info function can raise socket.gaierror, stun.StunException, OSError, etc.
-            nat_type, external_ip, external_port = stun.get_ip_info(
-                source_ip="0.0.0.0",
-                source_port=INTERNAL_UDP_PORT,
-                stun_host=stun_host,
-                stun_port=stun_port
+            # Run in executor to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            nat_type, external_ip, external_port = await loop.run_in_executor(
+                None,
+                stun.get_ip_info,
+                "0.0.0.0",
+                INTERNAL_UDP_PORT,
+                stun_host,
+                stun_port
             )
             
             if external_ip and external_port:
@@ -1058,24 +1062,50 @@ async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, pe
     )
 
 async def connect_to_rendezvous(rendezvous_ws_url: str):
-    global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
+    global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port, worker_id
     ip_echo_service_url = "https://api.ipify.org"
     ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
     ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
     udp_listener_active = False
     loop = asyncio.get_running_loop()
 
+    reconnect_failures = 0
     while not stop_signal_received:
         p2p_listener_transport_local_ref = None
         try:
+            # After multiple failures, consider regenerating worker ID
+            if reconnect_failures >= 3:
+                old_worker_id = worker_id
+                worker_id = str(uuid.uuid4())
+                print(f"Worker '{old_worker_id}': After {reconnect_failures} reconnect failures, generating new worker ID: {worker_id}")
+                # Update the WebSocket URL with new worker ID
+                ws_scheme = "wss" if rendezvous_ws_url.startswith("wss://") else "ws"
+                base_url = rendezvous_ws_url.rsplit('/', 1)[0]  # Remove old worker ID
+                rendezvous_ws_url = f"{base_url}/{worker_id}"
+                reconnect_failures = 0
+            
+            print(f"Worker '{worker_id}': Attempting to connect to rendezvous at {rendezvous_ws_url}")
             # Ensure explicit proxy=None to avoid automatic system proxy usage (websockets v15.0+ behavior)
             async with websockets.connect(rendezvous_ws_url, 
                                         ping_interval=ping_interval, 
                                         ping_timeout=ping_timeout,
+                                        open_timeout=30,  # 30 second timeout for connection
                                         proxy=None) as ws_to_rendezvous:
-                print(f"Worker '{worker_id}' connected to Rendezvous Service.")
+                connection_start_time = time.time()
+                print(f"Worker '{worker_id}' connected to Rendezvous Service at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(connection_start_time))}")
+                reconnect_failures = 0  # Reset counter on successful connection
+                
+                # Send immediate keepalive to test connection
                 try:
-                    response = requests.get(ip_echo_service_url, timeout=10)
+                    await ws_to_rendezvous.send(json.dumps({"type": "echo_request", "payload": "initial_connection_test"}))
+                    print(f"Worker '{worker_id}': Sent initial connection test to rendezvous")
+                except Exception as e:
+                    print(f"Worker '{worker_id}': Failed to send initial connection test: {e}")
+                
+                try:
+                    # Run blocking HTTP request in executor to avoid blocking the event loop
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(None, lambda: requests.get(ip_echo_service_url, timeout=10))
                     response.raise_for_status()
                     http_public_ip = response.text.strip()
                     await ws_to_rendezvous.send(json.dumps({"type": "register_public_ip", "ip": http_public_ip}))
@@ -1088,19 +1118,32 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 # Create a keep-alive task for the WebSocket
                 async def send_ws_keepalive():
                     """Send periodic keep-alive messages to prevent WebSocket timeout"""
+                    print(f"Worker '{worker_id}': Starting WebSocket keepalive task")
+                    keepalive_count = 0
+                    
+                    # Send initial keepalive immediately
+                    try:
+                        keepalive_count += 1
+                        await ws_to_rendezvous.send(json.dumps({"type": "echo_request", "payload": "keepalive"}))
+                        print(f"Worker '{worker_id}': Sent initial echo keepalive #{keepalive_count} to rendezvous")
+                    except Exception as e:
+                        print(f"Worker '{worker_id}': Error sending initial WebSocket keep-alive: {e}")
+                        return
+                    
                     while not stop_signal_received:
                         try:
                             await asyncio.sleep(20)  # Send every 20 seconds
-                            if not ws_to_rendezvous.closed:
-                                # Use echo_request which the rendezvous service handles
-                                await ws_to_rendezvous.send(json.dumps({"type": "echo_request", "payload": "keepalive"}))
-                                print(f"Worker '{worker_id}': Sent echo keepalive to rendezvous")
+                            keepalive_count += 1
+                            # Just try to send - if the connection is closed, it will raise an exception
+                            await ws_to_rendezvous.send(json.dumps({"type": "echo_request", "payload": "keepalive"}))
+                            print(f"Worker '{worker_id}': Sent echo keepalive #{keepalive_count} to rendezvous")
                         except websockets.exceptions.ConnectionClosed:
                             print(f"Worker '{worker_id}': WebSocket closed, stopping keep-alive")
                             break
                         except Exception as e:
                             print(f"Worker '{worker_id}': Error sending WebSocket keep-alive: {e}")
                             break
+                    print(f"Worker '{worker_id}': Exiting keepalive task (stop_signal_received={stop_signal_received})")
                 
                 keepalive_task = asyncio.create_task(send_ws_keepalive())
 
@@ -1170,7 +1213,8 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                         # WebSocket ping/pong should keep the connection alive.
                         pass
                     except websockets.exceptions.ConnectionClosed as e_conn_closed: 
-                        print(f"Worker '{worker_id}': Rendezvous WS closed by server during recv: {e_conn_closed}.") 
+                        connection_duration = time.time() - connection_start_time
+                        print(f"Worker '{worker_id}': Rendezvous WS closed by server during recv: {e_conn_closed}. Connection lasted {connection_duration:.1f} seconds ({connection_duration/60:.1f} minutes)") 
                         break # Break inner message loop
                     except Exception as e_recv: 
                         print(f"Worker '{worker_id}': Error in WS recv loop: {e_recv}") 
@@ -1181,8 +1225,10 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
 
         except websockets.exceptions.ConnectionClosed as e_outer_closed:
             print(f"Worker '{worker_id}': Rendezvous WS connection closed before or during connect: {e_outer_closed}")
+            reconnect_failures += 1
         except Exception as e_ws_connect: 
             print(f"Worker '{worker_id}': Error in WS connection loop: {type(e_ws_connect).__name__} - {e_ws_connect}. Retrying...")
+            reconnect_failures += 1
         finally: 
             # Cancel the WebSocket keepalive task if it exists
             if 'keepalive_task' in locals() and not keepalive_task.done():
