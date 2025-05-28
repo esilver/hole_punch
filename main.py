@@ -562,6 +562,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     return # Local handling complete
                 else:
                     # Forward to peer via UDP tunnel
+                    # Note: The peer will forward this to their local Trino - no further routing logic applied
+                    is_coordinator = (self.worker_id == TRINO_COORDINATOR_ID)
+                    print(f"Worker '{self.worker_id}': Path {path} not local. I am {'COORDINATOR' if is_coordinator else 'WORKER'}. Forwarding to peer.")
                     if not current_p2p_peer_addr:
                         print(f"Worker '{self.worker_id}': HTTP proxy - no peer for Trino req {request_summary_for_logs}")
                         error_response = b"HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 17\\r\\n\\r\\nNo peer connected"
@@ -711,6 +714,9 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
         """Handle Trino request from remote peer by forwarding to local Trino"""
         print(f"Worker '{self.worker_id}': _handle_remote_trino_request START for msg_id={msg_id}")
         print(f"Worker '{self.worker_id}': Request preview: {request[:100]}")
+        
+        # Important: ANY request that comes via UDP tunnel should be forwarded to local Trino
+        # We should NOT apply routing logic here - that was already done by the sender
         try:
             # Connect to local Trino worker
             print(f"Worker '{self.worker_id}': Attempting to connect to local Trino on 127.0.0.1:{TRINO_LOCAL_PORT}")
