@@ -885,6 +885,11 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                 request_str = request.decode('utf-8', errors='ignore')
                 lines = request_str.split('\r\n')
                 
+                # Extract node ID from the PUT path
+                request_line = lines[0]
+                path_parts = request_line.split(' ')[1].split('/')
+                announcing_node_id = path_parts[-1] if len(path_parts) > 3 else 'unknown'
+                
                 # Find the JSON body (after empty line)
                 body_start = -1
                 for i, line in enumerate(lines):
@@ -903,8 +908,8 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                         if 'services' in announcement:
                             for service in announcement['services']:
                                 if 'properties' in service:
-                                    # Use path prefix to identify target worker
-                                    node_id = service.get('nodeId', 'unknown')
+                                    # Use the node ID from the announcement path
+                                    node_id = service.get('nodeId', announcing_node_id)
                                     # Only rewrite for workers, not coordinator
                                     is_worker_announcement = service.get('properties', {}).get('coordinator', 'true') == 'false'
                                     if is_worker_announcement:
