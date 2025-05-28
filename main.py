@@ -401,7 +401,7 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
                     # Check if it's an HTTP request
                     if TRINO_MODE:
                         # In Trino mode, forward to local Trino worker
-                        if payload.startswith(b"GET ") or payload.startswith(b"POST ") or payload.startswith(b"PUT ") or payload.startswith(b"DELETE "):
+                        if payload.startswith(b"GET ") or payload.startswith(b"POST ") or payload.startswith(b"PUT ") or payload.startswith(b"DELETE ") or payload.startswith(b"HEAD "):
                             print(f"Worker '{self.worker_id}': Processing Trino request from {addr}")
                             # Process immediately without wrapper for better performance
                             asyncio.create_task(self._handle_remote_trino_request(payload, msg_id, addr))
