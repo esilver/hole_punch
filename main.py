@@ -755,9 +755,14 @@ class P2PUDPProtocol(asyncio.DatagramProtocol):
             '/v1/info',  # Worker info
             '/v1/status',  # Worker status
             '/v1/thread',  # Thread dumps
-            '/v1/announcement',  # Service announcements - each node handles its own
             '/v1/service',  # Service discovery - handled locally by each node
         ]
+        
+        # Special handling for announcement paths
+        if path.startswith('/v1/announcement'):
+            # Coordinator: handle locally (receive announcements from workers)
+            # Worker: forward to coordinator (announce itself)
+            return is_coordinator
         
         # These paths are only handled by the coordinator
         coordinator_only_paths = [
