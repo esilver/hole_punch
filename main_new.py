@@ -166,48 +166,55 @@ class P2PQuicHandler:
         stream_id = event.stream_id
         data = event.data
         
-        print(f"Worker '{self.worker_id}': Received stream data on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}")
+        # Initial raw log of what's received
+        print(f"Worker '{self.worker_id}': RAW_STREAM_DATA on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}, data_start: {data[:20]!r}")
         
         if stream_id not in self.streams:
             self.streams[stream_id] = {
                 "buffer": bytearray(),
-                "mode": "json_header", # Waiting for benchmark_start JSON header or other JSON messages
-                "file_info": None # Will store file details if benchmark_start is received
+                "mode": "json_header", 
+                "file_info": None 
             }
             print(f"Worker '{self.worker_id}': New stream {stream_id} created, mode=json_header")
         
         stream_info = self.streams[stream_id]
         
         if stream_info["mode"] == "file_data":
-            # Currently receiving raw file data
-            stream_info["buffer"].extend(data) # Temporarily buffer raw file data if it comes with end_stream
-            if stream_info["file_info"]: # Should always be true if in file_data mode
+            if stream_info["file_info"]: 
                 stream_info["file_info"]["received_bytes"] += len(data)
-                # Optional: UI progress update can be added here if desired (e.g., every N bytes)
-                # For now, just log server-side for larger chunks
-                if stream_info["file_info"]["received_bytes"] % (1024 * 1024) < len(data): # roughly every 1MB
-                    if stream_info["file_info"].get("start_time"):
-                        elapsed = time.monotonic() - stream_info["file_info"]["start_time"]
-                        speed_mbps = (stream_info["file_info"]["received_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                        print(f"Worker '{self.worker_id}': File benchmark receiving ('{stream_info['file_info']['filename']}'), {stream_info['file_info']['received_bytes'] / 1024:.0f} KB at {speed_mbps:.2f} MB/s")
-            # Raw file data is not processed further here until end_stream
-        else: # mode is "json_header" or other future JSON-based modes
+                # Progress logging moved to after potential mode switch for clarity
+            else: 
+                print(f"Worker '{self.worker_id}': CRITICAL_ERROR - stream {stream_id} in file_data mode but no file_info! Data: {data[:50]!r}")
+
+        else: # mode is "json_header"
             stream_info["buffer"].extend(data)
-            # Process any complete newline-delimited JSON messages in the buffer
+            print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header mode) buffer extended. Current buffer len: {len(stream_info['buffer'])}, end_stream: {event.end_stream}")
             while True:
                 buf = stream_info["buffer"]
                 newline_idx = buf.find(b"\n")
                 if newline_idx == -1:
-                    break  # No full JSON message yet
+                    if event.end_stream and len(buf) > 0: # Stream ended, no newline, try to parse anyway if in json_header
+                        print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header) ended with data but no newline. Attempting parse of: {buf[:100]!r}")
+                        line_bytes = bytes(buf) # Process the whole buffer
+                        del buf[:] # Clear buffer
+                    else:
+                        break # No full JSON message yet, or buffer empty
+                else:
+                    line_bytes = bytes(buf[:newline_idx])
+                    del buf[:newline_idx + 1] 
                 
-                line_bytes = bytes(buf[:newline_idx])
-                del buf[:newline_idx + 1] # Remove the processed line including the newline
-                
-                if not line_bytes: # Empty line, skip
+                if not line_bytes: 
                     continue
                 
+                # Guard before json.loads
+                if not line_bytes.lstrip().startswith(b'{'):
+                    print(f"Worker '{self.worker_id}': JSON_PARSE_GUARD - Stream {stream_id} got non-JSON first byte in line: {line_bytes[:60]!r}")
+                    # Potentially treat as an error or unexpected data
+                    continue # Skip this line
+
                 try:
                     msg = json.loads(line_bytes)
+                    print(f"Worker '{self.worker_id}': Stream {stream_id} parsed JSON: {msg.get('type', 'N/A_TYPE')}")
                     msg_type = msg.get("type")
 
                     if msg_type == "benchmark_start":
@@ -219,47 +226,68 @@ class P2PQuicHandler:
                             "start_time": time.monotonic(),
                             "from_worker_id": msg.get("from_worker_id")
                         }
-                        print(f"Worker '{self.worker_id}': Benchmark '{stream_info['file_info']['filename']}' started by {stream_info['file_info']['from_worker_id']}, expecting {stream_info['file_info']['expected_total_size']} bytes.")
+                        print(f"Worker '{self.worker_id}': BENCHMARK_START stream {stream_id} ('{stream_info['file_info']['filename']}') by {stream_info['file_info'].get('from_worker_id', 'unknown')}, expecting {stream_info['file_info']['expected_total_size']} bytes. Mode switched to file_data.")
                         
-                        # The buffer `buf` (alias for stream_info["buffer"]) might contain the start of the file data after the header.
+                        # If buffer still has data after header, it's the start of the file
                         if len(buf) > 0:
                             initial_file_data_len = len(buf)
                             stream_info["file_info"]["received_bytes"] += initial_file_data_len
-                            print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer.")
-                            # No need to log buf content here, it's raw binary.
-                        stream_info["buffer"].clear() # IMPORTANT: Clear buffer after processing header and initial file bytes
-                        break # Exit JSON processing loop, subsequent data on this stream is raw file data
+                            print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer for stream {stream_id}.")
+                        stream_info["buffer"].clear() # Clear buffer, it's for JSON only
+                        # IMPORTANT: Do NOT break here if event.end_stream is true and buffer had data.
+                        # The end_stream logic below needs to run.
+                        # If not end_stream, the next data will be handled by file_data mode.
+                        if not event.end_stream: # If stream is not ending with this packet, we're done with JSON loop
+                           break
+                        # If event.end_stream IS true, fall through to end_stream processing, buffer is now empty or contains trailing file data
                     elif msg_type == "benchmark_cancelled":
                         print(f"Worker '{self.worker_id}': Received benchmark_cancelled message on stream {stream_id}.")
-                        # Clean up stream, could also notify UI
-                        if stream_id in self.streams:
+                        if stream_id in self.streams: 
                             del self.streams[stream_id]
-                        return # Stop processing this stream further
+                        return 
                     else:
-                        # Process other standard P2P JSON messages
                         self.process_p2p_message(line_bytes, reliable=True)
-                except json.JSONDecodeError:
-                    print(f"Worker '{self.worker_id}': Received non-JSON line on stream {stream_id} in json_header mode: {line_bytes[:100]}...")
+                except json.JSONDecodeError as e:
+                    print(f"Worker '{self.worker_id}': JSON_DECODE_ERROR stream {stream_id} (json_header mode): {e} on data: {line_bytes[:100]!r}")
                     pass 
         
+        # After potential mode switch, if now in file_data, log progress
+        if stream_info["mode"] == "file_data" and stream_info["file_info"]:
+            current_mb_milestone = stream_info["file_info"]["received_bytes"] // (1024 * 1024)
+            # Calculate previous milestone based on bytes *before* adding current `data`
+            # This requires storing data length if we are to calculate it accurately here
+            # For simplicity, log if it's a new MB, less frequent if data chunks are large
+            if stream_info["file_info"].get("last_logged_mb", -1) < current_mb_milestone:
+                 if stream_info["file_info"].get("start_time"):
+                    elapsed = time.monotonic() - stream_info["file_info"]["start_time"]
+                    speed_mbps = (stream_info["file_info"]["received_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    print(f"Worker '{self.worker_id}': FILE_PROGRESS stream {stream_id} ('{stream_info['file_info']['filename']}'): {stream_info['file_info']['received_bytes'] / (1024*1024):.2f} MB at {speed_mbps:.2f} MB/s")
+                    stream_info["file_info"]["last_logged_mb"] = current_mb_milestone
+
+
         if event.end_stream:
+            print(f"Worker '{self.worker_id}': END_STREAM event for stream {stream_id}, current mode: {stream_info['mode']}")
             if stream_info["mode"] == "file_data" and stream_info["file_info"] and stream_info["file_info"].get("start_time") is not None:
                 file_info = stream_info["file_info"]
-                # If there's anything left in the stream_info["buffer"] when file_data mode ends,
-                # it's the very last piece of raw file data that came with the FIN.
-                if len(stream_info["buffer"]) > 0:
-                    print(f"Worker '{self.worker_id}': Consuming {len(stream_info['buffer'])} trailing raw bytes from buffer on stream {stream_id} end.")
-                    file_info["received_bytes"] += len(stream_info["buffer"]) # Add any trailing raw bytes
+                
+                if len(stream_info["buffer"]) > 0: # This buffer should be empty in file_data mode after header
+                    print(f"Worker '{self.worker_id}': WARNING stream {stream_id} (file_data) ended with non-empty JSON buffer: {stream_info['buffer'][:100]!r}. This indicates a logic issue or unexpected data.")
+                    # Assuming this was meant to be raw file data if an error occurred in mode switch
+                    # For safety, we are NOT adding this to file_info["received_bytes"] unless explicitly decided
+                    # file_info["received_bytes"] += len(stream_info["buffer"]) 
                     stream_info["buffer"].clear()
 
                 elapsed = time.monotonic() - file_info["start_time"]
-                total_mb = file_info["received_bytes"] / (1024 * 1024)
-                speed_mbps = total_mb / elapsed if elapsed > 0 else 0
+                total_mb_received = file_info["received_bytes"] / (1024 * 1024)
+                expected_total_mb = file_info["expected_total_size"] / (1024*1024)
+                speed_mbps = total_mb_received / elapsed if elapsed > 0 else 0
                 
                 from_peer_id_for_log = file_info.get("from_worker_id", "unknown_peer")
+                
+                print(f"Worker '{self.worker_id}': FILE_INFO_ON_END stream {stream_id}: Received Bytes: {file_info['received_bytes']}, Expected: {file_info['expected_total_size']}")
 
-                status_msg = f"Benchmark File Receive Complete: '{file_info['filename']}' ({file_info['received_bytes'] / (1024*1024):.2f} MB / {file_info['expected_total_size']/(1024*1024):.2f} MB) in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
-                print(f"Worker '{self.worker_id}': {status_msg} from {from_peer_id_for_log}")
+                status_msg = f"Benchmark File Receive Complete: '{file_info['filename']}' ({total_mb_received:.2f} MB / {expected_total_mb:.2f} MB) in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
+                print(f"Worker '{self.worker_id}': FINAL_BENCHMARK_RECEIVE_STATUS: {status_msg} from {from_peer_id_for_log}")
 
                 global ui_websocket_clients
                 for ui_client_ws in list(ui_websocket_clients):
@@ -267,17 +295,17 @@ class P2PQuicHandler:
                         "type": "benchmark_status", 
                         "message": status_msg
                     })))
-            elif stream_info["buffer"]: 
-                print(f"Worker '{self.worker_id}': Stream {stream_id} ended in mode '{stream_info['mode']}' with {len(stream_info['buffer'])} unparsed bytes: {stream_info['buffer'][:100]}...")
-                # If it was expecting JSON, try to parse a final one
+            elif len(stream_info["buffer"]) > 0 : # Stream ended, not in file_data mode, but buffer has data
+                print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with {len(stream_info['buffer'])} unparsed JSON buffer bytes: {stream_info['buffer'][:100]!r}. Attempting final parse.")
                 if stream_info["mode"] == "json_header":
                     try:
-                        # There might not be a newline for the very last message if stream closes
                         msg_bytes = bytes(stream_info["buffer"])
-                        json.loads(msg_bytes) # Just to see if it's valid JSON
+                        json.loads(msg_bytes) 
                         self.process_p2p_message(msg_bytes, reliable=True)
                     except json.JSONDecodeError:
                         print(f"Worker '{self.worker_id}': Final buffered data on stream {stream_id} was not valid JSON or was incomplete.")
+            else:
+                 print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with empty buffer. No final processing needed.")
             
             if stream_id in self.streams:
                 del self.streams[stream_id]
@@ -350,7 +378,8 @@ class P2PQuicHandler:
             # Use QUIC stream for reliable delivery
             stream_id = self.connection.get_next_available_stream_id()
             json_bytes = json.dumps(message_dict).encode() + b"\n"
-            self.connection.send_stream_data(stream_id, json_bytes, end_stream=False)
+            # IMPORTANT: Set end_stream=True for chat messages to ensure prompt delivery
+            self.connection.send_stream_data(stream_id, json_bytes, end_stream=True)
             print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(json_bytes)} bytes")
             print(f"Worker '{self.worker_id}': Message content: {message_dict}")
         else:
@@ -474,8 +503,19 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             event = connection.next_event()
             if event is None:
                 break
-            # Debug logging
-            print(f"Worker '{self.worker_id}': Processing QUIC event {type(event).__name__} from {addr}")
+            # Enhanced Debug logging for events
+            event_type_name = type(event).__name__
+            log_msg = f"Worker '{self.worker_id}': QUIC_EVENT from {addr} for conn {connection.original_destination_connection_id!r}: {event_type_name}"
+            if hasattr(event, 'stream_id'):
+                log_msg += f", stream_id={event.stream_id}"
+            if hasattr(event, 'data') and event.data is not None: # Check if data is not None
+                 log_msg += f", data_len={len(event.data)}"
+            if hasattr(event, 'end_stream'):
+                log_msg += f", end_stream={event.end_stream}"
+            if event_type_name == "ConnectionTerminated":
+                log_msg += f", error_code={event.error_code}, reason_phrase='{event.reason_phrase}'"
+            print(log_msg)
+            
             handler.handle_event(event)
             
     def _send_pending_datagrams(self, connection: QuicConnection, addr: Tuple[str, int], now: float):
@@ -639,9 +679,7 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
         chunk_size_for_sending = 65536 # 64KB
         
         if actual_total_file_bytes == 0:
-            print(f"Worker '{worker_id}': Benchmark file '{file_name_from_url}' is empty. Sending only header and closing stream.")
-            # For empty files, send empty data with end_stream=True
-            handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
+            print(f"Worker '{worker_id}': Benchmark file '{file_name_from_url}' is empty. Will send header and then 0-byte FIN.")
         else:
             print(f"Worker '{worker_id}': Sending file '{file_name_from_url}' ({actual_total_file_bytes} bytes) in {chunk_size_for_sending}-byte chunks over QUIC stream {data_stream_id}.")
             for offset in range(0, actual_total_file_bytes, chunk_size_for_sending):
@@ -658,14 +696,17 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
                     return
 
                 current_chunk_data = file_content_bytes[offset : offset + chunk_size_for_sending]
-                # Check if this is the last chunk
-                is_last_chunk = (offset + len(current_chunk_data)) >= actual_total_file_bytes
-                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=is_last_chunk)
+                # Send current chunk, DO NOT set end_stream=True here
+                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=False)
                 bytes_sent_on_stream += len(current_chunk_data)
+                print(f"Worker '{worker_id}': Sent chunk offset {offset}, len {len(current_chunk_data)} for stream {data_stream_id}. Total stream bytes sent: {bytes_sent_on_stream}")
 
-                if quic_dispatcher and chunk_size_for_sending > 0 and (offset + len(current_chunk_data)) % (chunk_size_for_sending * 4) < len(current_chunk_data): # Flush approx every 256KB
+                # Flush every chunk to ensure data flows immediately
+                if quic_dispatcher:
                     now_flush_time = time.time()
                     quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_flush_time)
+                    # Allow event loop to process outgoing packets
+                    await asyncio.sleep(0)
                     
                     progress_total_payload = actual_total_file_bytes + len(header_bytes) # For UI percentage against total expected payload
                     progress_pct = (bytes_sent_on_stream / progress_total_payload) * 100 if progress_total_payload > 0 else 0
@@ -674,13 +715,18 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
                         print(f"Worker '{worker_id}': {progress_msg}")
                     await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
         
-        # 5. Log completion (stream was already closed with the last chunk)
-        print(f"Worker '{worker_id}': Finished sending all data for '{file_name_from_url}'. Stream {data_stream_id} closed with last chunk.")
+        # 5. After loop (or if file was empty), send final 0-length data with end_stream=True
+        print(f"Worker '{worker_id}': All file data chunks sent for '{file_name_from_url}'. Sending 0-byte frame with end_stream=True on stream {data_stream_id}.")
+        handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
+        # bytes_sent_on_stream += 0 # No change for 0-byte data
 
         # 6. Final flush to ensure the last data and FIN are sent
+        print(f"Worker '{worker_id}': Attempting final flush for stream {data_stream_id}.")
+        await asyncio.sleep(0.01) # Tiny sleep to allow event loop to process outgoing if busy
         now_final_flush_time = time.time()
         if quic_dispatcher: 
             quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_final_flush_time)
+        print(f"Worker '{worker_id}': Final flush executed for stream {data_stream_id}.")
 
         quic_transfer_duration = time.monotonic() - quic_transfer_start_time
         
