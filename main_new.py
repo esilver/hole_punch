@@ -132,6 +132,12 @@ def create_quic_configuration(is_client=True):
     # Set idle timeout
     configuration.idle_timeout = 60.0
     
+    # Increase flow control windows for better performance with many small messages or large transfers
+    configuration.initial_max_stream_data_bidi_local = 8 * 1024 * 1024  # 8 MB per stream (local initiator)
+    configuration.initial_max_stream_data_bidi_remote = 8 * 1024 * 1024 # 8 MB per stream (remote initiator)
+    configuration.initial_max_stream_data_uni = 8 * 1024 * 1024       # 8 MB for unidirectional streams
+    configuration.initial_max_data = 32 * 1024 * 1024                 # 32 MB for the entire connection
+    
     return configuration
 
 class P2PQuicHandler:
@@ -238,15 +244,15 @@ class P2PQuicHandler:
                 print(f"Worker '{self.worker_id}': Received P2P keep-alive from '{from_id}'")
                 
             elif msg_type == "p2p_pairing_test":
-                timestamp = p2p_message.get("timestamp")
-                print(f"Worker '{self.worker_id}': Received p2p_pairing_test from '{from_id}' (timestamp: {timestamp}). Sending echo.")
-                echo_message = {
-                    "type": "p2p_pairing_echo",
-                    "from_worker_id": self.worker_id,
-                    "original_timestamp": timestamp
-                }
-                asyncio.create_task(self.send_message(echo_message, reliable=False))
-                
+                original_timestamp = p2p_message.get("original_timestamp")
+                rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
+                print(f"Worker '{self.worker_id}': Received p2p_pairing_test from '{from_id}'. RTT: {rtt:.2f} ms")
+                for ui_client_ws in list(ui_websocket_clients):
+                    asyncio.create_task(ui_client_ws.send(json.dumps({
+                        "type": "p2p_status_update",
+                        "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"
+                    })))
+                    
             elif msg_type == "p2p_pairing_echo":
                 original_timestamp = p2p_message.get("original_timestamp")
                 rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
@@ -268,11 +274,12 @@ class P2PQuicHandler:
             # Use QUIC stream for reliable delivery
             stream_id = self.connection.get_next_available_stream_id()
             self.connection.send_stream_data(stream_id, data, end_stream=True)
-            print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}")
+            print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(data)} bytes")
+            print(f"Worker '{self.worker_id}': Message content: {message_dict}")
         else:
             # Use QUIC datagram for fast unreliable delivery
             self.connection.send_datagram_frame(data)
-            print(f"Worker '{self.worker_id}': Sent unreliable datagram")
+            print(f"Worker '{self.worker_id}': Sent unreliable datagram, length={len(data)} bytes")
 
 class QuicServerDispatcher(asyncio.DatagramProtocol):
     """Dispatcher that handles both UDP hole-punching and QUIC connections"""
@@ -302,6 +309,9 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             print(f"Worker '{self.worker_id}': !!! P2P UDP Ping received from {addr}: {message_str} !!!")
             return
             
+        # Log all QUIC packets received
+        print(f"Worker '{self.worker_id}': Received UDP datagram from {addr}, length={len(data)} bytes")
+        
         # Try to handle as QUIC packet
         now = time.time()
         
@@ -309,15 +319,21 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             # This might be a new incoming QUIC connection
             print(f"Worker '{self.worker_id}': New QUIC packet from {addr}, creating server connection")
             config = create_quic_configuration(is_client=False)
-            # Parse the first byte to get the destination connection ID length
-            # For initial packets, we need to extract the DCID from the packet
-            dcid_length = 8  # Default QUIC connection ID length
-            if len(data) > dcid_length + 5:
-                # Extract destination connection ID from the packet (simplified)
-                dcid = data[6:6+dcid_length]  # Skip header flags and version
+            # Properly extract the Destination Connection ID (DCID) length from the first long-header packet.
+            # QUIC long header format: 1 byte flags, 4 bytes version, 1 byte DCID length, DCID bytes, 1 byte SCID length, SCID bytes, ...
+            # Reference: RFC 9000 §17.2
+            if len(data) >= 6:  # Need at least flags (1) + version (4) + DCID len (1)
+                dcid_length = data[5]
+                dcid_start = 6
+                dcid_end = dcid_start + dcid_length
+                if len(data) >= dcid_end:
+                    dcid = data[dcid_start:dcid_end]
+                else:
+                    # Malformed packet ‑ DCID length longer than available bytes; fall back to random CID
+                    dcid = os.urandom(8)
             else:
-                # Fallback: generate a random connection ID
-                dcid = os.urandom(dcid_length)
+                # Packet too short to contain DCID length; use random CID
+                dcid = os.urandom(8)
             
             connection = QuicConnection(
                 configuration=config,
@@ -328,6 +344,13 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             
         connection = self.quic_connections[addr]
         connection.receive_datagram(data, addr, now)
+        
+        # Log connection state
+        # The following line caused an AttributeError because aioquic's QuicConnection
+        # does not have direct is_connected, is_closing, is_closed attributes.
+        # Connection state should be tracked via QUIC events (e.g., ConnectionEstablished, ConnectionTerminated).
+        # For now, we'll comment out this problematic log.
+        # print(f"Worker '{self.worker_id}': QUIC connection state for {addr}: connected={connection.is_connected}, closing={connection.is_closing}, closed={connection.is_closed}")
         
         # Process QUIC events
         self._process_quic_events(connection, addr)
@@ -383,8 +406,14 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
         if not self.transport:
             return
             
+        datagrams_sent = 0
         for data, _ in connection.datagrams_to_send(now):
             self.transport.sendto(data, addr)
+            datagrams_sent += 1
+            print(f"Worker '{self.worker_id}': Sent QUIC datagram to {addr}, length={len(data)} bytes")
+            
+        if datagrams_sent == 0:
+            print(f"Worker '{self.worker_id}': No pending datagrams to send to {addr}")
             
     def _update_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
         """Update QUIC timer for this connection"""
@@ -401,6 +430,7 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             
     def _handle_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
         """Handle QUIC timer expiry"""
+        print(f"Worker '{self.worker_id}': QUIC timer fired for {addr}")
         now = time.time()
         connection.handle_timer(now)
         
@@ -712,25 +742,28 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
     await asyncio.sleep(0.5)  # Small delay to ensure hole punch completes
     
     if quic_dispatcher:
-        quic_dispatcher.initiate_quic_connection(current_p2p_peer_addr, peer_worker_id)
-        
-        # Send pairing test if we're the initiator (like in main.py)
         if worker_id < peer_worker_id:
-            print(f"Worker '{worker_id}': Designated as initiator for pairing test with '{peer_worker_id}'. Sending test message.")
+            # This side acts as the client-initiator for the QUIC handshake
+            print(f"Worker '{worker_id}': Lexicographically first. Initiating QUIC connection to '{peer_worker_id}'.")
+            quic_dispatcher.initiate_quic_connection(current_p2p_peer_addr, peer_worker_id)
+
+            # Send pairing-test once we have a handler (after initiate_quic_connection registered it)
             handler = quic_dispatcher.get_handler(current_p2p_peer_addr)
             if handler:
+                print(f"Worker '{worker_id}': Sending initial p2p_pairing_test to '{peer_worker_id}'.")
                 pairing_test_message = {
                     "type": "p2p_pairing_test",
                     "from_worker_id": worker_id,
                     "timestamp": time.time()
                 }
                 await handler.send_message(pairing_test_message, reliable=False)
-                
-                # Trigger sending
+
+                # Flush the datagrams immediately
                 now = time.time()
                 quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
         else:
-            print(f"Worker '{worker_id}': Designated as responder for pairing test with '{peer_worker_id}'. Awaiting test message.")
+            # We are the responder; do NOT initiate a duplicate client connection – wait for peer's handshake
+            print(f"Worker '{worker_id}': Lexicographically second. Waiting for peer '{peer_worker_id}' to initiate QUIC connection.")
 
 async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, peer_worker_id: str, 
                                        max_wait_sec: float = 10.0, check_interval: float = 0.5):
@@ -764,6 +797,7 @@ async def send_periodic_p2p_keep_alives():
                         "type": "p2p_keep_alive",
                         "from_worker_id": worker_id
                     }
+                    print(f"Worker '{worker_id}': Sending keep-alive to {current_p2p_peer_addr}")
                     await handler.send_message(keep_alive_message, reliable=False)
                     
                     # Trigger sending
@@ -771,6 +805,10 @@ async def send_periodic_p2p_keep_alives():
                     quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
                 except Exception as e:
                     print(f"Worker '{worker_id}': Error sending P2P keep-alive: {e}")
+            else:
+                print(f"Worker '{worker_id}': No handler for peer {current_p2p_peer_addr}")
+        else:
+            print(f"Worker '{worker_id}': Keep-alive skipped - dispatcher={quic_dispatcher is not None}, peer_addr={current_p2p_peer_addr}")
                     
     print(f"Worker '{worker_id}': P2P Keep-Alive sender task stopped.")
 

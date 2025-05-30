@@ -124,7 +124,10 @@ run_with_timeout ${DEPLOY_TIMEOUT_SEC}s gcloud run deploy "${WORKER_SERVICE_NAME
   --platform managed \
   --allow-unauthenticated \
   --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_URL},STUN_HOST=${DEFAULT_STUN_HOST:-stun.l.google.com},STUN_PORT=${DEFAULT_STUN_PORT:-19302},INTERNAL_UDP_PORT=${INTERNAL_UDP_PORT:-8081},PING_INTERVAL_SEC=${PING_INTERVAL_SEC:-25},PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC:-25},BENCHMARK_GCS_URL=${BENCHMARK_GCS_URL},BENCHMARK_CHUNK_SIZE=${BENCHMARK_CHUNK_SIZE},STUN_RECHECK_INTERVAL_SEC=${STUN_RECHECK_INTERVAL_SEC:-60}" \
-  --cpu=1 \
+  --cpu=4 \
+  --memory=4Gi \
+  --execution-environment=gen2 \
+  --no-cpu-throttling \
   --cpu-boost \
   --vpc-egress=all-traffic \
   --network=ip-worker-vpc \
