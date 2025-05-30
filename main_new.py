@@ -640,6 +640,8 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
         
         if actual_total_file_bytes == 0:
             print(f"Worker '{worker_id}': Benchmark file '{file_name_from_url}' is empty. Sending only header and closing stream.")
+            # For empty files, send empty data with end_stream=True
+            handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
         else:
             print(f"Worker '{worker_id}': Sending file '{file_name_from_url}' ({actual_total_file_bytes} bytes) in {chunk_size_for_sending}-byte chunks over QUIC stream {data_stream_id}.")
             for offset in range(0, actual_total_file_bytes, chunk_size_for_sending):
@@ -656,7 +658,9 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
                     return
 
                 current_chunk_data = file_content_bytes[offset : offset + chunk_size_for_sending]
-                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=False)
+                # Check if this is the last chunk
+                is_last_chunk = (offset + len(current_chunk_data)) >= actual_total_file_bytes
+                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=is_last_chunk)
                 bytes_sent_on_stream += len(current_chunk_data)
 
                 if quic_dispatcher and chunk_size_for_sending > 0 and (offset + len(current_chunk_data)) % (chunk_size_for_sending * 4) < len(current_chunk_data): # Flush approx every 256KB
@@ -670,10 +674,8 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
                         print(f"Worker '{worker_id}': {progress_msg}")
                     await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
         
-        # 5. Send final 0-length data with end_stream=True to close the stream gracefully
-        # This ensures FIN is sent for the stream.
-        handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
-        print(f"Worker '{worker_id}': Finished sending all data for '{file_name_from_url}'. Closing stream {data_stream_id} with end_stream=True.")
+        # 5. Log completion (stream was already closed with the last chunk)
+        print(f"Worker '{worker_id}': Finished sending all data for '{file_name_from_url}'. Stream {data_stream_id} closed with last chunk.")
 
         # 6. Final flush to ensure the last data and FIN are sent
         now_final_flush_time = time.time()
