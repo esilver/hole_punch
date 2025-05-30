@@ -167,7 +167,7 @@ class P2PQuicHandler:
         data = event.data
         
         # Initial raw log of what's received
-        print(f"Worker '{self.worker_id}': RAW_STREAM_DATA on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}, data_start: {data[:20]!r}")
+        # print(f"Worker '{self.worker_id}': RAW_STREAM_DATA on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}, data_start: {data[:20]!r}")
         
         if stream_id not in self.streams:
             self.streams[stream_id] = {
@@ -175,7 +175,7 @@ class P2PQuicHandler:
                 "mode": "json_header", 
                 "file_info": None 
             }
-            print(f"Worker '{self.worker_id}': New stream {stream_id} created, mode=json_header")
+            # print(f"Worker '{self.worker_id}': New stream {stream_id} created, mode=json_header")
         
         stream_info = self.streams[stream_id]
         
@@ -188,7 +188,7 @@ class P2PQuicHandler:
 
         else: # mode is "json_header"
             stream_info["buffer"].extend(data)
-            print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header mode) buffer extended. Current buffer len: {len(stream_info['buffer'])}, end_stream: {event.end_stream}")
+            # print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header mode) buffer extended. Current buffer len: {len(stream_info['buffer'])}, end_stream: {event.end_stream}")
             while True:
                 buf = stream_info["buffer"]
                 newline_idx = buf.find(b"\n")
@@ -214,7 +214,7 @@ class P2PQuicHandler:
 
                 try:
                     msg = json.loads(line_bytes)
-                    print(f"Worker '{self.worker_id}': Stream {stream_id} parsed JSON: {msg.get('type', 'N/A_TYPE')}")
+                    # print(f"Worker '{self.worker_id}': Stream {stream_id} parsed JSON: {msg.get('type', 'N/A_TYPE')}")
                     msg_type = msg.get("type")
 
                     if msg_type == "benchmark_start":
@@ -232,7 +232,7 @@ class P2PQuicHandler:
                         if len(buf) > 0:
                             initial_file_data_len = len(buf)
                             stream_info["file_info"]["received_bytes"] += initial_file_data_len
-                            print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer for stream {stream_id}.")
+                            # print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer for stream {stream_id}.")
                         stream_info["buffer"].clear() # Clear buffer, it's for JSON only
                         # IMPORTANT: Do NOT break here if event.end_stream is true and buffer had data.
                         # The end_stream logic below needs to run.
@@ -296,7 +296,7 @@ class P2PQuicHandler:
                         "message": status_msg
                     })))
             elif len(stream_info["buffer"]) > 0 : # Stream ended, not in file_data mode, but buffer has data
-                print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with {len(stream_info['buffer'])} unparsed JSON buffer bytes: {stream_info['buffer'][:100]!r}. Attempting final parse.")
+                # print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with {len(stream_info['buffer'])} unparsed JSON buffer bytes: {stream_info['buffer'][:100]!r}. Attempting final parse.")
                 if stream_info["mode"] == "json_header":
                     try:
                         msg_bytes = bytes(stream_info["buffer"])
@@ -305,11 +305,12 @@ class P2PQuicHandler:
                     except json.JSONDecodeError:
                         print(f"Worker '{self.worker_id}': Final buffered data on stream {stream_id} was not valid JSON or was incomplete.")
             else:
-                 print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with empty buffer. No final processing needed.")
+                pass
+                 # print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with empty buffer. No final processing needed.")
             
             if stream_id in self.streams:
                 del self.streams[stream_id]
-                print(f"Worker '{self.worker_id}': Cleaned up stream {stream_id}.")
+                # print(f"Worker '{self.worker_id}': Cleaned up stream {stream_id}.")
 
     def handle_datagram(self, data: bytes):
         """Handle QUIC datagram (unreliable but fast)"""
@@ -380,12 +381,12 @@ class P2PQuicHandler:
             json_bytes = json.dumps(message_dict).encode() + b"\n"
             # IMPORTANT: Set end_stream=True for chat messages to ensure prompt delivery
             self.connection.send_stream_data(stream_id, json_bytes, end_stream=True)
-            print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(json_bytes)} bytes")
-            print(f"Worker '{self.worker_id}': Message content: {message_dict}")
+            # print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(json_bytes)} bytes")
+            # print(f"Worker '{self.worker_id}': Message content: {message_dict}")
         else:
             # Use QUIC datagram for fast unreliable delivery
             self.connection.send_datagram_frame(data)
-            print(f"Worker '{self.worker_id}': Sent unreliable datagram, length={len(data)} bytes")
+            # print(f"Worker '{self.worker_id}': Sent unreliable datagram, length={len(data)} bytes")
 
 class QuicServerDispatcher(asyncio.DatagramProtocol):
     """Dispatcher that handles both UDP hole-punching and QUIC connections"""
@@ -416,14 +417,14 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             return
             
         # Log all QUIC packets received
-        print(f"Worker '{self.worker_id}': Received UDP datagram from {addr}, length={len(data)} bytes")
+        # print(f"Worker '{self.worker_id}': Received UDP datagram from {addr}, length={len(data)} bytes")
         
         # Try to handle as QUIC packet
         now = time.time()
         
         if addr not in self.quic_connections:
             # This might be a new incoming QUIC connection
-            print(f"Worker '{self.worker_id}': New QUIC packet from {addr}, creating server connection")
+            # print(f"Worker '{self.worker_id}': New QUIC packet from {addr}, creating server connection")
             config = create_quic_configuration(is_client=False)
             # Properly extract the Destination Connection ID (DCID) length from the first long-header packet.
             # QUIC long header format: 1 byte flags, 4 bytes version, 1 byte DCID length, DCID bytes, 1 byte SCID length, SCID bytes, ...
@@ -503,18 +504,18 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             event = connection.next_event()
             if event is None:
                 break
-            # Enhanced Debug logging for events
-            event_type_name = type(event).__name__
-            log_msg = f"Worker '{self.worker_id}': QUIC_EVENT from {addr} for conn {connection.original_destination_connection_id!r}: {event_type_name}"
-            if hasattr(event, 'stream_id'):
-                log_msg += f", stream_id={event.stream_id}"
-            if hasattr(event, 'data') and event.data is not None: # Check if data is not None
-                 log_msg += f", data_len={len(event.data)}"
-            if hasattr(event, 'end_stream'):
-                log_msg += f", end_stream={event.end_stream}"
-            if event_type_name == "ConnectionTerminated":
-                log_msg += f", error_code={event.error_code}, reason_phrase='{event.reason_phrase}'"
-            print(log_msg)
+            # Enhanced Debug logging for events - disabled for less verbosity
+            # event_type_name = type(event).__name__
+            # log_msg = f"Worker '{self.worker_id}': QUIC_EVENT from {addr} for conn {connection.original_destination_connection_id!r}: {event_type_name}"
+            # if hasattr(event, 'stream_id'):
+            #     log_msg += f", stream_id={event.stream_id}"
+            # if hasattr(event, 'data') and event.data is not None: # Check if data is not None
+            #      log_msg += f", data_len={len(event.data)}"
+            # if hasattr(event, 'end_stream'):
+            #     log_msg += f", end_stream={event.end_stream}"
+            # if event_type_name == "ConnectionTerminated":
+            #     log_msg += f", error_code={event.error_code}, reason_phrase='{event.reason_phrase}'"
+            # print(log_msg)
             
             handler.handle_event(event)
             
@@ -527,10 +528,10 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
         for data, _ in connection.datagrams_to_send(now):
             self.transport.sendto(data, addr)
             datagrams_sent += 1
-            print(f"Worker '{self.worker_id}': Sent QUIC datagram to {addr}, length={len(data)} bytes")
+            # print(f"Worker '{self.worker_id}': Sent QUIC datagram to {addr}, length={len(data)} bytes")
             
-        if datagrams_sent == 0:
-            print(f"Worker '{self.worker_id}': No pending datagrams to send to {addr}")
+        # if datagrams_sent == 0:
+        #     print(f"Worker '{self.worker_id}': No pending datagrams to send to {addr}")
             
     def _update_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
         """Update QUIC timer for this connection"""
@@ -547,7 +548,7 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             
     def _handle_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
         """Handle QUIC timer expiry"""
-        print(f"Worker '{self.worker_id}': QUIC timer fired for {addr}")
+        # print(f"Worker '{self.worker_id}': QUIC timer fired for {addr}")
         now = time.time()
         connection.handle_timer(now)
         
@@ -562,7 +563,7 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
         if self.transport:
             message = f"P2P_HOLE_PUNCH_PING_FROM_{self.worker_id}_NUM_{ping_num}"
             self.transport.sendto(message.encode(), peer_addr)
-            print(f"Worker '{self.worker_id}': Sent UDP Hole Punch PING {ping_num} to {peer_addr}")
+            # print(f"Worker '{self.worker_id}': Sent UDP Hole Punch PING {ping_num} to {peer_addr}")
             
     def get_handler(self, addr: Tuple[str, int]) -> Optional[P2PQuicHandler]:
         """Get the handler for a specific peer address"""
@@ -699,7 +700,7 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
                 # Send current chunk, DO NOT set end_stream=True here
                 handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=False)
                 bytes_sent_on_stream += len(current_chunk_data)
-                print(f"Worker '{worker_id}': Sent chunk offset {offset}, len {len(current_chunk_data)} for stream {data_stream_id}. Total stream bytes sent: {bytes_sent_on_stream}")
+                # print(f"Worker '{worker_id}': Sent chunk offset {offset}, len {len(current_chunk_data)} for stream {data_stream_id}. Total stream bytes sent: {bytes_sent_on_stream}")
 
                 # Flush every chunk to ensure data flows immediately
                 if quic_dispatcher:
@@ -969,7 +970,7 @@ async def send_periodic_p2p_keep_alives():
                         "type": "p2p_keep_alive",
                         "from_worker_id": worker_id
                     }
-                    print(f"Worker '{worker_id}': Sending keep-alive to {current_p2p_peer_addr}")
+                    # print(f"Worker '{worker_id}': Sending keep-alive to {current_p2p_peer_addr}")
                     await handler.send_message(keep_alive_message, reliable=False)
                     
                     # Trigger sending
@@ -978,9 +979,11 @@ async def send_periodic_p2p_keep_alives():
                 except Exception as e:
                     print(f"Worker '{worker_id}': Error sending P2P keep-alive: {e}")
             else:
-                print(f"Worker '{worker_id}': No handler for peer {current_p2p_peer_addr}")
+                pass
+                # print(f"Worker '{worker_id}': No handler for peer {current_p2p_peer_addr}")
         else:
-            print(f"Worker '{worker_id}': Keep-alive skipped - dispatcher={quic_dispatcher is not None}, peer_addr={current_p2p_peer_addr}")
+            pass
+            # print(f"Worker '{worker_id}': Keep-alive skipped - dispatcher={quic_dispatcher is not None}, peer_addr={current_p2p_peer_addr}")
                     
     print(f"Worker '{worker_id}': P2P Keep-Alive sender task stopped.")
 
