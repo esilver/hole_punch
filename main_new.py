@@ -168,117 +168,121 @@ class P2PQuicHandler:
         
         print(f"Worker '{self.worker_id}': Received stream data on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}")
         
-        # Accumulate data for the stream
         if stream_id not in self.streams:
             self.streams[stream_id] = {
                 "buffer": bytearray(),
-                "mode": "json",  # Start in JSON mode
-                "benchmark_bytes": 0,
-                "benchmark_total": 0,
-                "benchmark_start_time": None
+                "mode": "json_header", # Waiting for benchmark_start JSON header or other JSON messages
+                "file_info": None # Will store file details if benchmark_start is received
             }
-            print(f"Worker '{self.worker_id}': New stream {stream_id} created")
+            print(f"Worker '{self.worker_id}': New stream {stream_id} created, mode=json_header")
         
         stream_info = self.streams[stream_id]
-        stream_info["buffer"].extend(data)
         
-        # If in benchmark mode, count bytes but skip JSON parsing
-        if stream_info["mode"] == "benchmark":
-            # Count all the raw data bytes
-            stream_info["benchmark_bytes"] += len(data)
-            # Report progress every 1MB
-            if stream_info["benchmark_bytes"] % (1024 * 1024) < len(data):
-                elapsed = time.monotonic() - stream_info["benchmark_start_time"]
-                speed_mbps = (stream_info["benchmark_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                print(f"Worker '{self.worker_id}': Benchmark receiving: {stream_info['benchmark_bytes'] / 1024:.0f} KB at {speed_mbps:.2f} MB/s")
-            
-            # Check if we have the end marker in the buffer (switch back to JSON mode to process it)
-            if b'"type": "benchmark_end"' in stream_info["buffer"]:
-                stream_info["mode"] = "json"
-                # Continue to process the JSON end marker below
-        
-        # Process any complete newline-delimited JSON messages in the buffer
-        while stream_info["mode"] == "json":
-            buf = stream_info["buffer"]
-            newline_idx = buf.find(b"\n")
-            if newline_idx == -1:
-                break  # No full message yet
-            line_bytes = bytes(buf[:newline_idx])
-            # Remove the processed line including the newline char
-            del buf[:newline_idx + 1]
-            if line_bytes:
+        if stream_info["mode"] == "file_data":
+            # Currently receiving raw file data
+            stream_info["buffer"].extend(data) # Temporarily buffer raw file data if it comes with end_stream
+            if stream_info["file_info"]: # Should always be true if in file_data mode
+                stream_info["file_info"]["received_bytes"] += len(data)
+                # Optional: UI progress update can be added here if desired (e.g., every N bytes)
+                # For now, just log server-side for larger chunks
+                if stream_info["file_info"]["received_bytes"] % (1024 * 1024) < len(data): # roughly every 1MB
+                    if stream_info["file_info"].get("start_time"):
+                        elapsed = time.monotonic() - stream_info["file_info"]["start_time"]
+                        speed_mbps = (stream_info["file_info"]["received_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        print(f"Worker '{self.worker_id}': File benchmark receiving ('{stream_info['file_info']['filename']}'), {stream_info['file_info']['received_bytes'] / 1024:.0f} KB at {speed_mbps:.2f} MB/s")
+            # Raw file data is not processed further here until end_stream
+        else: # mode is "json_header" or other future JSON-based modes
+            stream_info["buffer"].extend(data)
+            # Process any complete newline-delimited JSON messages in the buffer
+            while True:
+                buf = stream_info["buffer"]
+                newline_idx = buf.find(b"\n")
+                if newline_idx == -1:
+                    break  # No full JSON message yet
+                
+                line_bytes = bytes(buf[:newline_idx])
+                del buf[:newline_idx + 1] # Remove the processed line including the newline
+                
+                if not line_bytes: # Empty line, skip
+                    continue
+                
                 try:
                     msg = json.loads(line_bytes)
                     msg_type = msg.get("type")
-                    
-                    # Check if this starts a benchmark
+
                     if msg_type == "benchmark_start":
-                        stream_info["mode"] = "benchmark"
-                        stream_info["benchmark_total"] = msg.get("total_bytes", 0)
-                        stream_info["benchmark_start_time"] = time.monotonic()
-                        stream_info["from_worker_id"] = msg.get("from_worker_id")
-                        # Count any data bytes that are already in the buffer after the header
-                        remaining_in_buffer = len(stream_info["buffer"])
-                        if remaining_in_buffer > 0:
-                            stream_info["benchmark_bytes"] = remaining_in_buffer
-                            print(f"Worker '{self.worker_id}': Starting benchmark receive, expecting {stream_info['benchmark_total']} bytes, {remaining_in_buffer} bytes already in buffer")
-                        else:
-                            print(f"Worker '{self.worker_id}': Starting benchmark receive, expecting {stream_info['benchmark_total']} bytes")
+                        stream_info["mode"] = "file_data"
+                        stream_info["file_info"] = {
+                            "filename": msg.get("filename", "unknown_file"),
+                            "expected_total_size": msg.get("total_size", 0),
+                            "received_bytes": 0, 
+                            "start_time": time.monotonic(),
+                            "from_worker_id": msg.get("from_worker_id")
+                        }
+                        print(f"Worker '{self.worker_id}': Benchmark '{stream_info['file_info']['filename']}' started by {stream_info['file_info']['from_worker_id']}, expecting {stream_info['file_info']['expected_total_size']} bytes.")
                         
-                        # If we already have the end marker in buffer, we need to process it
-                        if b'"type": "benchmark_end"' in stream_info["buffer"]:
-                            # Continue processing to handle the end marker
-                            pass
-                        else:
-                            # Don't process this as a regular message
-                            continue
-                    
-                    # Otherwise process as normal message
-                    self.process_p2p_message(line_bytes, reliable=True)
+                        # The buffer `buf` (alias for stream_info["buffer"]) might contain the start of the file data after the header.
+                        if len(buf) > 0:
+                            initial_file_data_len = len(buf)
+                            stream_info["file_info"]["received_bytes"] += initial_file_data_len
+                            print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer.")
+                            # No need to log buf content here, it's raw binary.
+                        stream_info["buffer"].clear() # IMPORTANT: Clear buffer after processing header and initial file bytes
+                        break # Exit JSON processing loop, subsequent data on this stream is raw file data
+                    elif msg_type == "benchmark_cancelled":
+                        print(f"Worker '{self.worker_id}': Received benchmark_cancelled message on stream {stream_id}.")
+                        # Clean up stream, could also notify UI
+                        if stream_id in self.streams:
+                            del self.streams[stream_id]
+                        return # Stop processing this stream further
+                    else:
+                        # Process other standard P2P JSON messages
+                        self.process_p2p_message(line_bytes, reliable=True)
                 except json.JSONDecodeError:
-                    # Not JSON, treat as raw data
-                    pass
+                    print(f"Worker '{self.worker_id}': Received non-JSON line on stream {stream_id} in json_header mode: {line_bytes[:100]}...")
+                    pass 
         
-        # If the peer closed the stream
         if event.end_stream:
-            # Process any remaining JSON messages first
-            if stream_info["buffer"] and stream_info["mode"] == "json":
-                # Try to process remaining JSON messages
-                while True:
-                    buf = stream_info["buffer"]
-                    newline_idx = buf.find(b"\n")
-                    if newline_idx == -1:
-                        break
-                    line_bytes = bytes(buf[:newline_idx])
-                    del buf[:newline_idx + 1]
-                    if line_bytes:
-                        try:
-                            msg = json.loads(line_bytes)
-                            self.process_p2p_message(line_bytes, reliable=True)
-                        except json.JSONDecodeError:
-                            pass
-            
-            # Check if we were in benchmark mode when stream closed
-            if stream_info["mode"] == "benchmark" and stream_info.get("benchmark_start_time"):
-                # Benchmark completed
-                elapsed = time.monotonic() - stream_info["benchmark_start_time"]
-                total_mb = stream_info["benchmark_bytes"] / (1024 * 1024)
+            if stream_info["mode"] == "file_data" and stream_info["file_info"] and stream_info["file_info"].get("start_time") is not None:
+                file_info = stream_info["file_info"]
+                # If there's anything left in the stream_info["buffer"] when file_data mode ends,
+                # it's the very last piece of raw file data that came with the FIN.
+                if len(stream_info["buffer"]) > 0:
+                    print(f"Worker '{self.worker_id}': Consuming {len(stream_info['buffer'])} trailing raw bytes from buffer on stream {stream_id} end.")
+                    file_info["received_bytes"] += len(stream_info["buffer"]) # Add any trailing raw bytes
+                    stream_info["buffer"].clear()
+
+                elapsed = time.monotonic() - file_info["start_time"]
+                total_mb = file_info["received_bytes"] / (1024 * 1024)
                 speed_mbps = total_mb / elapsed if elapsed > 0 else 0
                 
-                from_id = stream_info.get("from_worker_id", "unknown")
-                status_msg = f"Benchmark Receive from {from_id} Complete: Received {stream_info['benchmark_bytes'] / 1024:.0f} KB in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
-                print(f"Worker '{self.worker_id}': {status_msg}")
-                
-                # Notify UI
+                from_peer_id_for_log = file_info.get("from_worker_id", "unknown_peer")
+
+                status_msg = f"Benchmark File Receive Complete: '{file_info['filename']}' ({file_info['received_bytes'] / (1024*1024):.2f} MB / {file_info['expected_total_size']/(1024*1024):.2f} MB) in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
+                print(f"Worker '{self.worker_id}': {status_msg} from {from_peer_id_for_log}")
+
                 global ui_websocket_clients
                 for ui_client_ws in list(ui_websocket_clients):
                     asyncio.create_task(ui_client_ws.send(json.dumps({
                         "type": "benchmark_status", 
                         "message": status_msg
                     })))
+            elif stream_info["buffer"]: 
+                print(f"Worker '{self.worker_id}': Stream {stream_id} ended in mode '{stream_info['mode']}' with {len(stream_info['buffer'])} unparsed bytes: {stream_info['buffer'][:100]}...")
+                # If it was expecting JSON, try to parse a final one
+                if stream_info["mode"] == "json_header":
+                    try:
+                        # There might not be a newline for the very last message if stream closes
+                        msg_bytes = bytes(stream_info["buffer"])
+                        json.loads(msg_bytes) # Just to see if it's valid JSON
+                        self.process_p2p_message(msg_bytes, reliable=True)
+                    except json.JSONDecodeError:
+                        print(f"Worker '{self.worker_id}': Final buffered data on stream {stream_id} was not valid JSON or was incomplete.")
             
-            del self.streams[stream_id]
-            
+            if stream_id in self.streams:
+                del self.streams[stream_id]
+                print(f"Worker '{self.worker_id}': Cleaned up stream {stream_id}.")
+
     def handle_datagram(self, data: bytes):
         """Handle QUIC datagram (unreliable but fast)"""
         self.process_p2p_message(data, reliable=False)
@@ -574,6 +578,13 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
 async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: int, ui_ws: websockets.WebSocketServerProtocol):
     global worker_id, quic_dispatcher, current_p2p_peer_addr
     
+    benchmark_file_url = os.environ.get("BENCHMARK_GCS_URL")
+    if not benchmark_file_url:
+        err_msg = "BENCHMARK_GCS_URL not set in environment. Cannot run file benchmark."
+        print(f"Worker '{worker_id}': {err_msg}")
+        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
+        return
+
     if not (quic_dispatcher and current_p2p_peer_addr):
         err_msg = "No active QUIC connection for benchmark."
         print(f"Worker '{worker_id}': {err_msg}")
@@ -587,88 +598,103 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
         await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
         return
         
-    print(f"Worker '{worker_id}': Starting QUIC Benchmark: Sending {size_kb}KB to {target_ip}:{target_port}")
-    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmark Send: Starting to send {size_kb}KB..."}))
-    
-    start_time = time.monotonic()
-    total_bytes = size_kb * 1024
+    print(f"Worker '{worker_id}': UI requested benchmark (nominal {size_kb}KB), will use file from {benchmark_file_url}")
+    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmark: Preparing to send file from {benchmark_file_url}..."}))
     
     try:
-        # Get a stream ID for sending data
-        if handler and handler.connection:
-            data_stream_id = handler.connection.get_next_available_stream_id()
-        else:
-            raise ConnectionError("Handler or connection not available to get stream ID for benchmark data.")
+        # 1. Download the file
+        print(f"Worker '{worker_id}': Downloading benchmark file from {benchmark_file_url}...")
+        download_start_time = time.monotonic()
+        response = requests.get(benchmark_file_url, timeout=180) 
+        response.raise_for_status()
+        file_content_bytes = response.content
+        actual_total_file_bytes = len(file_content_bytes)
+        file_name_from_url = benchmark_file_url.split('/')[-1] # Use actual filename from URL
+        download_duration = time.monotonic() - download_start_time
 
-        # Send a simple header with the total size
-        header = json.dumps({
+        download_status_msg = f"Downloaded '{file_name_from_url}' ({actual_total_file_bytes / (1024*1024):.2f} MB) in {download_duration:.2f}s. Sending via QUIC..."
+        print(f"Worker '{worker_id}': {download_status_msg}")
+        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": download_status_msg}))
+
+        # 2. Get a QUIC stream ID
+        if not (handler and handler.connection): # Should be redundant due to check above, but good practice
+            raise ConnectionError("Handler or connection not available for benchmark data stream.")
+        data_stream_id = handler.connection.get_next_available_stream_id()
+
+        quic_transfer_start_time = time.monotonic() 
+
+        # 3. Send benchmark_start header
+        header_payload = {
             "type": "benchmark_start",
-            "total_bytes": total_bytes,
+            "filename": file_name_from_url, # Send the actual filename
+            "total_size": actual_total_file_bytes, 
             "from_worker_id": worker_id
-        }).encode() + b"\n"
-        
-        handler.connection.send_stream_data(data_stream_id, header, end_stream=False)
-        
-        # Send the actual data as raw bytes (like TCP would)
-        # Generate data in larger chunks for efficiency, but not larger than total
-        chunk_size = min(65536, total_bytes)  # 64KB chunks or total size if smaller
-        bytes_sent = len(header)
-        
-        print(f"Worker '{worker_id}': Starting to send {total_bytes} bytes in {chunk_size} byte chunks")
-        
-        for offset in range(0, total_bytes, chunk_size):
-            if stop_signal_received or ui_ws.closed:
-                print(f"Worker '{worker_id}': Benchmark send cancelled")
-                await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark send cancelled."}))
-                break
-                
-            # Generate chunk of data
-            remaining = total_bytes - offset
-            current_chunk_size = min(chunk_size, remaining)
-            data_chunk = b'D' * current_chunk_size  # Simple data pattern
-            
-            # Send raw data
-            handler.connection.send_stream_data(data_stream_id, data_chunk, end_stream=False)
-            bytes_sent += current_chunk_size
-            
-            # Flush every 256KB (4 chunks) to balance latency and throughput
-            if offset % (chunk_size * 4) == 0:
-                now = time.time()
-                quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
-            
-            # Update progress every 256KB
-            if offset % (chunk_size * 4) == 0:  # Every 256KB
-                progress_pct = (bytes_sent / (total_bytes + len(header))) * 100
-                progress_msg = f"Benchmark Send: {progress_pct:.1f}% ({bytes_sent / 1024:.0f} KB sent)"
-                print(f"Worker '{worker_id}': {progress_msg}")
-                await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
-                
-        else:  # Loop completed
-            # Send end marker and close stream
-            end_marker = json.dumps({
-                "type": "benchmark_end",
-                "total_bytes": total_bytes,
-                "from_worker_id": worker_id
-            }).encode() + b"\n"
-            
-            handler.connection.send_stream_data(data_stream_id, end_marker, end_stream=True)
-            bytes_sent += len(end_marker)
+        }
+        header_bytes = json.dumps(header_payload).encode() + b"\n"
+        handler.connection.send_stream_data(data_stream_id, header_bytes, end_stream=False)
+        bytes_sent_on_stream = len(header_bytes)
+        print(f"Worker '{worker_id}': Sent benchmark_start header for '{file_name_from_url}' ({actual_total_file_bytes} bytes) on stream {data_stream_id}.")
 
-            # Final flush
-            now = time.time()
-            quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
+        # 4. Send the actual downloaded file data in chunks
+        chunk_size_for_sending = 65536 # 64KB
+        
+        if actual_total_file_bytes == 0:
+            print(f"Worker '{worker_id}': Benchmark file '{file_name_from_url}' is empty. Sending only header and closing stream.")
+        else:
+            print(f"Worker '{worker_id}': Sending file '{file_name_from_url}' ({actual_total_file_bytes} bytes) in {chunk_size_for_sending}-byte chunks over QUIC stream {data_stream_id}.")
+            for offset in range(0, actual_total_file_bytes, chunk_size_for_sending):
+                if stop_signal_received or ui_ws.closed:
+                    print(f"Worker '{worker_id}': Benchmark file send for '{file_name_from_url}' cancelled.")
+                    try:
+                        cancel_marker = json.dumps({"type":"benchmark_cancelled", "reason":"client_request"}).encode() + b"\n"
+                        handler.connection.send_stream_data(data_stream_id, cancel_marker, end_stream=True)
+                    except Exception as cancel_e:
+                        print(f"Worker '{worker_id}': Error sending CANCELLED marker: {cancel_e}")
+                        if hasattr(handler, 'connection') and handler.connection and not handler.connection.is_closed: # Check if connection exists and is not closed
+                           handler.connection.close(error_code=0, reason=b"benchmark_cancelled_by_sender") # error_code=0 (NO_ERROR) might be appropriate for app-level cancel
+                    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark file send cancelled."}))
+                    return
 
-            print(f"Worker '{worker_id}': Sent benchmark_end marker on stream {data_stream_id}")
-            
-            end_time = time.monotonic()
-            duration = end_time - start_time
-            throughput_mbps = (bytes_sent / (1024 * 1024)) / duration if duration > 0 else 0
-            final_msg = f"Benchmark Send Complete: Sent {bytes_sent / 1024:.0f} KB in {duration:.2f}s. Throughput: {throughput_mbps:.2f} MB/s"
-            print(f"Worker '{worker_id}': {final_msg}")
-            await ui_ws.send(json.dumps({"type": "benchmark_status", "message": final_msg}))
-            
-            return  # Exit function successfully
+                current_chunk_data = file_content_bytes[offset : offset + chunk_size_for_sending]
+                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=False)
+                bytes_sent_on_stream += len(current_chunk_data)
 
+                if quic_dispatcher and chunk_size_for_sending > 0 and (offset + len(current_chunk_data)) % (chunk_size_for_sending * 4) < len(current_chunk_data): # Flush approx every 256KB
+                    now_flush_time = time.time()
+                    quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_flush_time)
+                    
+                    progress_total_payload = actual_total_file_bytes + len(header_bytes) # For UI percentage against total expected payload
+                    progress_pct = (bytes_sent_on_stream / progress_total_payload) * 100 if progress_total_payload > 0 else 0
+                    progress_msg = f"Benchmark Send '{file_name_from_url}': {progress_pct:.1f}% ({bytes_sent_on_stream / (1024*1024):.0f} MB of {progress_total_payload / (1024*1024):.0f} MB total payload sent)"
+                    if os.environ.get("HP_DEBUG") == "1":
+                        print(f"Worker '{worker_id}': {progress_msg}")
+                    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
+        
+        # 5. Send final 0-length data with end_stream=True to close the stream gracefully
+        # This ensures FIN is sent for the stream.
+        handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
+        print(f"Worker '{worker_id}': Finished sending all data for '{file_name_from_url}'. Closing stream {data_stream_id} with end_stream=True.")
+
+        # 6. Final flush to ensure the last data and FIN are sent
+        now_final_flush_time = time.time()
+        if quic_dispatcher: 
+            quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_final_flush_time)
+
+        quic_transfer_duration = time.monotonic() - quic_transfer_start_time
+        
+        throughput_mbps = (actual_total_file_bytes / (1024 * 1024)) / quic_transfer_duration if quic_transfer_duration > 0 else 0
+        
+        final_msg = f"Benchmark File Send Complete: Sent '{file_name_from_url}' ({actual_total_file_bytes / (1024*1024):.2f} MB) in {quic_transfer_duration:.2f}s (QUIC transfer). Throughput: {throughput_mbps:.2f} MB/s. (Download took {download_duration:.2f}s)"
+        print(f"Worker '{worker_id}': {final_msg}")
+        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": final_msg}))
+            
+        return
+
+    except requests.exceptions.RequestException as req_e:
+        err_msg = f"Benchmark Error: Failed to download file from {benchmark_file_url}: {req_e}"
+        print(f"Worker '{worker_id}': {err_msg}")
+        if not ui_ws.closed: # Check if UI websocket is still open
+            await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
     except Exception as e:
         error_msg = f"Benchmark Send Error: {type(e).__name__} - {e}"
         print(f"Worker '{worker_id}': {error_msg}")
