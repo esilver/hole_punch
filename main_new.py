@@ -46,8 +46,7 @@ P2P_KEEP_ALIVE_INTERVAL_SEC = 15
 ui_websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
 
 # Benchmark related globals
-benchmark_sessions: Dict[str, Dict] = {}
-BENCHMARK_CHUNK_SIZE = 1024
+# (Removed benchmark_sessions - no longer needed with streaming approach)
 
 # STUN retry configuration
 STUN_MAX_RETRIES = int(os.environ.get("STUN_MAX_RETRIES", "3"))
@@ -171,14 +170,114 @@ class P2PQuicHandler:
         
         # Accumulate data for the stream
         if stream_id not in self.streams:
-            self.streams[stream_id] = bytearray()
-        self.streams[stream_id].extend(data)
+            self.streams[stream_id] = {
+                "buffer": bytearray(),
+                "mode": "json",  # Start in JSON mode
+                "benchmark_bytes": 0,
+                "benchmark_total": 0,
+                "benchmark_start_time": None
+            }
+            print(f"Worker '{self.worker_id}': New stream {stream_id} created")
         
-        # If stream is complete, process the message
+        stream_info = self.streams[stream_id]
+        stream_info["buffer"].extend(data)
+        
+        # If in benchmark mode, count bytes but skip JSON parsing
+        if stream_info["mode"] == "benchmark":
+            # Count all the raw data bytes
+            stream_info["benchmark_bytes"] += len(data)
+            # Report progress every 1MB
+            if stream_info["benchmark_bytes"] % (1024 * 1024) < len(data):
+                elapsed = time.monotonic() - stream_info["benchmark_start_time"]
+                speed_mbps = (stream_info["benchmark_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                print(f"Worker '{self.worker_id}': Benchmark receiving: {stream_info['benchmark_bytes'] / 1024:.0f} KB at {speed_mbps:.2f} MB/s")
+            
+            # Check if we have the end marker in the buffer (switch back to JSON mode to process it)
+            if b'"type": "benchmark_end"' in stream_info["buffer"]:
+                stream_info["mode"] = "json"
+                # Continue to process the JSON end marker below
+        
+        # Process any complete newline-delimited JSON messages in the buffer
+        while stream_info["mode"] == "json":
+            buf = stream_info["buffer"]
+            newline_idx = buf.find(b"\n")
+            if newline_idx == -1:
+                break  # No full message yet
+            line_bytes = bytes(buf[:newline_idx])
+            # Remove the processed line including the newline char
+            del buf[:newline_idx + 1]
+            if line_bytes:
+                try:
+                    msg = json.loads(line_bytes)
+                    msg_type = msg.get("type")
+                    
+                    # Check if this starts a benchmark
+                    if msg_type == "benchmark_start":
+                        stream_info["mode"] = "benchmark"
+                        stream_info["benchmark_total"] = msg.get("total_bytes", 0)
+                        stream_info["benchmark_start_time"] = time.monotonic()
+                        stream_info["from_worker_id"] = msg.get("from_worker_id")
+                        # Count any data bytes that are already in the buffer after the header
+                        remaining_in_buffer = len(stream_info["buffer"])
+                        if remaining_in_buffer > 0:
+                            stream_info["benchmark_bytes"] = remaining_in_buffer
+                            print(f"Worker '{self.worker_id}': Starting benchmark receive, expecting {stream_info['benchmark_total']} bytes, {remaining_in_buffer} bytes already in buffer")
+                        else:
+                            print(f"Worker '{self.worker_id}': Starting benchmark receive, expecting {stream_info['benchmark_total']} bytes")
+                        
+                        # If we already have the end marker in buffer, we need to process it
+                        if b'"type": "benchmark_end"' in stream_info["buffer"]:
+                            # Continue processing to handle the end marker
+                            pass
+                        else:
+                            # Don't process this as a regular message
+                            continue
+                    
+                    # Otherwise process as normal message
+                    self.process_p2p_message(line_bytes, reliable=True)
+                except json.JSONDecodeError:
+                    # Not JSON, treat as raw data
+                    pass
+        
+        # If the peer closed the stream
         if event.end_stream:
-            complete_data = bytes(self.streams[stream_id])
+            # Process any remaining JSON messages first
+            if stream_info["buffer"] and stream_info["mode"] == "json":
+                # Try to process remaining JSON messages
+                while True:
+                    buf = stream_info["buffer"]
+                    newline_idx = buf.find(b"\n")
+                    if newline_idx == -1:
+                        break
+                    line_bytes = bytes(buf[:newline_idx])
+                    del buf[:newline_idx + 1]
+                    if line_bytes:
+                        try:
+                            msg = json.loads(line_bytes)
+                            self.process_p2p_message(line_bytes, reliable=True)
+                        except json.JSONDecodeError:
+                            pass
+            
+            # Check if we were in benchmark mode when stream closed
+            if stream_info["mode"] == "benchmark" and stream_info.get("benchmark_start_time"):
+                # Benchmark completed
+                elapsed = time.monotonic() - stream_info["benchmark_start_time"]
+                total_mb = stream_info["benchmark_bytes"] / (1024 * 1024)
+                speed_mbps = total_mb / elapsed if elapsed > 0 else 0
+                
+                from_id = stream_info.get("from_worker_id", "unknown")
+                status_msg = f"Benchmark Receive from {from_id} Complete: Received {stream_info['benchmark_bytes'] / 1024:.0f} KB in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
+                print(f"Worker '{self.worker_id}': {status_msg}")
+                
+                # Notify UI
+                global ui_websocket_clients
+                for ui_client_ws in list(ui_websocket_clients):
+                    asyncio.create_task(ui_client_ws.send(json.dumps({
+                        "type": "benchmark_status", 
+                        "message": status_msg
+                    })))
+            
             del self.streams[stream_id]
-            self.process_p2p_message(complete_data, reliable=True)
             
     def handle_datagram(self, data: bytes):
         """Handle QUIC datagram (unreliable but fast)"""
@@ -186,7 +285,7 @@ class P2PQuicHandler:
         
     def process_p2p_message(self, data: bytes, reliable: bool):
         """Process P2P messages"""
-        global benchmark_sessions, ui_websocket_clients
+        global ui_websocket_clients
         
         message_str = data.decode(errors='ignore')
         try:
@@ -209,36 +308,9 @@ class P2PQuicHandler:
                 test_data_content = p2p_message.get("data")
                 print(f"Worker '{self.worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
                 
-            elif msg_type == "benchmark_chunk":
-                peer_addr_str = f"{from_id}"
-                session = benchmark_sessions.setdefault(peer_addr_str, {
-                    "received_bytes": 0,
-                    "received_chunks": 0,
-                    "start_time": time.monotonic(),
-                    "total_chunks": -1,
-                    "from_worker_id": from_id
-                })
-                
-                session["received_bytes"] += len(data)
-                session["received_chunks"] += 1
-                if session["received_chunks"] % 100 == 0:
-                    log_from_id = session.get('from_worker_id', 'unknown_peer')
-                    print(f"Worker '{self.worker_id}': Benchmark data from {log_from_id}: {session['received_chunks']} chunks, {session['received_bytes']/1024:.2f} KB")
-                    
             elif msg_type == "benchmark_end":
-                total_chunks_sent = p2p_message.get("total_chunks", 0)
-                peer_addr_str = f"{from_id}"
-                if peer_addr_str in benchmark_sessions:
-                    session = benchmark_sessions[peer_addr_str]
-                    session["total_chunks"] = total_chunks_sent
-                    duration = time.monotonic() - session["start_time"]
-                    throughput_kbps = (session["received_bytes"] / 1024) / duration if duration > 0 else 0
-                    log_from_id = session.get('from_worker_id', 'unknown_peer')
-                    status_msg = f"Benchmark Receive from {log_from_id} Complete: Received {session['received_chunks']}/{total_chunks_sent} chunks ({session['received_bytes']/1024:.2f} KB) in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
-                    print(f"Worker '{self.worker_id}': {status_msg}")
-                    for ui_client_ws in list(ui_websocket_clients):
-                        asyncio.create_task(ui_client_ws.send(json.dumps({"type": "benchmark_status", "message": status_msg})))
-                    del benchmark_sessions[peer_addr_str]
+                # This is now just a final marker processed in handle_stream_data
+                print(f"Worker '{self.worker_id}': Received benchmark_end marker from '{from_id}'")
                     
             elif msg_type == "p2p_keep_alive":
                 print(f"Worker '{self.worker_id}': Received P2P keep-alive from '{from_id}'")
@@ -273,8 +345,9 @@ class P2PQuicHandler:
         if reliable:
             # Use QUIC stream for reliable delivery
             stream_id = self.connection.get_next_available_stream_id()
-            self.connection.send_stream_data(stream_id, data, end_stream=True)
-            print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(data)} bytes")
+            json_bytes = json.dumps(message_dict).encode() + b"\n"
+            self.connection.send_stream_data(stream_id, json_bytes, end_stream=False)
+            print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(json_bytes)} bytes")
             print(f"Worker '{self.worker_id}': Message content: {message_dict}")
         else:
             # Use QUIC datagram for fast unreliable delivery
@@ -517,60 +590,85 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
     print(f"Worker '{worker_id}': Starting QUIC Benchmark: Sending {size_kb}KB to {target_ip}:{target_port}")
     await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmark Send: Starting to send {size_kb}KB..."}))
     
-    num_chunks = size_kb
-    dummy_chunk_content = b'B' * (BENCHMARK_CHUNK_SIZE - 50)
-    dummy_chunk_b64 = base64.b64encode(dummy_chunk_content).decode('ascii')
-    
     start_time = time.monotonic()
-    bytes_sent = 0
-    update_interval = max(1, num_chunks // 10)
+    total_bytes = size_kb * 1024
     
     try:
-        for i in range(num_chunks):
+        # Get a stream ID for sending data
+        if handler and handler.connection:
+            data_stream_id = handler.connection.get_next_available_stream_id()
+        else:
+            raise ConnectionError("Handler or connection not available to get stream ID for benchmark data.")
+
+        # Send a simple header with the total size
+        header = json.dumps({
+            "type": "benchmark_start",
+            "total_bytes": total_bytes,
+            "from_worker_id": worker_id
+        }).encode() + b"\n"
+        
+        handler.connection.send_stream_data(data_stream_id, header, end_stream=False)
+        
+        # Send the actual data as raw bytes (like TCP would)
+        # Generate data in larger chunks for efficiency, but not larger than total
+        chunk_size = min(65536, total_bytes)  # 64KB chunks or total size if smaller
+        bytes_sent = len(header)
+        
+        print(f"Worker '{worker_id}': Starting to send {total_bytes} bytes in {chunk_size} byte chunks")
+        
+        for offset in range(0, total_bytes, chunk_size):
             if stop_signal_received or ui_ws.closed:
                 print(f"Worker '{worker_id}': Benchmark send cancelled")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark send cancelled."}))
                 break
                 
-            payload = {
-                "type": "benchmark_chunk",
-                "seq": i,
-                "payload": dummy_chunk_b64,
-                "from_worker_id": worker_id
-            }
+            # Generate chunk of data
+            remaining = total_bytes - offset
+            current_chunk_size = min(chunk_size, remaining)
+            data_chunk = b'D' * current_chunk_size  # Simple data pattern
             
-            # Send as reliable stream data for benchmarking
-            await handler.send_message(payload, reliable=True)
+            # Send raw data
+            handler.connection.send_stream_data(data_stream_id, data_chunk, end_stream=False)
+            bytes_sent += current_chunk_size
             
-            # Trigger sending of QUIC packets
-            now = time.time()
-            quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
+            # Flush every 256KB (4 chunks) to balance latency and throughput
+            if offset % (chunk_size * 4) == 0:
+                now = time.time()
+                quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
             
-            bytes_sent += len(json.dumps(payload).encode())
-            
-            if (i + 1) % update_interval == 0:
-                progress_msg = f"Benchmark Send: Sent {i+1}/{num_chunks} chunks ({bytes_sent / 1024:.2f} KB)..."
+            # Update progress every 256KB
+            if offset % (chunk_size * 4) == 0:  # Every 256KB
+                progress_pct = (bytes_sent / (total_bytes + len(header))) * 100
+                progress_msg = f"Benchmark Send: {progress_pct:.1f}% ({bytes_sent / 1024:.0f} KB sent)"
                 print(f"Worker '{worker_id}': {progress_msg}")
                 await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
                 
         else:  # Loop completed
-            # Send benchmark end marker
-            end_payload = {"type": "benchmark_end", "total_chunks": num_chunks, "from_worker_id": worker_id}
-            await handler.send_message(end_payload, reliable=True)
+            # Send end marker and close stream
+            end_marker = json.dumps({
+                "type": "benchmark_end",
+                "total_bytes": total_bytes,
+                "from_worker_id": worker_id
+            }).encode() + b"\n"
             
-            # Ensure it's sent
+            handler.connection.send_stream_data(data_stream_id, end_marker, end_stream=True)
+            bytes_sent += len(end_marker)
+
+            # Final flush
             now = time.time()
             quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
-            
-            print(f"Worker '{worker_id}': Sent benchmark_end marker")
+
+            print(f"Worker '{worker_id}': Sent benchmark_end marker on stream {data_stream_id}")
             
             end_time = time.monotonic()
             duration = end_time - start_time
-            throughput_kbps = (bytes_sent / 1024) / duration if duration > 0 else 0
-            final_msg = f"Benchmark Send Complete: Sent {bytes_sent / 1024:.2f} KB in {duration:.2f}s. Throughput: {throughput_kbps:.2f} KB/s"
+            throughput_mbps = (bytes_sent / (1024 * 1024)) / duration if duration > 0 else 0
+            final_msg = f"Benchmark Send Complete: Sent {bytes_sent / 1024:.0f} KB in {duration:.2f}s. Throughput: {throughput_mbps:.2f} MB/s"
             print(f"Worker '{worker_id}': {final_msg}")
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": final_msg}))
             
+            return  # Exit function successfully
+
     except Exception as e:
         error_msg = f"Benchmark Send Error: {type(e).__name__} - {e}"
         print(f"Worker '{worker_id}': {error_msg}")
