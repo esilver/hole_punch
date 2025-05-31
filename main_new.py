@@ -24,9 +24,10 @@ from datetime import datetime, timedelta, timezone
 
 # QUIC imports
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection
+from aioquic.quic.connection import QuicConnection, QuicConnectionState
 from aioquic.quic.events import QuicEvent, StreamDataReceived, ConnectionIdIssued, DatagramFrameReceived, ConnectionTerminated
 from aioquic.tls import SessionTicket
+from aioquic.asyncio import QuicConnectionProtocol
 
 # --- Global Variables ---
 worker_id = str(uuid.uuid4())
@@ -139,265 +140,213 @@ def create_quic_configuration(is_client=True):
     
     return configuration
 
-class P2PQuicHandler:
-    """Handler for P2P QUIC connection events"""
+# P2P Application Stream Handler (Async)
+async def _async_handle_app_stream(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    source_peer_id: Optional[str], # Peer ID if known
+    source_peer_addr: Tuple[str, int],
+    is_client_role: bool  # Passed from the callback
+):
+    """Handle incoming P2P streams from peers (async)"""
+    global ui_websocket_clients, worker_id
+    local_worker_id = worker_id # Capture from global scope
     
-    def __init__(self, connection: QuicConnection, peer_addr: Tuple[str, int], 
-                 peer_id: Optional[str], is_client: bool):
-        self.connection = connection
-        self.peer_addr = peer_addr
-        self.peer_id = peer_id
-        self.is_client = is_client
-        self.worker_id = worker_id
-        self.streams = {}
-        print(f"Worker '{self.worker_id}': P2PQuicHandler created for {peer_addr} (is_client={is_client})")
-        
-    def handle_event(self, event: QuicEvent):
-        """Handle QUIC events"""
-        if isinstance(event, StreamDataReceived):
-            self.handle_stream_data(event)
-        elif isinstance(event, DatagramFrameReceived):
-            self.handle_datagram(event.data)
-        elif isinstance(event, ConnectionTerminated):
-            print(f"Worker '{self.worker_id}': QUIC connection to {self.peer_addr} terminated")
-            
-    def handle_stream_data(self, event: StreamDataReceived):
-        """Handle data received on a QUIC stream (reliable)"""
-        stream_id = event.stream_id
-        data = event.data
-        
-        # Initial raw log of what's received
-        # print(f"Worker '{self.worker_id}': RAW_STREAM_DATA on stream {stream_id}, length={len(data)}, end_stream={event.end_stream}, data_start: {data[:20]!r}")
-        
-        if stream_id not in self.streams:
-            self.streams[stream_id] = {
-                "buffer": bytearray(),
-                "mode": "json_header", 
-                "file_info": None 
-            }
-            # print(f"Worker '{self.worker_id}': New stream {stream_id} created, mode=json_header")
-        
-        stream_info = self.streams[stream_id]
-        
-        if stream_info["mode"] == "file_data":
-            if stream_info["file_info"]: 
-                stream_info["file_info"]["received_bytes"] += len(data)
-                # Progress logging moved to after potential mode switch for clarity
-            else: 
-                print(f"Worker '{self.worker_id}': CRITICAL_ERROR - stream {stream_id} in file_data mode but no file_info! Data: {data[:50]!r}")
+    # Get stream ID and check if it's client-initiated
+    stream_id = writer.get_extra_info('stream_id')
+    
+    # In QUIC, stream IDs indicate who initiated:
+    # Client-initiated: 0, 4, 8, 12... (bidirectional) or 2, 6, 10... (unidirectional)
+    # Server-initiated: 1, 5, 9, 13... (bidirectional) or 3, 7, 11... (unidirectional)
+    
+    is_client_initiated = (stream_id % 4) in [0, 2]
+    
+    # Use the passed client role status
+    we_are_client = is_client_role
+    
+    # Debug logging
+    print(f"Worker '{local_worker_id}': Stream handler called - Stream ID: {stream_id}, Client-initiated: {is_client_initiated}, We are client: {we_are_client}")
+    
+    # If we're the client and this is a client-initiated stream, it's our own stream
+    # This happens when the server sends data back on a stream we initiated
+    if we_are_client and is_client_initiated:
+        print(f"Worker '{local_worker_id}': Data received on our client-initiated stream {stream_id} from {source_peer_addr}")
+        # We might receive data back on our own stream (e.g., server echo)
+        # But for now, our protocol doesn't expect responses on chat/benchmark streams
+        # So we'll just return without processing
+        return
+    
+    # If we're the server and this is a server-initiated stream, it's our own stream
+    if not we_are_client and not is_client_initiated:
+        print(f"Worker '{local_worker_id}': Data received on our server-initiated stream {stream_id} from {source_peer_addr}")
+        # Similar to above - we don't expect responses on server-initiated streams
+        return
 
-        else: # mode is "json_header"
-            stream_info["buffer"].extend(data)
-            # print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header mode) buffer extended. Current buffer len: {len(stream_info['buffer'])}, end_stream: {event.end_stream}")
-            while True:
-                buf = stream_info["buffer"]
-                newline_idx = buf.find(b"\n")
-                if newline_idx == -1:
-                    if event.end_stream and len(buf) > 0: # Stream ended, no newline, try to parse anyway if in json_header
-                        print(f"Worker '{self.worker_id}': Stream {stream_id} (json_header) ended with data but no newline. Attempting parse of: {buf[:100]!r}")
-                        line_bytes = bytes(buf) # Process the whole buffer
-                        del buf[:] # Clear buffer
-                    else:
-                        break # No full JSON message yet, or buffer empty
-                else:
-                    line_bytes = bytes(buf[:newline_idx])
-                    del buf[:newline_idx + 1] 
-                
-                if not line_bytes: 
-                    continue
-                
-                # Guard before json.loads
-                if not line_bytes.lstrip().startswith(b'{'):
-                    print(f"Worker '{self.worker_id}': JSON_PARSE_GUARD - Stream {stream_id} got non-JSON first byte in line: {line_bytes[:60]!r}")
-                    # Potentially treat as an error or unexpected data
-                    continue # Skip this line
+    print(f"Worker '{local_worker_id}': New P2P stream accepted from {source_peer_addr} (Peer ID: {source_peer_id}). Stream ID: {stream_id}")
 
-                try:
-                    msg = json.loads(line_bytes)
-                    # print(f"Worker '{self.worker_id}': Stream {stream_id} parsed JSON: {msg.get('type', 'N/A_TYPE')}")
-                    msg_type = msg.get("type")
+    # Buffer for initial JSON message
+    file_info_for_stream = None
+    is_benchmark_stream = False
 
-                    if msg_type == "benchmark_start":
-                        stream_info["mode"] = "file_data"
-                        stream_info["file_info"] = {
-                            "filename": msg.get("filename", "unknown_file"),
-                            "expected_total_size": msg.get("total_size", 0),
-                            "received_bytes": 0, 
-                            "start_time": time.monotonic(),
-                            "from_worker_id": msg.get("from_worker_id")
-                        }
-                        print(f"Worker '{self.worker_id}': BENCHMARK_START stream {stream_id} ('{stream_info['file_info']['filename']}') by {stream_info['file_info'].get('from_worker_id', 'unknown')}, expecting {stream_info['file_info']['expected_total_size']} bytes. Mode switched to file_data.")
-                        
-                        # If buffer still has data after header, it's the start of the file
-                        if len(buf) > 0:
-                            initial_file_data_len = len(buf)
-                            stream_info["file_info"]["received_bytes"] += initial_file_data_len
-                            # print(f"Worker '{self.worker_id}': Consumed {initial_file_data_len} initial file bytes from header buffer for stream {stream_id}.")
-                        stream_info["buffer"].clear() # Clear buffer, it's for JSON only
-                        # IMPORTANT: Do NOT break here if event.end_stream is true and buffer had data.
-                        # The end_stream logic below needs to run.
-                        # If not end_stream, the next data will be handled by file_data mode.
-                        if not event.end_stream: # If stream is not ending with this packet, we're done with JSON loop
-                           break
-                        # If event.end_stream IS true, fall through to end_stream processing, buffer is now empty or contains trailing file data
-                    elif msg_type == "benchmark_cancelled":
-                        print(f"Worker '{self.worker_id}': Received benchmark_cancelled message on stream {stream_id}.")
-                        if stream_id in self.streams: 
-                            del self.streams[stream_id]
-                        return 
-                    else:
-                        self.process_p2p_message(line_bytes, reliable=True)
-                except json.JSONDecodeError as e:
-                    print(f"Worker '{self.worker_id}': JSON_DECODE_ERROR stream {stream_id} (json_header mode): {e} on data: {line_bytes[:100]!r}")
-                    pass 
-        
-        # After potential mode switch, if now in file_data, log progress
-        if stream_info["mode"] == "file_data" and stream_info["file_info"]:
-            current_mb_milestone = stream_info["file_info"]["received_bytes"] // (1024 * 1024)
-            # Calculate previous milestone based on bytes *before* adding current `data`
-            # This requires storing data length if we are to calculate it accurately here
-            # For simplicity, log if it's a new MB, less frequent if data chunks are large
-            if stream_info["file_info"].get("last_logged_mb", -1) < current_mb_milestone:
-                 if stream_info["file_info"].get("start_time"):
-                    elapsed = time.monotonic() - stream_info["file_info"]["start_time"]
-                    speed_mbps = (stream_info["file_info"]["received_bytes"] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    print(f"Worker '{self.worker_id}': FILE_PROGRESS stream {stream_id} ('{stream_info['file_info']['filename']}'): {stream_info['file_info']['received_bytes'] / (1024*1024):.2f} MB at {speed_mbps:.2f} MB/s")
-                    stream_info["file_info"]["last_logged_mb"] = current_mb_milestone
+    try:
+        # 1. Read the initial JSON header line
+        header_line_bytes = await reader.readline()
+        if not header_line_bytes:
+            print(f"Worker '{local_worker_id}': Stream from {source_peer_addr} closed before header.")
+            return
 
-
-        if event.end_stream:
-            print(f"Worker '{self.worker_id}': END_STREAM event for stream {stream_id}, current mode: {stream_info['mode']}")
-            if stream_info["mode"] == "file_data" and stream_info["file_info"] and stream_info["file_info"].get("start_time") is not None:
-                file_info = stream_info["file_info"]
-                
-                if len(stream_info["buffer"]) > 0: # This buffer should be empty in file_data mode after header
-                    print(f"Worker '{self.worker_id}': WARNING stream {stream_id} (file_data) ended with non-empty JSON buffer: {stream_info['buffer'][:100]!r}. This indicates a logic issue or unexpected data.")
-                    # Assuming this was meant to be raw file data if an error occurred in mode switch
-                    # For safety, we are NOT adding this to file_info["received_bytes"] unless explicitly decided
-                    # file_info["received_bytes"] += len(stream_info["buffer"]) 
-                    stream_info["buffer"].clear()
-
-                elapsed = time.monotonic() - file_info["start_time"]
-                total_mb_received = file_info["received_bytes"] / (1024 * 1024)
-                expected_total_mb = file_info["expected_total_size"] / (1024*1024)
-                speed_mbps = total_mb_received / elapsed if elapsed > 0 else 0
-                
-                from_peer_id_for_log = file_info.get("from_worker_id", "unknown_peer")
-                
-                print(f"Worker '{self.worker_id}': FILE_INFO_ON_END stream {stream_id}: Received Bytes: {file_info['received_bytes']}, Expected: {file_info['expected_total_size']}")
-
-                status_msg = f"Benchmark File Receive Complete: '{file_info['filename']}' ({total_mb_received:.2f} MB / {expected_total_mb:.2f} MB) in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s"
-                print(f"Worker '{self.worker_id}': FINAL_BENCHMARK_RECEIVE_STATUS: {status_msg} from {from_peer_id_for_log}")
-
-                global ui_websocket_clients
-                for ui_client_ws in list(ui_websocket_clients):
-                    asyncio.create_task(ui_client_ws.send(json.dumps({
-                        "type": "benchmark_status", 
-                        "message": status_msg
-                    })))
-            elif len(stream_info["buffer"]) > 0 : # Stream ended, not in file_data mode, but buffer has data
-                # print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with {len(stream_info['buffer'])} unparsed JSON buffer bytes: {stream_info['buffer'][:100]!r}. Attempting final parse.")
-                if stream_info["mode"] == "json_header":
-                    try:
-                        msg_bytes = bytes(stream_info["buffer"])
-                        json.loads(msg_bytes) 
-                        self.process_p2p_message(msg_bytes, reliable=True)
-                    except json.JSONDecodeError:
-                        print(f"Worker '{self.worker_id}': Final buffered data on stream {stream_id} was not valid JSON or was incomplete.")
-            else:
-                pass
-                 # print(f"Worker '{self.worker_id}': Stream {stream_id} (mode: {stream_info['mode']}) ended with empty buffer. No final processing needed.")
-            
-            if stream_id in self.streams:
-                del self.streams[stream_id]
-                # print(f"Worker '{self.worker_id}': Cleaned up stream {stream_id}.")
-
-    def handle_datagram(self, data: bytes):
-        """Handle QUIC datagram (unreliable but fast)"""
-        self.process_p2p_message(data, reliable=False)
-        
-    def process_p2p_message(self, data: bytes, reliable: bool):
-        """Process P2P messages"""
-        global ui_websocket_clients
-        
-        message_str = data.decode(errors='ignore')
+        # Attempt to parse header
         try:
-            p2p_message = json.loads(message_str)
-            msg_type = p2p_message.get("type")
-            from_id = p2p_message.get("from_worker_id")
-            
-            if msg_type == "chat_message":
-                content = p2p_message.get("content")
-                print(f"Worker '{self.worker_id}': Received P2P chat from '{from_id}': '{content}' (reliable={reliable})")
+            message = json.loads(header_line_bytes.decode().strip())
+            msg_type = message.get("type")
+            from_id = message.get("from_worker_id")
+
+            # print(f"Worker '{local_worker_id}': Stream header from {from_id or source_peer_addr}: Type '{msg_type}'")
+
+            if msg_type == "benchmark_start":
+                is_benchmark_stream = True
+                file_info_for_stream = {
+                    "filename": message.get("filename", "unknown_file"),
+                    "expected_total_size": message.get("total_size", 0),
+                    "received_bytes": 0,
+                    "start_time": time.monotonic(),
+                    "from_worker_id": from_id
+                }
+                print(f"Worker '{local_worker_id}': BENCHMARK_START (receive) on stream {writer.get_extra_info('stream_id')} for '{file_info_for_stream['filename']}', expecting {file_info_for_stream['expected_total_size']} bytes.")
+
+            elif msg_type == "chat_message":
+                content = message.get("content")
+                print(f"Worker '{local_worker_id}': Received P2P chat via stream from '{from_id}': '{content}'")
                 for ui_client_ws in list(ui_websocket_clients):
                     asyncio.create_task(ui_client_ws.send(json.dumps({
-                        "type": "p2p_message_received",
+                        "type": "p2p_message_received", 
                         "from_peer_id": from_id,
-                        "content": content,
-                        "reliable": reliable
+                        "content": content, 
+                        "reliable": True # Streams are reliable
                     })))
-                    
+
             elif msg_type == "p2p_test_data":
-                test_data_content = p2p_message.get("data")
-                print(f"Worker '{self.worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
-                
-            elif msg_type == "benchmark_end":
-                # This is now just a final marker processed in handle_stream_data
-                print(f"Worker '{self.worker_id}': Received benchmark_end marker from '{from_id}'")
-                    
-            elif msg_type == "p2p_keep_alive":
-                print(f"Worker '{self.worker_id}': Received P2P keep-alive from '{from_id}'")
-                
+                test_data_content = message.get("data")
+                print(f"Worker '{local_worker_id}': +++ P2P_TEST_DATA RECEIVED from '{from_id}': '{test_data_content}' +++")
+
             elif msg_type == "p2p_pairing_test":
-                original_timestamp = p2p_message.get("original_timestamp")
+                original_timestamp = message.get("original_timestamp")
                 rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
-                print(f"Worker '{self.worker_id}': Received p2p_pairing_test from '{from_id}'. RTT: {rtt:.2f} ms")
+                print(f"Worker '{local_worker_id}': Received p2p_pairing_test from '{from_id}'. RTT: {rtt:.2f} ms")
                 for ui_client_ws in list(ui_websocket_clients):
                     asyncio.create_task(ui_client_ws.send(json.dumps({
                         "type": "p2p_status_update",
                         "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"
                     })))
-                    
+
             elif msg_type == "p2p_pairing_echo":
-                original_timestamp = p2p_message.get("original_timestamp")
+                original_timestamp = message.get("original_timestamp")
                 rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
-                print(f"Worker '{self.worker_id}': Received p2p_pairing_echo from '{from_id}'. RTT: {rtt:.2f} ms")
+                print(f"Worker '{local_worker_id}': Received p2p_pairing_echo from '{from_id}'. RTT: {rtt:.2f} ms")
                 for ui_client_ws in list(ui_websocket_clients):
                     asyncio.create_task(ui_client_ws.send(json.dumps({
                         "type": "p2p_status_update",
                         "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"
                     })))
-                    
+
+            elif msg_type == "p2p_keep_alive":
+                # print(f"Worker '{local_worker_id}': Received P2P keep-alive from '{from_id}'")
+                pass
+
+            else:
+                print(f"Worker '{local_worker_id}': Unknown P2P message type '{msg_type}' on stream from {source_peer_addr}")
+
         except json.JSONDecodeError:
-            print(f"Worker '{self.worker_id}': Received non-JSON QUIC packet: {message_str[:100]}")
-            
-    async def send_message(self, message_dict: dict, reliable: bool = True):
-        """Send a P2P message either reliably (stream) or unreliably (datagram)"""
-        data = json.dumps(message_dict).encode()
-        
-        if reliable:
-            # Use QUIC stream for reliable delivery
-            stream_id = self.connection.get_next_available_stream_id()
-            json_bytes = json.dumps(message_dict).encode() + b"\n"
-            # IMPORTANT: Set end_stream=True for chat messages to ensure prompt delivery
-            self.connection.send_stream_data(stream_id, json_bytes, end_stream=True)
-            # print(f"Worker '{self.worker_id}': Sent reliable message on stream {stream_id}, length={len(json_bytes)} bytes")
-            # print(f"Worker '{self.worker_id}': Message content: {message_dict}")
-        else:
-            # Use QUIC datagram for fast unreliable delivery
-            self.connection.send_datagram_frame(data)
-            # print(f"Worker '{self.worker_id}': Sent unreliable datagram, length={len(data)} bytes")
+            print(f"Worker '{local_worker_id}': Non-JSON header on stream from {source_peer_addr}: {header_line_bytes[:100]!r}")
+            return
+
+        # 2. If it's a benchmark stream, read the file data
+        if is_benchmark_stream and file_info_for_stream:
+            while True:
+                chunk = await reader.read(65536) # Read in chunks
+                if not chunk: # EOF
+                    break
+                file_info_for_stream["received_bytes"] += len(chunk)
+                # Add progress logging every ~5MB
+                if file_info_for_stream["received_bytes"] % (1024 * 1024 * 5) < len(chunk):
+                    elapsed = time.monotonic() - file_info_for_stream["start_time"]
+                    speed_mbps = (file_info_for_stream["received_bytes"] / (1024*1024)) / elapsed if elapsed > 0 else 0
+                    print(f"Worker '{local_worker_id}': FILE_PROGRESS ('{file_info_for_stream['filename']}'): "
+                          f"{file_info_for_stream['received_bytes'] / (1024*1024):.2f} MB at {speed_mbps:.2f} MB/s")
+
+            # Benchmark receive complete
+            elapsed = time.monotonic() - file_info_for_stream["start_time"]
+            total_mb_received = file_info_for_stream["received_bytes"] / (1024 * 1024)
+            expected_total_mb = file_info_for_stream["expected_total_size"] / (1024*1024)
+            speed_mbps = total_mb_received / elapsed if elapsed > 0 else 0
+            from_peer_id_for_log = file_info_for_stream.get("from_worker_id", "unknown_peer")
+
+            status_msg = (f"Benchmark File Receive Complete: '{file_info_for_stream['filename']}' "
+                          f"({total_mb_received:.2f} MB / {expected_total_mb:.2f} MB expected) from {from_peer_id_for_log} "
+                          f"in {elapsed:.2f}s. Throughput: {speed_mbps:.2f} MB/s")
+            print(f"Worker '{local_worker_id}': FINAL_BENCHMARK_RECEIVE_STATUS: {status_msg}")
+            for ui_client_ws in list(ui_websocket_clients):
+                asyncio.create_task(ui_client_ws.send(json.dumps({
+                    "type": "benchmark_status", "message": status_msg
+                })))
+
+    except (ConnectionResetError, asyncio.IncompleteReadError) as e:
+        print(f"Worker '{local_worker_id}': Stream from {source_peer_addr} reset or closed unexpectedly: {e}")
+    except Exception as e:
+        print(f"Worker '{local_worker_id}': Error handling P2P stream from {source_peer_addr}: {type(e).__name__} - {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Don't automatically close the writer here
+        # The stream might be bidirectional and still in use
+        # Let the protocol handle stream lifecycle
+        pass
+
+# P2PQuicHandler class has been removed - functionality moved to _async_handle_app_stream and QuicConnectionProtocol
+
+# Create the synchronous callback for aioquic
+def quic_protocol_stream_handler_callback(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+):
+    """Synchronous stream handler callback for QuicConnectionProtocol"""
+    global quic_dispatcher
+    peer_addr = writer.get_extra_info('peername')
+    
+    peer_id = None
+    is_client_role = False  # Default
+    
+    # Retrieve the QuicConnectionProtocol instance associated with this stream.
+    # For aioquic, `writer.transport` is a `QuicStreamAdapter` (see
+    # aioquic.asyncio.protocol.QuicStreamAdapter).  It exposes the parent
+    # `QuicConnectionProtocol` through its public `protocol` attribute.
+    # (Older versions used a protected `_protocol`, so we keep that as a
+    #  fallback for compatibility.)
+    qcp_instance = getattr(writer.transport, "protocol", None) or getattr(writer.transport, "_protocol", None)
+
+    if qcp_instance and hasattr(qcp_instance, "_quic") and qcp_instance._quic:
+        is_client_role = qcp_instance._quic._is_client
+    
+    if quic_dispatcher and peer_addr:
+        peer_id = quic_dispatcher.peer_ids_by_addr.get(peer_addr)
+
+    # Launch the async task, passing the correctly determined client role status
+    asyncio.create_task(_async_handle_app_stream(reader, writer, peer_id, peer_addr, is_client_role))
 
 class QuicServerDispatcher(asyncio.DatagramProtocol):
-    """Dispatcher that handles both UDP hole-punching and QUIC connections"""
+    """Dispatcher that handles both UDP hole-punching and QUIC connections using QuicConnectionProtocol"""
     
-    def __init__(self, worker_id_val: str):
+    def __init__(self, worker_id_val: str, application_stream_handler_cb):
         self.worker_id = worker_id_val
         self.transport: Optional[asyncio.DatagramTransport] = None
-        self.quic_connections: Dict[Tuple[str, int], QuicConnection] = {}
-        self.handlers: Dict[Tuple[str, int], P2PQuicHandler] = {}
-        self.timers: Dict[Tuple[str, int], asyncio.TimerHandle] = {}
-        print(f"Worker '{self.worker_id}': QuicServerDispatcher created")
+        # Store QuicConnectionProtocol instances per peer address
+        self.peer_protocols: Dict[Tuple[str, int], QuicConnectionProtocol] = {}
+        # Store peer IDs associated with an address
+        self.peer_ids_by_addr: Dict[Tuple[str, int], str] = {}
+        # The app callback for new streams
+        self.application_stream_handler_callback = application_stream_handler_cb
+        # Store datagram handler tasks
+        self.datagram_handler_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
+        print(f"Worker '{self.worker_id}': QuicServerDispatcher (using QuicConnectionProtocol) created")
         
     def connection_made(self, transport: asyncio.DatagramTransport):
         global quic_dispatcher
@@ -407,156 +356,242 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
         print(f"Worker '{self.worker_id}': UDP listener active on {local_addr} (Internal Port: {INTERNAL_UDP_PORT})")
         
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-        """Handle incoming UDP datagrams"""
-        global current_p2p_peer_addr, current_p2p_peer_id
-        
-        # Check if it's a hole-punch ping (non-QUIC)
+        """Handle incoming UDP datagrams and route to QuicConnectionProtocol"""
+
+        # Check for hole-punch pings (non-QUIC)
         message_str = data.decode(errors='ignore')
         if "P2P_PING_FROM_" in message_str or "P2P_HOLE_PUNCH_PING_FROM_" in message_str:
-            print(f"Worker '{self.worker_id}': !!! P2P UDP Ping received from {addr}: {message_str} !!!")
+            print(f"Worker '{self.worker_id}': UDP Ping received from {addr}: {message_str}")
             return
+
+        # Debug logging to track protocol lookup
+        print(f"Worker '{self.worker_id}': datagram_received from {addr}. Current peer_protocols keys: {list(self.peer_protocols.keys())}")
+        protocol = self.peer_protocols.get(addr)
+
+        if protocol:
+            print(f"Worker '{self.worker_id}': Found existing protocol for {addr}. Is client: {protocol._quic._is_client if hasattr(protocol, '_quic') and protocol._quic else 'N/A'}")
+            protocol.datagram_received(data, addr) # QuicConnectionProtocol handles 'now' internally via loop
+        else:
+            print(f"Worker '{self.worker_id}': No existing protocol found for {addr}. Checking if this should create server-side protocol...")
             
-        # Log all QUIC packets received
-        # print(f"Worker '{self.worker_id}': Received UDP datagram from {addr}, length={len(data)} bytes")
-        
-        # Try to handle as QUIC packet
-        now = time.time()
-        
-        if addr not in self.quic_connections:
-            # This might be a new incoming QUIC connection
-            # print(f"Worker '{self.worker_id}': New QUIC packet from {addr}, creating server connection")
-            config = create_quic_configuration(is_client=False)
-            # Properly extract the Destination Connection ID (DCID) length from the first long-header packet.
-            # QUIC long header format: 1 byte flags, 4 bytes version, 1 byte DCID length, DCID bytes, 1 byte SCID length, SCID bytes, ...
-            # Reference: RFC 9000 §17.2
-            if len(data) >= 6:  # Need at least flags (1) + version (4) + DCID len (1)
-                dcid_length = data[5]
-                dcid_start = 6
-                dcid_end = dcid_start + dcid_length
-                if len(data) >= dcid_end:
-                    dcid = data[dcid_start:dcid_end]
+            # Check if we're already tracking this as a peer (might have initiated connection to them)
+            if addr in self.peer_ids_by_addr:
+                print(f"Worker '{self.worker_id}': WARNING: Received packet from known peer {self.peer_ids_by_addr[addr]} at {addr} but no protocol found!")
+                print(f"Worker '{self.worker_id}': This suggests the client protocol was lost. Skipping server creation.")
+                return
+            
+            # Potentially a new incoming QUIC connection (server role)
+            # print(f"Worker '{self.worker_id}': New QUIC source {addr}, attempting to create server protocol.")
+            try:
+                # Parse the Original Destination Connection ID (ODCID) from the incoming packet
+                # This is required for server-side QuicConnection initialization
+                odcid = None
+                
+                if len(data) > 0 and (data[0] & 0x80):  # Check if it's a long header (Initial packet)
+                    if len(data) >= 6:  # Minimum for flags, version, and DCID_len
+                        # Skip version (4 bytes after flags)
+                        dcid_len = data[5]
+                        dcid_end_offset = 6 + dcid_len
+                        
+                        if len(data) >= dcid_end_offset:
+                            odcid = data[6:dcid_end_offset]
+                        else:
+                            print(f"Worker '{self.worker_id}': Packet from {addr} too short for stated DCID length.")
+                            return
+                    else:
+                        print(f"Worker '{self.worker_id}': Packet from {addr} too short for Long Header essentials.")
+                        return
                 else:
-                    # Malformed packet ‑ DCID length longer than available bytes; fall back to random CID
-                    dcid = os.urandom(8)
+                    # Short header, not an initial packet for a new connection
+                    print(f"Worker '{self.worker_id}': Received short header packet from unknown source {addr}. Ignoring.")
+                    return
+                
+                if odcid is None:
+                    print(f"Worker '{self.worker_id}': Could not parse ODCID from initial packet from {addr}. Ignoring.")
+                    return
+                
+                config = create_quic_configuration(is_client=False)  # Server-side config
+                
+                # Create QuicConnection with the parsed ODCID
+                quic_connection = QuicConnection(
+                    configuration=config,
+                    original_destination_connection_id=odcid
+                )
+
+                # The stream_handler callback needs context about the peer
+                protocol = QuicConnectionProtocol(quic_connection, stream_handler=self.application_stream_handler_callback)
+                protocol.connection_made(self.transport)  # IMPORTANT: Give it the transport
+                protocol.datagram_received(data, addr)    # Feed the first packet
+
+                self.peer_protocols[addr] = protocol
+                print(f"Worker '{self.worker_id}': Added SERVER protocol to peer_protocols[{addr}]")
+                # Start datagram handler task
+                self.datagram_handler_tasks[addr] = asyncio.create_task(
+                    self._handle_datagrams_for_protocol(protocol, addr)
+                )
+                print(f"Worker '{self.worker_id}': Created new server-side QuicConnectionProtocol for {addr} with ODCID {odcid.hex()}")
+
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error creating server protocol for {addr}: {type(e).__name__} - {e}")
+                import traceback
+                traceback.print_exc()
+        
+    async def initiate_quic_connection(self, peer_addr: Tuple[str, int], peer_id: str):
+        """Initiate a QUIC connection to a peer (client role) using QuicConnectionProtocol"""
+        global current_p2p_peer_id, current_p2p_peer_addr # Update global P2P state
+
+        if peer_addr in self.peer_protocols:
+            print(f"Worker '{self.worker_id}': Protocol for {peer_id} at {peer_addr} already exists.")
+            existing_protocol = self.peer_protocols[peer_addr]
+            if (hasattr(existing_protocol, '_quic') and existing_protocol._quic and
+                existing_protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+                print(f"Worker '{self.worker_id}': Existing protocol to {peer_id} seems healthy. Proceeding with P2P test.")
+                # Update globals if this is a re-connection attempt via rendezvous
+                current_p2p_peer_id = peer_id
+                current_p2p_peer_addr = peer_addr
+                await self.send_pairing_test_to_protocol(existing_protocol, peer_id, peer_addr)
+                return
             else:
-                # Packet too short to contain DCID length; use random CID
-                dcid = os.urandom(8)
-            
-            connection = QuicConnection(
-                configuration=config,
-                original_destination_connection_id=dcid
-            )
-            self.quic_connections[addr] = connection
-            self.handlers[addr] = P2PQuicHandler(connection, addr, None, is_client=False)
-            
-        connection = self.quic_connections[addr]
-        connection.receive_datagram(data, addr, now)
-        
-        # Log connection state
-        # The following line caused an AttributeError because aioquic's QuicConnection
-        # does not have direct is_connected, is_closing, is_closed attributes.
-        # Connection state should be tracked via QUIC events (e.g., ConnectionEstablished, ConnectionTerminated).
-        # For now, we'll comment out this problematic log.
-        # print(f"Worker '{self.worker_id}': QUIC connection state for {addr}: connected={connection.is_connected}, closing={connection.is_closing}, closed={connection.is_closed}")
-        
-        # Process QUIC events
-        self._process_quic_events(connection, addr)
-        
-        # Send any pending datagrams
-        self._send_pending_datagrams(connection, addr, now)
-        
-        # Update timer
-        self._update_timer(connection, addr)
-        
-    def initiate_quic_connection(self, peer_addr: Tuple[str, int], peer_id: str):
-        """Initiate a QUIC connection to a peer"""
-        global current_p2p_peer_id, current_p2p_peer_addr
-        
-        print(f"Worker '{self.worker_id}': Initiating QUIC connection to {peer_id} at {peer_addr}")
-        
-        # Update globals
+                print(f"Worker '{self.worker_id}': Existing protocol to {peer_id} not healthy. Will try to re-initiate.")
+                # Clean up the old protocol
+                self._cleanup_protocol(peer_addr)
+
+        print(f"Worker '{self.worker_id}': Initiating new QUIC (client) QuicConnectionProtocol to {peer_id} at {peer_addr}")
         current_p2p_peer_id = peer_id
         current_p2p_peer_addr = peer_addr
-        
-        # Create client QUIC connection
+        self.peer_ids_by_addr[peer_addr] = peer_id
+
         config = create_quic_configuration(is_client=True)
-        connection = QuicConnection(configuration=config)
-        self.quic_connections[peer_addr] = connection
-        self.handlers[peer_addr] = P2PQuicHandler(connection, peer_addr, peer_id, is_client=True)
-        
-        # Start handshake
+        quic_connection = QuicConnection(configuration=config)
+
+        # Use the same stream handler callback
+        protocol = QuicConnectionProtocol(quic_connection, stream_handler=self.application_stream_handler_callback)
+        protocol.connection_made(self.transport)
+
+        self.peer_protocols[peer_addr] = protocol
+        print(f"Worker '{self.worker_id}': Added CLIENT protocol to peer_protocols[{peer_addr}]")
+        # Start datagram handler task
+        self.datagram_handler_tasks[peer_addr] = asyncio.create_task(
+            self._handle_datagrams_for_protocol(protocol, peer_addr)
+        )
+
+        # Start the QUIC handshake (this method is on QuicConnection, accessed via _quic)
         now = time.time()
-        connection.connect(peer_addr, now)
+        protocol._quic.connect(peer_addr, now) # This populates data to be sent
+        self._flush_protocol_datagrams(protocol, peer_addr)
+
+        print(f"Worker '{self.worker_id}': QUIC client handshake initiated with {peer_id} at {peer_addr}.")
+        await self.send_pairing_test_to_protocol(protocol, peer_id, peer_addr)
         
-        # Send initial packets
-        self._send_pending_datagrams(connection, peer_addr, now)
-        
-        # Set up timer
-        self._update_timer(connection, peer_addr)
-        
-    def _process_quic_events(self, connection: QuicConnection, addr: Tuple[str, int]):
-        """Process QUIC events"""
-        handler = self.handlers.get(addr)
-        if not handler:
+    async def send_pairing_test_to_protocol(self, protocol: QuicConnectionProtocol, peer_id_to_test: str, peer_addr: Tuple[str, int]):
+        """Helper to send a pairing test message"""
+        if not (hasattr(protocol, '_quic') and protocol._quic and
+                protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+            print(f"Worker '{self.worker_id}': Cannot send pairing test to {peer_id_to_test}, protocol unhealthy or closed (state: {protocol._quic._state if hasattr(protocol, '_quic') and protocol._quic else 'N/A'}).")
             return
-            
-        while True:
-            event = connection.next_event()
-            if event is None:
+
+        # Send a pairing test datagram
+        pairing_test_message = {
+            "type": "p2p_pairing_test", 
+            "from_worker_id": self.worker_id, 
+            "original_timestamp": time.time()
+        }
+        try:
+            protocol._quic.send_datagram_frame(json.dumps(pairing_test_message).encode())
+            self._flush_protocol_datagrams(protocol, peer_addr) # Use the passed peer_addr
+            print(f"Worker '{self.worker_id}': Sent pairing test datagram to {peer_id_to_test}.")
+        except Exception as e:
+            print(f"Worker '{self.worker_id}': Error sending pairing test datagram to {peer_id_to_test}: {e}")
+
+    def _flush_protocol_datagrams(self, protocol: QuicConnectionProtocol, peer_addr: Tuple[str, int]):
+        """Flush pending datagrams for a protocol (mainly for initial packets or explicit datagram sends)"""
+        if self.transport and hasattr(protocol, '_quic'):
+            now = time.time()
+            for data_to_send, _ in protocol._quic.datagrams_to_send(now):
+                self.transport.sendto(data_to_send, peer_addr)
+
+    def get_protocol_for_peer(self, peer_addr: Tuple[str, int]) -> Optional[QuicConnectionProtocol]:
+        return self.peer_protocols.get(peer_addr)
+    
+    def _cleanup_protocol(self, addr: Tuple[str, int]):
+        """Clean up protocol and associated resources"""
+        print(f"Worker '{self.worker_id}': Starting cleanup for protocol at {addr}")
+        
+        if addr in self.datagram_handler_tasks:
+            task = self.datagram_handler_tasks.pop(addr)
+            if not task.done():
+                task.cancel()
+        
+        if addr in self.peer_protocols:
+            protocol_to_close = self.peer_protocols.pop(addr)
+            was_client = protocol_to_close._quic._is_client if hasattr(protocol_to_close, '_quic') and protocol_to_close._quic else 'unknown'
+            print(f"Worker '{self.worker_id}': Removed {'CLIENT' if was_client else 'SERVER'} protocol from peer_protocols[{addr}]")
+            if (hasattr(protocol_to_close, '_quic') and protocol_to_close._quic and
+                protocol_to_close._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+                protocol_to_close._quic.close(error_code=0x00, reason_phrase=b"cleanup")
+        
+        if addr in self.peer_ids_by_addr:
+            del self.peer_ids_by_addr[addr]
+        
+        print(f"Worker '{self.worker_id}': Cleaned up protocol for {addr}")
+    
+    async def _handle_datagrams_for_protocol(self, protocol: QuicConnectionProtocol, peer_addr: Tuple[str, int]):
+        """Handle incoming QUIC datagrams for a specific protocol"""
+        global ui_websocket_clients, worker_id
+        peer_id = self.peer_ids_by_addr.get(peer_addr)
+        print(f"Worker '{self.worker_id}': Datagram handler active for {peer_addr}, known peer ID: {peer_id}")
+        
+        while (hasattr(protocol, '_quic') and protocol._quic and
+               protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+            try:
+                # Fetch and process events one-by-one (next_event returns a single QuicEvent or None)
+                event = protocol._quic.next_event()
+                while event is not None:
+                    if isinstance(event, DatagramFrameReceived):
+                        # Handle the datagram
+                        data = event.data
+                        message_str = data.decode(errors='ignore')
+                        try:
+                            p2p_message = json.loads(message_str)
+                            msg_type = p2p_message.get("type")
+                            from_id = p2p_message.get("from_worker_id")
+                            
+                            if msg_type == "p2p_pairing_test":
+                                original_timestamp = p2p_message.get("original_timestamp")
+                                rtt = (time.time() - original_timestamp) * 1000 if original_timestamp else -1
+                                print(f"Worker '{self.worker_id}': Received p2p_pairing_test datagram from '{from_id}'. RTT: {rtt:.2f} ms")
+                                for ui_client_ws in list(ui_websocket_clients):
+                                    asyncio.create_task(ui_client_ws.send(json.dumps({
+                                        "type": "p2p_status_update",
+                                        "message": f"Pairing test with {from_id[:8]} successful! RTT: {rtt:.2f}ms"
+                                    })))
+                            
+                            elif msg_type == "p2p_keep_alive":
+                                # Keep-alive received – no action required beyond keeping connection alive
+                                pass
+                            
+                            elif msg_type == "chat_message":
+                                content = p2p_message.get("content")
+                                print(f"Worker '{self.worker_id}': Received P2P chat datagram from '{from_id}': '{content}'")
+                                for ui_client_ws in list(ui_websocket_clients):
+                                    asyncio.create_task(ui_client_ws.send(json.dumps({
+                                        "type": "p2p_message_received",
+                                        "from_peer_id": from_id,
+                                        "content": content,
+                                        "reliable": False  # Datagrams are unreliable
+                                    })))
+                        except json.JSONDecodeError:
+                            print(f"Worker '{self.worker_id}': Received non-JSON QUIC datagram: {message_str[:100]}")
+                    # Fetch next pending event
+                    event = protocol._quic.next_event()
+
+                # Small delay to yield control back to the event loop and avoid busy-waiting
+                await asyncio.sleep(0.1)  # Check periodically
+            except Exception as e:
+                print(f"Worker '{self.worker_id}': Error in datagram handler for {peer_addr}: {e}")
                 break
-            # Enhanced Debug logging for events - disabled for less verbosity
-            # event_type_name = type(event).__name__
-            # log_msg = f"Worker '{self.worker_id}': QUIC_EVENT from {addr} for conn {connection.original_destination_connection_id!r}: {event_type_name}"
-            # if hasattr(event, 'stream_id'):
-            #     log_msg += f", stream_id={event.stream_id}"
-            # if hasattr(event, 'data') and event.data is not None: # Check if data is not None
-            #      log_msg += f", data_len={len(event.data)}"
-            # if hasattr(event, 'end_stream'):
-            #     log_msg += f", end_stream={event.end_stream}"
-            # if event_type_name == "ConnectionTerminated":
-            #     log_msg += f", error_code={event.error_code}, reason_phrase='{event.reason_phrase}'"
-            # print(log_msg)
-            
-            handler.handle_event(event)
-            
-    def _send_pending_datagrams(self, connection: QuicConnection, addr: Tuple[str, int], now: float):
-        """Send any pending QUIC datagrams"""
-        if not self.transport:
-            return
-            
-        datagrams_sent = 0
-        for data, _ in connection.datagrams_to_send(now):
-            self.transport.sendto(data, addr)
-            datagrams_sent += 1
-            # print(f"Worker '{self.worker_id}': Sent QUIC datagram to {addr}, length={len(data)} bytes")
-            
-        # if datagrams_sent == 0:
-        #     print(f"Worker '{self.worker_id}': No pending datagrams to send to {addr}")
-            
-    def _update_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
-        """Update QUIC timer for this connection"""
-        # Cancel existing timer
-        if addr in self.timers:
-            self.timers[addr].cancel()
-            
-        # Get next timer
-        timer = connection.get_timer()
-        if timer is not None:
-            loop = asyncio.get_event_loop()
-            handle = loop.call_at(timer, self._handle_timer, connection, addr)
-            self.timers[addr] = handle
-            
-    def _handle_timer(self, connection: QuicConnection, addr: Tuple[str, int]):
-        """Handle QUIC timer expiry"""
-        # print(f"Worker '{self.worker_id}': QUIC timer fired for {addr}")
-        now = time.time()
-        connection.handle_timer(now)
         
-        # Send any resulting datagrams
-        self._send_pending_datagrams(connection, addr, now)
-        
-        # Update timer
-        self._update_timer(connection, addr)
+        print(f"Worker '{self.worker_id}': Datagram handler task for {peer_addr} ending")
         
     def send_hole_punch_ping(self, peer_addr: Tuple[str, int], ping_num: int):
         """Send UDP hole punch ping"""
@@ -565,29 +600,36 @@ class QuicServerDispatcher(asyncio.DatagramProtocol):
             self.transport.sendto(message.encode(), peer_addr)
             # print(f"Worker '{self.worker_id}': Sent UDP Hole Punch PING {ping_num} to {peer_addr}")
             
-    def get_handler(self, addr: Tuple[str, int]) -> Optional[P2PQuicHandler]:
-        """Get the handler for a specific peer address"""
-        return self.handlers.get(addr)
+    # get_handler method removed - use get_protocol_for_peer instead
         
     def error_received(self, exc: Exception):
         print(f"Worker '{self.worker_id}': UDP listener error: {exc}")
+        # Clean up all protocols
+        for addr in list(self.peer_protocols.keys()):
+            self._cleanup_protocol(addr)
         
     def connection_lost(self, exc: Optional[Exception]):
         global quic_dispatcher
         print(f"Worker '{self.worker_id}': UDP listener connection lost: {exc if exc else 'Closed normally'}")
+        # Clean up all protocols
+        for addr in list(self.peer_protocols.keys()):
+            self._cleanup_protocol(addr)
+        
         if self == quic_dispatcher:
             quic_dispatcher = None
 
-def handle_shutdown_signal(signum, frame):
+def handle_shutdown_signal(signum, _frame):
     global stop_signal_received, quic_dispatcher
     print(f"Shutdown signal ({signum}) received. Worker '{worker_id}' attempting graceful shutdown.")
     stop_signal_received = True
     
     # Close QUIC connections
     if quic_dispatcher:
-        for addr, connection in quic_dispatcher.quic_connections.items():
+        for addr, protocol in list(quic_dispatcher.peer_protocols.items()):
             try:
-                connection.close()
+                if (hasattr(protocol, '_quic') and protocol._quic and
+                    protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+                    protocol._quic.close()
                 print(f"Worker '{worker_id}': Closed QUIC connection to {addr}")
             except Exception as e:
                 print(f"Worker '{worker_id}': Error closing QUIC connection: {e}")
@@ -596,7 +638,7 @@ def handle_shutdown_signal(signum, frame):
     for ws_client in list(ui_websocket_clients):
         asyncio.create_task(ws_client.close(reason="Server shutting down"))
 
-async def process_http_request(path: str, request_headers: Headers) -> Optional[Tuple[int, Headers, bytes]]:
+async def process_http_request(path: str, _request_headers: Headers) -> Optional[Tuple[int, Headers, bytes]]:
     if path == "/ui_ws":
         return None
     if path == "/":
@@ -617,116 +659,117 @@ async def process_http_request(path: str, request_headers: Headers) -> Optional[
         return (404, Headers([("Content-Type", "text/plain")]), b"Not Found")
 
 async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: int, ui_ws: websockets.WebSocketServerProtocol):
-    global worker_id, quic_dispatcher, current_p2p_peer_addr
+    global worker_id, quic_dispatcher
     
     benchmark_file_url = os.environ.get("BENCHMARK_GCS_URL")
     if not benchmark_file_url:
-        err_msg = "BENCHMARK_GCS_URL not set in environment. Cannot run file benchmark."
+        err_msg = "BENCHMARK_GCS_URL not set. Cannot run file benchmark."
         print(f"Worker '{worker_id}': {err_msg}")
-        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
+        if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
         return
 
-    if not (quic_dispatcher and current_p2p_peer_addr):
-        err_msg = "No active QUIC connection for benchmark."
-        print(f"Worker '{worker_id}': {err_msg}")
-        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
-        return
-        
-    handler = quic_dispatcher.get_handler(current_p2p_peer_addr)
-    if not handler:
-        err_msg = "No QUIC handler for current peer."
-        print(f"Worker '{worker_id}': {err_msg}")
-        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
-        return
-        
-    print(f"Worker '{worker_id}': UI requested benchmark (nominal {size_kb}KB), will use file from {benchmark_file_url}")
-    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmark: Preparing to send file from {benchmark_file_url}..."}))
+    # Use target_ip and target_port to identify the peer
+    peer_addr_for_benchmark = (target_ip, target_port)
     
+    if not quic_dispatcher:
+        err_msg = "QUIC dispatcher not available."
+        print(f"Worker '{worker_id}': {err_msg}")
+        if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
+        return
+        
+    protocol = quic_dispatcher.get_protocol_for_peer(peer_addr_for_benchmark)
+    if not protocol or not hasattr(protocol, '_quic') or not protocol._quic or \
+       protocol._quic._state in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]:
+        err_msg = f"No active or healthy QUIC protocol for target {target_ip}:{target_port}."
+        print(f"Worker '{worker_id}': {err_msg}")
+        if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {err_msg}"}))
+        return
+    
+    print(f"Worker '{worker_id}': Benchmark using protocol for {peer_addr_for_benchmark}. Is client: {protocol._quic._is_client}")
+        
+    print(f"Worker '{worker_id}': UI requested benchmark of {size_kb}KB to {target_ip}:{target_port} (file: {benchmark_file_url})")
+    if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Benchmarking: Preparing file from {benchmark_file_url}..."}))
+    
+    file_name_from_url = "unknown_file"
+    actual_total_file_bytes = 0
+    download_duration = 0.0
+
     try:
-        # 1. Download the file
-        print(f"Worker '{worker_id}': Downloading benchmark file from {benchmark_file_url}...")
+        print(f"Worker '{worker_id}': Downloading benchmark file: {benchmark_file_url}")
         download_start_time = time.monotonic()
-        response = requests.get(benchmark_file_url, timeout=180) 
+        response = requests.get(benchmark_file_url, stream=True, timeout=180)
         response.raise_for_status()
         file_content_bytes = response.content
         actual_total_file_bytes = len(file_content_bytes)
-        file_name_from_url = benchmark_file_url.split('/')[-1] # Use actual filename from URL
+        file_name_from_url = benchmark_file_url.split('/')[-1]
         download_duration = time.monotonic() - download_start_time
 
-        download_status_msg = f"Downloaded '{file_name_from_url}' ({actual_total_file_bytes / (1024*1024):.2f} MB) in {download_duration:.2f}s. Sending via QUIC..."
+        download_status_msg = f"Downloaded '{file_name_from_url}' ({actual_total_file_bytes / (1024*1024):.2f} MB) in {download_duration:.2f}s. Preparing QUIC stream..."
         print(f"Worker '{worker_id}': {download_status_msg}")
-        await ui_ws.send(json.dumps({"type": "benchmark_status", "message": download_status_msg}))
+        if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": download_status_msg}))
 
-        # 2. Get a QUIC stream ID
-        if not (handler and handler.connection): # Should be redundant due to check above, but good practice
-            raise ConnectionError("Handler or connection not available for benchmark data stream.")
-        data_stream_id = handler.connection.get_next_available_stream_id()
+        if protocol._quic._state in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]: # Re-check after download
+            raise ConnectionAbortedError("QUIC connection became invalid during file download.")
 
+        data_stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+        print(f"Worker '{worker_id}': Got stream ID {data_stream_id} from protocol (is_client: {protocol._quic._is_client})")
         quic_transfer_start_time = time.monotonic() 
 
-        # 3. Send benchmark_start header
-        header_payload = {
-            "type": "benchmark_start",
-            "filename": file_name_from_url, # Send the actual filename
-            "total_size": actual_total_file_bytes, 
-            "from_worker_id": worker_id
-        }
-        header_bytes = json.dumps(header_payload).encode() + b"\n"
-        handler.connection.send_stream_data(data_stream_id, header_bytes, end_stream=False)
-        bytes_sent_on_stream = len(header_bytes)
-        print(f"Worker '{worker_id}': Sent benchmark_start header for '{file_name_from_url}' ({actual_total_file_bytes} bytes) on stream {data_stream_id}.")
+        if stop_signal_received or ui_ws.closed:
+            print(f"Worker '{worker_id}': Benchmark for '{file_name_from_url}' cancelled before QUIC send.")
+            if not ui_ws.closed: await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark cancelled."}))
+            return
 
-        # 4. Send the actual downloaded file data in chunks
-        chunk_size_for_sending = 65536 # 64KB
-        
+        header_payload = {"type": "benchmark_start", "filename": file_name_from_url, "total_size": actual_total_file_bytes, "from_worker_id": worker_id}
+        header_bytes = json.dumps(header_payload).encode() + b"\n"
+        protocol._quic.send_stream_data(data_stream_id, header_bytes, end_stream=False)
+        bytes_sent_on_stream = len(header_bytes)
+        print(f"Worker '{worker_id}': Sent benchmark_start header on stream {data_stream_id}.")
+        await asyncio.sleep(0)
+
+        # 4. Send the actual downloaded file data
         if actual_total_file_bytes == 0:
             print(f"Worker '{worker_id}': Benchmark file '{file_name_from_url}' is empty. Will send header and then 0-byte FIN.")
         else:
-            print(f"Worker '{worker_id}': Sending file '{file_name_from_url}' ({actual_total_file_bytes} bytes) in {chunk_size_for_sending}-byte chunks over QUIC stream {data_stream_id}.")
-            for offset in range(0, actual_total_file_bytes, chunk_size_for_sending):
-                if stop_signal_received or ui_ws.closed:
-                    print(f"Worker '{worker_id}': Benchmark file send for '{file_name_from_url}' cancelled.")
-                    try:
-                        cancel_marker = json.dumps({"type":"benchmark_cancelled", "reason":"client_request"}).encode() + b"\n"
-                        handler.connection.send_stream_data(data_stream_id, cancel_marker, end_stream=True)
-                    except Exception as cancel_e:
-                        print(f"Worker '{worker_id}': Error sending CANCELLED marker: {cancel_e}")
-                        if hasattr(handler, 'connection') and handler.connection and not handler.connection.is_closed: # Check if connection exists and is not closed
-                           handler.connection.close(error_code=0, reason=b"benchmark_cancelled_by_sender") # error_code=0 (NO_ERROR) might be appropriate for app-level cancel
-                    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark file send cancelled."}))
-                    return
+            print(f"Worker '{worker_id}': Sending entire file '{file_name_from_url}' ({actual_total_file_bytes} bytes) over QUIC stream {data_stream_id}.")
+            
+            if stop_signal_received or ui_ws.closed:
+                print(f"Worker '{worker_id}': Benchmark file send for '{file_name_from_url}' cancelled.")
+                try:
+                    cancel_marker = json.dumps({"type":"benchmark_cancelled", "reason":"client_request"}).encode() + b"\n"
+                    protocol._quic.send_stream_data(data_stream_id, cancel_marker, end_stream=True)
+                except Exception as cancel_e:
+                    print(f"Worker '{worker_id}': Error sending CANCELLED marker: {cancel_e}")
+                    if (protocol._quic and
+                        protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
+                       protocol._quic.close(error_code=0, reason_phrase=b"benchmark_cancelled_by_sender")
+                await ui_ws.send(json.dumps({"type": "benchmark_status", "message": "Benchmark file send cancelled."}))
+                return
 
-                current_chunk_data = file_content_bytes[offset : offset + chunk_size_for_sending]
-                # Send current chunk, DO NOT set end_stream=True here
-                handler.connection.send_stream_data(data_stream_id, current_chunk_data, end_stream=False)
-                bytes_sent_on_stream += len(current_chunk_data)
-                # print(f"Worker '{worker_id}': Sent chunk offset {offset}, len {len(current_chunk_data)} for stream {data_stream_id}. Total stream bytes sent: {bytes_sent_on_stream}")
-
-                # Flush every chunk to ensure data flows immediately
-                if quic_dispatcher:
-                    now_flush_time = time.time()
-                    quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_flush_time)
-                    # Allow event loop to process outgoing packets
-                    await asyncio.sleep(0)
-                    
-                    progress_total_payload = actual_total_file_bytes + len(header_bytes) # For UI percentage against total expected payload
-                    progress_pct = (bytes_sent_on_stream / progress_total_payload) * 100 if progress_total_payload > 0 else 0
-                    progress_msg = f"Benchmark Send '{file_name_from_url}': {progress_pct:.1f}% ({bytes_sent_on_stream / (1024*1024):.0f} MB of {progress_total_payload / (1024*1024):.0f} MB total payload sent)"
-                    if os.environ.get("HP_DEBUG") == "1":
-                        print(f"Worker '{worker_id}': {progress_msg}")
-                    await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
+            # Send entire file content at once - QUIC will handle segmentation
+            protocol._quic.send_stream_data(data_stream_id, file_content_bytes, end_stream=False)
+            bytes_sent_on_stream += len(file_content_bytes)
+            
+            # Flush to ensure data starts transmitting
+            if quic_dispatcher:
+                quic_dispatcher._flush_protocol_datagrams(protocol, peer_addr_for_benchmark)
+            
+            # Allow event loop to process
+            await asyncio.sleep(0)
+            
+            progress_msg = f"Benchmark Send '{file_name_from_url}': Entire {actual_total_file_bytes / (1024*1024):.2f} MB queued for transmission"
+            print(f"Worker '{worker_id}': {progress_msg}")
+            await ui_ws.send(json.dumps({"type": "benchmark_status", "message": progress_msg}))
         
-        # 5. After loop (or if file was empty), send final 0-length data with end_stream=True
-        print(f"Worker '{worker_id}': All file data chunks sent for '{file_name_from_url}'. Sending 0-byte frame with end_stream=True on stream {data_stream_id}.")
-        handler.connection.send_stream_data(data_stream_id, b'', end_stream=True)
-        # bytes_sent_on_stream += 0 # No change for 0-byte data
+        # 5. Send final 0-length data with end_stream=True
+        print(f"Worker '{worker_id}': All file data sent for '{file_name_from_url}'. Sending 0-byte frame with end_stream=True on stream {data_stream_id}.")
+        protocol._quic.send_stream_data(data_stream_id, b'', end_stream=True)
 
         # 6. Final flush to ensure the last data and FIN are sent
         print(f"Worker '{worker_id}': Attempting final flush for stream {data_stream_id}.")
         await asyncio.sleep(0.01) # Tiny sleep to allow event loop to process outgoing if busy
-        now_final_flush_time = time.time()
         if quic_dispatcher: 
-            quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now_final_flush_time)
+            quic_dispatcher._flush_protocol_datagrams(protocol, peer_addr_for_benchmark)
         print(f"Worker '{worker_id}': Final flush executed for stream {data_stream_id}.")
 
         quic_transfer_duration = time.monotonic() - quic_transfer_start_time
@@ -750,7 +793,7 @@ async def benchmark_send_quic_data(target_ip: str, target_port: int, size_kb: in
         if not ui_ws.closed:
             await ui_ws.send(json.dumps({"type": "benchmark_status", "message": f"Error: {error_msg}"}))
 
-async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, path: str):
+async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, _path: str):
     global ui_websocket_clients, worker_id, current_p2p_peer_id, quic_dispatcher, current_p2p_peer_addr
     ui_websocket_clients.add(websocket)
     print(f"Worker '{worker_id}': UI WebSocket client connected from {websocket.remote_address}")
@@ -778,21 +821,30 @@ async def ui_websocket_handler(websocket: websockets.WebSocketServerProtocol, pa
                     elif not content:
                         await websocket.send(json.dumps({"type": "error", "message": "Cannot send empty message."}))
                     else:
-                        handler = quic_dispatcher.get_handler(current_p2p_peer_addr)
-                        if handler:
+                        protocol = quic_dispatcher.get_protocol_for_peer(current_p2p_peer_addr)
+                        if (protocol and protocol._quic and
+                            protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
                             print(f"Worker '{worker_id}': Sending P2P message '{content}' to peer {current_p2p_peer_id} (reliable={reliable})")
                             p2p_message = {
                                 "type": "chat_message",
                                 "from_worker_id": worker_id,
                                 "content": content
                             }
-                            await handler.send_message(p2p_message, reliable=reliable)
+                            
+                            if reliable:
+                                # Send via stream
+                                stream_id = protocol._quic.get_next_available_stream_id()
+                                print(f"Worker '{worker_id}': Sending chat on stream {stream_id} (is_client: {protocol._quic._is_client})")
+                                json_bytes = json.dumps(p2p_message).encode() + b"\n"
+                                protocol._quic.send_stream_data(stream_id, json_bytes, end_stream=True)
+                            else:
+                                # Send via datagram
+                                protocol._quic.send_datagram_frame(json.dumps(p2p_message).encode())
                             
                             # Trigger sending
-                            now = time.time()
-                            quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
+                            quic_dispatcher._flush_protocol_datagrams(protocol, current_p2p_peer_addr)
                         else:
-                            await websocket.send(json.dumps({"type": "error", "message": "QUIC handler not available."}))
+                            await websocket.send(json.dumps({"type": "error", "message": "QUIC protocol not available."}))
                         
                 elif msg_type == "ui_client_hello":
                     print(f"Worker '{worker_id}': UI Client says hello.")
@@ -918,22 +970,9 @@ async def start_udp_hole_punch(peer_udp_ip: str, peer_udp_port: int, peer_worker
         if worker_id < peer_worker_id:
             # This side acts as the client-initiator for the QUIC handshake
             print(f"Worker '{worker_id}': Lexicographically first. Initiating QUIC connection to '{peer_worker_id}'.")
-            quic_dispatcher.initiate_quic_connection(current_p2p_peer_addr, peer_worker_id)
+            await quic_dispatcher.initiate_quic_connection(current_p2p_peer_addr, peer_worker_id)
 
-            # Send pairing-test once we have a handler (after initiate_quic_connection registered it)
-            handler = quic_dispatcher.get_handler(current_p2p_peer_addr)
-            if handler:
-                print(f"Worker '{worker_id}': Sending initial p2p_pairing_test to '{peer_worker_id}'.")
-                pairing_test_message = {
-                    "type": "p2p_pairing_test",
-                    "from_worker_id": worker_id,
-                    "timestamp": time.time()
-                }
-                await handler.send_message(pairing_test_message, reliable=False)
-
-                # Flush the datagrams immediately
-                now = time.time()
-                quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
+            # Pairing test is already sent in initiate_quic_connection
         else:
             # We are the responder; do NOT initiate a duplicate client connection – wait for peer's handshake
             print(f"Worker '{worker_id}': Lexicographically second. Waiting for peer '{peer_worker_id}' to initiate QUIC connection.")
@@ -963,24 +1002,24 @@ async def send_periodic_p2p_keep_alives():
         await asyncio.sleep(P2P_KEEP_ALIVE_INTERVAL_SEC)
         
         if quic_dispatcher and current_p2p_peer_addr:
-            handler = quic_dispatcher.get_handler(current_p2p_peer_addr)
-            if handler:
+            protocol = quic_dispatcher.get_protocol_for_peer(current_p2p_peer_addr)
+            if (protocol and protocol._quic and
+                protocol._quic._state not in [QuicConnectionState.CLOSING, QuicConnectionState.DRAINING, QuicConnectionState.TERMINATED]):
                 try:
                     keep_alive_message = {
                         "type": "p2p_keep_alive",
                         "from_worker_id": worker_id
                     }
                     # print(f"Worker '{worker_id}': Sending keep-alive to {current_p2p_peer_addr}")
-                    await handler.send_message(keep_alive_message, reliable=False)
+                    protocol._quic.send_datagram_frame(json.dumps(keep_alive_message).encode())
                     
                     # Trigger sending
-                    now = time.time()
-                    quic_dispatcher._send_pending_datagrams(handler.connection, current_p2p_peer_addr, now)
+                    quic_dispatcher._flush_protocol_datagrams(protocol, current_p2p_peer_addr)
                 except Exception as e:
                     print(f"Worker '{worker_id}': Error sending P2P keep-alive: {e}")
             else:
                 pass
-                # print(f"Worker '{worker_id}': No handler for peer {current_p2p_peer_addr}")
+                # print(f"Worker '{worker_id}': No protocol for peer {current_p2p_peer_addr}")
         else:
             pass
             # print(f"Worker '{worker_id}': Keep-alive skipped - dispatcher={quic_dispatcher is not None}, peer_addr={current_p2p_peer_addr}")
@@ -1027,7 +1066,7 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                 if stun_success and not udp_listener_active:
                     try:
                         _transport, _protocol = await loop.create_datagram_endpoint(
-                            lambda: QuicServerDispatcher(worker_id),
+                            lambda: QuicServerDispatcher(worker_id, quic_protocol_stream_handler_callback),
                             local_addr=('0.0.0.0', INTERNAL_UDP_PORT)
                         )
                         await asyncio.sleep(0.1)
