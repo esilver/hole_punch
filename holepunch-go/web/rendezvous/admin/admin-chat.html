@@ -314,10 +314,10 @@
                 const response = await fetch('/api/workers');
                 const data = await response.json();
                 workers = {};
-                data.forEach(worker => {
-                    workers[worker.id] = worker;
+                data.workers.forEach(worker => {
+                    workers[worker.worker_id] = worker;
                 });
-                updateWorkerList(data);
+                updateWorkerList(data.workers);
             } catch (error) {
                 console.error('Error fetching workers:', error);
                 showError('Failed to fetch workers');
@@ -330,15 +330,15 @@
             
             workersList.forEach(worker => {
                 const workerEl = document.createElement('div');
-                const isConnected = worker.stun_reported_udp_ip ? true : false;
-                workerEl.className = `worker-item ${isConnected ? '' : 'disconnected'} ${worker.id === selectedWorkerId ? 'active' : ''}`;
+                const isConnected = worker.has_udp_endpoint;
+                workerEl.className = `worker-item ${isConnected ? '' : 'disconnected'} ${worker.worker_id === selectedWorkerId ? 'active' : ''}`;
                 workerEl.innerHTML = `
-                    <span class="worker-id">${worker.id}</span>
+                    <span class="worker-id">${worker.worker_id}</span>
                     <span class="worker-status ${isConnected ? 'connected' : 'disconnected'}"></span>
                 `;
                 
                 if (isConnected) {
-                    workerEl.onclick = () => selectWorker(worker.id);
+                    workerEl.onclick = () => selectWorker(worker.worker_id);
                 }
                 
                 workerListEl.appendChild(workerEl);
@@ -461,7 +461,7 @@
             const messageEl = document.createElement('div');
             messageEl.className = `message ${from}`;
             
-            const time = timestamp instanceof Date ? timestamp.toLocaleTimeString() : new Date().toLocaleTimeString();
+            const time = (typeof timestamp === 'number') ? new Date(timestamp * 1000).toLocaleTimeString() : new Date().toLocaleTimeString();
             
             messageEl.innerHTML = `
                 <div class="message-content">
@@ -483,7 +483,7 @@
             if (!message || !chatWs || chatWs.readyState !== WebSocket.OPEN) return;
             
             chatWs.send(JSON.stringify({
-                type: 'send_message',
+                type: 'chat_message',
                 content: message
             }));
             

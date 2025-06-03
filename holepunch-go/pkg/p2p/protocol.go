@@ -203,15 +203,11 @@ func (p *P2PProtocol) handlePairingEcho(msg *models.P2PMessage, addr *net.UDPAdd
 	clients := p.state.UIWebsocketClients
 	p.state.Mu.RUnlock()
 
-	// Use Python-compatible message type
+	// Use message type that matches the UI expectation
 	uiMsg := map[string]interface{}{
 		"type": "p2p_status_update",
-		"payload": map[string]interface{}{
-			"status":  "pairing_test_success",
-			"test_id": msg.FromWorkerID,
-			"rtt_ms":  int64(rttMs), // Store as int if Python UI expects int
-			"success": true,
-		},
+		"message": fmt.Sprintf("Pairing test successful! RTT: %.2fms", rttMs),
+		"peer_id": msg.FromWorkerID,
 	}
 
 	for _, client := range clients {

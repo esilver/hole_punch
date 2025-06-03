@@ -442,8 +442,25 @@
         }
         
         function handleWebSocketMessage(data) {
-            if (data.type === 'workers_update') {
-                updateUI({ workers: data.payload });
+            switch (data.type) {
+                case 'worker_connected':
+                    addEventLog(`Worker connected: ${data.worker_id.substring(0, 8)}...`);
+                    refreshWorkers();
+                    break;
+                case 'worker_disconnected':
+                    addEventLog(`Worker disconnected: ${data.worker_id.substring(0, 8)}...`);
+                    // Remove from selection if selected
+                    selectedWorkers = selectedWorkers.filter(id => id !== data.worker_id);
+                    updateSelectedWorkersDisplay();
+                    refreshWorkers();
+                    break;
+                case 'worker_udp_updated':
+                    addEventLog(`Worker UDP updated: ${data.worker_id.substring(0, 8)}... → ${data.udp_ip}:${data.udp_port}`);
+                    refreshWorkers();
+                    break;
+                case 'connection_initiated':
+                    addEventLog(`Connection initiated: ${data.worker_a_id.substring(0, 8)}... ↔ ${data.worker_b_id.substring(0, 8)}...`);
+                    break;
             }
         }
         
@@ -646,8 +663,8 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        worker_id_1: selectedWorkers[0],
-                        worker_id_2: selectedWorkers[1]
+                        worker_a_id: selectedWorkers[0],
+                        worker_b_id: selectedWorkers[1]
                     })
                 });
                 

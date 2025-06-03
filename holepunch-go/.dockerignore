@@ -1,0 +1,31 @@
+# Ignore version control system metadata
+.git
+
+# Build output binaries
+bin/
+worker
+rendezvous
+
+# Other operating-system files
+.DS_Store
+
+# Go test caches and debug files
+*.out
+*.test
+
+# IDE/editor config
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Node / front-end artifacts (if present)
+web/node_modules/
+web/dist/
+
+# Docker artifacts
+Dockerfile*
+
+# Misc
+*.md 

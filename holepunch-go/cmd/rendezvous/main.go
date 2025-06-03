@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -24,6 +25,13 @@ var (
 )
 
 func main() {
+	// Startup banner with revision info
+	log.Println("=====================================")
+	log.Println("Holepunch Go Rendezvous Service v1.0")
+	log.Println("Revision: Fixed port binding race condition")
+	log.Println("Build Date:", time.Now().Format("2006-01-02 15:04:05"))
+	log.Println("=====================================")
+	
 	state = models.NewServiceState()
 
 	port := getEnvInt("PORT", 8080)
@@ -47,8 +55,6 @@ func main() {
 	e.GET("/api/workers", getWorkers)
 	e.POST("/api/connect", connectWorkers)
 
-	// Test endpoint
-	e.GET("/ws/test", handleTestWebSocket)
 
 	log.Printf("Rendezvous service starting on port %d", port)
 	if err := e.Start(fmt.Sprintf(":%d", port)); err != nil {
@@ -68,14 +74,40 @@ func handleWorkerWebSocket(c echo.Context) error {
 
 	workerID := c.Param("worker_id")
 	clientIP := c.RealIP()
-	log.Printf("Worker %s connected from %s", workerID, clientIP)
+	
+	// Extract client port from RemoteAddr
+	clientAddr := c.Request().RemoteAddr
+	var clientPort int
+	if _, portStr, err := net.SplitHostPort(clientAddr); err == nil {
+		clientPort, _ = strconv.Atoi(portStr)
+	}
+	
+	log.Printf("Worker %s connected from %s:%d", workerID, clientIP, clientPort)
 
-	// Initialize worker info
+	// Check for duplicate worker and handle it
 	state.Mu.Lock()
+	if oldWorker, exists := state.ConnectedWorkers[workerID]; exists {
+		log.Printf("Worker %s re-connecting, closing old connection", workerID)
+		if oldWorker.Websocket != nil {
+			oldWorker.Websocket.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseServiceRestart, "New connection from same worker ID"))
+			oldWorker.Websocket.Close()
+		}
+		// Remove from pairing list if present
+		newPairingList := []string{}
+		for _, id := range state.WorkersReadyForPairing {
+			if id != workerID {
+				newPairingList = append(newPairingList, id)
+			}
+		}
+		state.WorkersReadyForPairing = newPairingList
+	}
+	
+	// Initialize worker info
 	state.ConnectedWorkers[workerID] = &models.WorkerInfo{
 		ID:                    workerID,
 		WebsocketObservedIP:   clientIP,
-		WebsocketObservedPort: 0, // Not easily obtainable
+		WebsocketObservedPort: clientPort,
 		ConnectedAt:           time.Now(),
 		LastPingAt:            time.Now(),
 		Websocket:             ws,
@@ -251,13 +283,6 @@ func handleAdminWebSocket(c echo.Context) error {
 		"message": "Connected to admin WebSocket",
 	})
 
-	// Send initial state
-	workers, _ := getWorkersInfo()
-	ws.WriteJSON(map[string]interface{}{
-		"type":    "workers_update",
-		"payload": workers,
-	})
-
 	// Keep connection alive and handle text-based ping
 	for {
 		messageType, p, err := ws.ReadMessage()
@@ -314,7 +339,7 @@ func handleAdminChatWebSocket(c echo.Context) error {
 			return nil
 		}
 
-		if msg["type"] == "send_message" {
+		if msg["type"] == "chat_message" {
 			content := msg["content"].(string)
 
 			state.Mu.RLock()
@@ -334,7 +359,7 @@ func handleAdminChatWebSocket(c echo.Context) error {
 				"type":      "chat_message",
 				"from":      "admin",
 				"content":   content,
-				"timestamp": time.Now().Format(time.RFC3339Nano),
+				"timestamp": float64(time.Now().UnixNano()) / 1e9,
 			}); err != nil {
 				log.Printf("Failed to echo chat message to admin %s for worker %s: %v", adminSessionID, workerID, err)
 			}
@@ -544,10 +569,19 @@ func attemptToPairWorkers(newWorkerID string) {
 }
 
 func broadcastWorkerUpdate() {
-	workers, _ := getWorkersInfo()
+	workers, counts := getWorkersInfo()
+	
+	// Create payload structure that matches the UI expectation
+	payload := map[string]interface{}{
+		"workers":         workers,
+		"total_count":     counts["total"],
+		"connected_count": counts["connected"],
+		"ready_count":     counts["ready"],
+	}
+	
 	msg := map[string]interface{}{
 		"type":    "workers_update",
-		"payload": workers,
+		"payload": payload,
 	}
 
 	state.Mu.RLock()
@@ -640,10 +674,9 @@ func getWorkersInfo() ([]map[string]interface{}, map[string]int) {
 			"ready_for_pairing":   isReady,
 			"websocket_ip":        worker.WebsocketObservedIP,
 			"websocket_port":      worker.WebsocketObservedPort,
+			"public_ip":           worker.HTTPReportedPublicIP,  // Added for Python admin UI compatibility
 			"udp_ip":              worker.StunReportedUDPIP,    // Python compatibility (without 'stun_' prefix)
 			"udp_port":            worker.StunReportedUDPPort,  // Python compatibility (without 'stun_' prefix)
-			"stun_udp_ip":         worker.StunReportedUDPIP,
-			"stun_udp_port":       worker.StunReportedUDPPort,
 		})
 	}
 	
@@ -654,35 +687,6 @@ func getWorkersInfo() ([]map[string]interface{}, map[string]int) {
 	}
 	
 	return workers, counts
-}
-
-func handleTestWebSocket(c echo.Context) error {
-	log.Printf("Test WebSocket upgrade request from %s", c.Request().RemoteAddr)
-
-	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
-	if err != nil {
-		log.Printf("Test WebSocket upgrade failed: %v", err)
-		return err
-	}
-	defer ws.Close()
-
-	log.Printf("Test WebSocket connected")
-
-	// Simple echo
-	for {
-		messageType, p, err := ws.ReadMessage()
-		if err != nil {
-			log.Printf("Test WebSocket read error: %v", err)
-			return nil
-		}
-
-		log.Printf("Test WebSocket received: %s", string(p))
-
-		if err := ws.WriteMessage(messageType, p); err != nil {
-			log.Printf("Test WebSocket write error: %v", err)
-			return nil
-		}
-	}
 }
 
 func getEnvInt(key string, defaultValue int) int {

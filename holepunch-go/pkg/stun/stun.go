@@ -37,7 +37,8 @@ func DiscoverWithConn(conn *net.UDPConn, stunHost string, stunPort int) (*STUNRe
 	return nil, fmt.Errorf("STUN discovery with shared connection not yet reliably implemented for response reading")
 }
 
-func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*STUNResult, error) {
+// DiscoverPublicEndpointWithTimeout performs STUN discovery with a configurable read timeout
+func DiscoverPublicEndpointWithTimeout(localAddr string, stunHost string, stunPort int, readTimeout time.Duration) (*STUNResult, error) {
 	serverAddrStr := fmt.Sprintf("%s:%d", stunHost, stunPort)
 
 	// Resolve STUN server address
@@ -74,7 +75,6 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 	// Read response
 	buf := make([]byte, 1500)
 	// Set a deadline for the read. net.PacketConn has SetReadDeadline.
-	readTimeout := 5 * time.Second
 	if err := pConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline for STUN response: %w", err)
 	}
@@ -88,7 +88,7 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 		return nil, fmt.Errorf("failed to read STUN response from %s (local %s): %w", raddr.String(), localSocketAddr, err)
 	}
 
-	// Log response details for debugging  
+	// Log response details for debugging
 	// log.Printf("STUN: Received %d bytes response", n)
 
 	// Parse response
@@ -120,7 +120,13 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 	}, nil
 }
 
-func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetries int) (*STUNResult, error) {
+// DiscoverPublicEndpoint performs STUN discovery with default 10 second read timeout
+func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*STUNResult, error) {
+	return DiscoverPublicEndpointWithTimeout(localAddr, stunHost, stunPort, 10*time.Second)
+}
+
+// DiscoverWithRetryTimeout performs STUN discovery with retries and configurable read timeout
+func DiscoverWithRetryTimeout(localAddr string, stunHost string, stunPort int, maxRetries int, readTimeout time.Duration) (*STUNResult, error) {
 	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
@@ -132,7 +138,7 @@ func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetri
 		}
 
 		// log.Printf("STUN: Attempt %d/%d to discover public endpoint", i+1, maxRetries)
-		result, err := DiscoverPublicEndpoint(localAddr, stunHost, stunPort)
+		result, err := DiscoverPublicEndpointWithTimeout(localAddr, stunHost, stunPort, readTimeout)
 		if err == nil {
 			return result, nil
 		}
@@ -141,4 +147,9 @@ func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetri
 	}
 
 	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+}
+
+// DiscoverWithRetry performs STUN discovery with retries using default 10 second read timeout
+func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetries int) (*STUNResult, error) {
+	return DiscoverWithRetryTimeout(localAddr, stunHost, stunPort, maxRetries, 10*time.Second)
 }

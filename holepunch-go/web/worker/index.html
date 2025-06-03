@@ -123,20 +123,24 @@
                             startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
                         }
                     } else if (data.type === "p2p_message_received") {
-                        addMessage(data.content, "peer", data.from_peer_id);
-                    } else if (data.type === "p2p_connection_established") {
-                        const peer_id = data.payload.peer_id;
-                        addMessage(`P2P connection established with ${peer_id.substring(0,8)}...`, "system");
-                        peerInfoDiv.textContent = `P2P Connected to Peer: ${peer_id.substring(0,8)}...`;
-                        statusDiv.textContent = "P2P Link Active.";
-                        startBenchmarkButton.disabled = false;
-                        startBenchmarkButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                        addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
+                    } else if (data.type === "p2p_status_update") {
+                        addMessage(`P2P Status: ${data.message}`, "system");
+                        if (data.peer_id) {
+                            peerInfoDiv.textContent = `P2P Connected to Peer: ${data.peer_id.substring(0,8)}...`;
+                            statusDiv.textContent = "P2P Link Active.";
+                            startBenchmarkButton.disabled = false;
+                            startBenchmarkButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                        } else {
+                             peerInfoDiv.textContent = "Peer: Not connected";
+                             if (!data.message.toLowerCase().includes("lost")) {
+                                statusDiv.textContent = "P2P Link Inactive.";
+                             }
+                             startBenchmarkButton.disabled = true;
+                             startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
+                        }
                     } else if (data.type === "admin_chat_received") {
                         addMessage(`Admin: ${data.payload.content}`, "peer", "Admin");
-                    } else if (data.type === "pairing_test_result") {
-                        if (data.payload.success) {
-                            addMessage(`Pairing test successful! RTT: ${data.payload.rtt_ms}ms`, "system");
-                        }
                     } else if (data.type === "benchmark_status") {
                         benchmarkStatusDiv.textContent = data.message;
                         addMessage(data.message, "system");
@@ -211,18 +215,6 @@
             }
         });
 
-        // Handle admin chat responses
-        window.sendAdminResponse = function(adminId, content) {
-            if (localUiSocket && localUiSocket.readyState === WebSocket.OPEN) {
-                localUiSocket.send(JSON.stringify({
-                    type: "send_admin_response",
-                    payload: {
-                        admin_id: adminId,
-                        content: content
-                    }
-                }));
-            }
-        };
 
         connectToLocalBackend();
     </script>
