@@ -37,7 +37,7 @@ var (
 func setupUDPListener(port int) (*net.UDPConn, error) {
 	// Use the specified port (matching Python's behavior)
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", port)
-	
+
 	udpAddr, err := net.ResolveUDPAddr("udp4", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve UDP addr: %w", err)
@@ -67,7 +67,7 @@ func main() {
 	log.Println("Revision: Fixed port binding race condition")
 	log.Println("Build Date:", time.Now().Format("2006-01-02 15:04:05"))
 	log.Println("=====================================")
-	
+
 	workerID := uuid.New().String()
 	state = models.NewWorkerState(workerID)
 
@@ -112,81 +112,105 @@ func main() {
 		// STUN discovery will attempt to bind locally to udpPort (INTERNAL_UDP_PORT)
 		localStunBindAddr := fmt.Sprintf(":%d", udpPort)
 
-		type stunDiscoveryOp struct {
-			result *stun.STUNResult
-			err    error
-		}
-		stunResultChan := make(chan stunDiscoveryOp, 1)
+		log.Printf("Attempting STUN discovery: STUN client will bind locally to %s, targeting STUN server %s:%d", localStunBindAddr, stunHost, stunPort)
 
-		go func() {
-			log.Printf("Attempting STUN discovery: STUN client will bind locally to %s, targeting STUN server %s:%d", localStunBindAddr, stunHost, stunPort)
-			// stun.DiscoverWithRetry internally creates a listener on localStunBindAddr,
-			// performs STUN, and then its listener is closed (due to defer pConn.Close() in DiscoverPublicEndpointWithTimeout).
-			sRes, sErr := stun.DiscoverWithRetry(localStunBindAddr, stunHost, stunPort, 3) // Max 3 retries
-			stunResultChan <- stunDiscoveryOp{result: sRes, err: sErr}
-		}()
+		// Call STUN discovery synchronously with longer individual timeout (10s instead of 5s)
+		stunResult, stunErr := stun.DiscoverWithRetryAndTimeout(localStunBindAddr, stunHost, stunPort, 5, 10*time.Second)
 
-		// Wait for STUN discovery to complete or timeout
-		select {
-		case res := <-stunResultChan:
-			if res.err != nil {
-				log.Printf("STUN discovery failed: %v", res.err)
-				log.Printf("Continuing without STUN endpoint information.")
-				// state.OurStunDiscoveredUDPIP and OurStunDiscoveredUDPPort will remain empty/zero
-			} else {
-				log.Printf("STUN discovery successful. Public UDP endpoint: %s:%d", res.result.PublicIP, res.result.PublicPort)
-				state.Mu.Lock()
-				state.OurStunDiscoveredUDPIP = res.result.PublicIP
-				state.OurStunDiscoveredUDPPort = res.result.PublicPort
-				state.Mu.Unlock()
-			}
-		case <-time.After(30 * time.Second): // Overall timeout for STUN discovery
-			log.Printf("STUN discovery timed out after 30 seconds.")
+		if stunErr != nil {
+			log.Printf("STUN discovery failed: %v", stunErr)
 			log.Printf("Continuing without STUN endpoint information.")
-		}
-
-		// STUN discovery phase is now complete, and the temporary listener used by it is closed.
-		// Add a small delay to ensure the OS has fully released the port before rebinding
-		log.Printf("STUN phase finished. Waiting 100ms for port release before setting up main P2P UDP listener...")
-		time.Sleep(100 * time.Millisecond)
-		
-		// Now, set up the main P2P UDP listener on the same udpPort.
-		log.Printf("Setting up main P2P UDP listener on port %d...", udpPort)
-		var errSetupListener error
-		
-		// Retry logic for setting up UDP listener in case port is still not released
-		maxRetries := 3
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			udpConn, errSetupListener = setupUDPListener(udpPort)
-			if errSetupListener == nil {
-				break // Success
-			}
-			
-			if strings.Contains(errSetupListener.Error(), "address already in use") && attempt < maxRetries {
-				log.Printf("Port %d still in use, retrying in %dms (attempt %d/%d)...", 
-					udpPort, 100*attempt, attempt, maxRetries)
-				time.Sleep(time.Duration(100*attempt) * time.Millisecond)
-			} else {
-				break // Non-recoverable error or last attempt
-			}
-		}
-		
-		if errSetupListener != nil {
-			log.Printf("CRITICAL: Failed to setup main P2P UDP listener on port %d after %d attempts: %v", 
-				udpPort, maxRetries, errSetupListener)
-			// Worker might still connect to rendezvous but P2P will likely fail.
-			// Depending on requirements, you might want to os.Exit(1) or handle this state.
+			// state.OurStunDiscoveredUDPIP and OurStunDiscoveredUDPPort will remain empty/zero
 		} else {
-			mainListenerAddr := udpConn.LocalAddr().(*net.UDPAddr)
-			log.Printf("Main P2P UDP listener established on %s (requested port %d)", mainListenerAddr.String(), udpPort)
-			
-			p2pProto = p2p.NewP2PProtocol(udpConn, state)
-			go p2pProto.Start() // Start the P2P read loop
+			log.Printf("STUN discovery successful. Public UDP endpoint: %s:%d", stunResult.PublicIP, stunResult.PublicPort)
+			state.Mu.Lock()
+			state.OurStunDiscoveredUDPIP = stunResult.PublicIP
+			state.OurStunDiscoveredUDPPort = stunResult.PublicPort
+			state.Mu.Unlock()
 		}
 
-		// Connect to rendezvous service after STUN discovery and UDP setup
+		// STUN discovery phase is now complete. The temporary listener used by it
+		// should have been closed by its 'defer pConn.Close()'.
+
+		log.Printf("STUN phase finished. Attempting to set up main P2P UDP listener on port %d...", udpPort)
+
+		const (
+			initialListenerDelay   = 1 * time.Second // Initial delay before first bind attempt for P2P listener (increased from 250ms)
+			maxListenerRetries     = 5               // Number of retries for P2P listener bind
+			listenerRetryDelayStep = 1 * time.Second // Base delay step for subsequent retries (increased from 300ms)
+		)
+
+		time.Sleep(initialListenerDelay) // Wait a bit for the OS to fully release the port used by STUN
+
+		var errSetupListener error
+		for i := 0; i < maxListenerRetries; i++ {
+			if i > 0 { // If this is a retry
+				// Increasing delay for subsequent retries
+				currentRetryDelay := listenerRetryDelayStep * time.Duration(i)
+				log.Printf("Retrying P2P UDP listener setup for port %d in %v (attempt %d/%d)...", udpPort, currentRetryDelay, i+1, maxListenerRetries)
+				time.Sleep(currentRetryDelay)
+			}
+
+			udpConn, errSetupListener = setupUDPListener(udpPort) // Attempt to bind to the fixed udpPort
+			if errSetupListener == nil {
+				// Success!
+				// The actual port might be different if setupUDPListener was changed to ephemeral,
+				// but with the change above, it should be the requested udpPort.
+				// Verify if udpConn.LocalAddr() indeed matches the requested udpPort.
+				mainListenerAddr := udpConn.LocalAddr().(*net.UDPAddr)
+				log.Printf("Main P2P UDP listener established on %s (requested port %d) after %d attempt(s)", mainListenerAddr.String(), udpPort, i+1)
+
+				p2pProto = p2p.NewP2PProtocol(udpConn, state)
+				go p2pProto.Start() // Start the P2P read loop
+				break               // Exit retry loop
+			}
+
+			// Enhanced error logging and detection
+			log.Printf("P2P Listener Setup attempt %d/%d raw error: [%T] %v", i+1, maxListenerRetries, errSetupListener, errSetupListener)
+
+			isAddrInUseError := false
+
+			// Check if error is "address already in use" with multiple fallback approaches
+			if opErr, ok := errSetupListener.(*net.OpError); ok {
+				log.Printf("P2P Listener Setup attempt %d/%d OpError: [%T] %v", i+1, maxListenerRetries, opErr.Err, opErr.Err)
+				if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+					log.Printf("P2P Listener Setup attempt %d/%d SyscallError: %v", i+1, maxListenerRetries, sysErr.Err)
+					// Check if the error contains "address already in use"
+					if strings.Contains(strings.ToLower(sysErr.Error()), "address already in use") {
+						isAddrInUseError = true
+					}
+				} else if strings.Contains(strings.ToLower(opErr.Err.Error()), "address already in use") {
+					// Fallback if not a SyscallError but net.OpError message contains it
+					isAddrInUseError = true
+				}
+			} else if strings.Contains(strings.ToLower(errSetupListener.Error()), "address already in use") {
+				// Fallback for other error types that might wrap it
+				isAddrInUseError = true
+			}
+
+			if isAddrInUseError {
+				log.Printf("Attempt %d/%d to bind P2P UDP listener on port %d identified as 'address already in use': %v. Will retry if attempts remain.", i+1, maxListenerRetries, udpPort, errSetupListener)
+				if i == maxListenerRetries-1 {
+					log.Printf("CRITICAL: All %d retries to bind P2P UDP listener on port %d failed with 'address already in use'. Last error: %v", maxListenerRetries, udpPort, errSetupListener)
+				} else {
+					continue // Go to the next retry iteration
+				}
+			}
+
+			// If error is not "address already in use" or it was the last retry for it
+			log.Printf("CRITICAL: Failed to setup main P2P UDP listener on port %d with a non-recoverable or final error after %d attempt(s): %v", udpPort, i+1, errSetupListener)
+			break // Exit loop on non-address-in-use error OR if it was the last retry for it
+		}
+
+		if udpConn == nil { // Check if listener setup ultimately failed
+			log.Printf("CRITICAL: Main P2P UDP listener could not be established on port %d.", udpPort)
+			// Ensure p2pProto is not used if udpConn is nil
+			p2pProto = nil
+		}
+
+		// Connect to rendezvous service after STUN discovery and UDP setup attempt
 		connectToRendezvous(workerID, rendezvousURL)
-		
+
 		// Start P2P keep-alive goroutine
 		go startP2PKeepAlive()
 	}()
@@ -302,7 +326,7 @@ func handleP2PConnectionOffer(payload map[string]interface{}) error {
 	state.Mu.RUnlock()
 
 	uiMsg := map[string]interface{}{
-		"type": "p2p_status_update",
+		"type":    "p2p_status_update",
 		"message": "P2P connection established",
 		"peer_id": peerID,
 	}
@@ -538,19 +562,19 @@ func startP2PKeepAlive() {
 	// Monitor for changes in P2P peer and start/stop keep-alive accordingly
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	var lastPeerAddr *net.UDPAddr
-	
+
 	for range ticker.C {
 		state.Mu.RLock()
 		currentPeerAddr := state.CurrentP2PPeerAddr
 		state.Mu.RUnlock()
-		
+
 		// If peer changed, update keep-alive
 		if (currentPeerAddr == nil && lastPeerAddr != nil) ||
-		   (currentPeerAddr != nil && lastPeerAddr == nil) ||
-		   (currentPeerAddr != nil && lastPeerAddr != nil && currentPeerAddr.String() != lastPeerAddr.String()) {
-			
+			(currentPeerAddr != nil && lastPeerAddr == nil) ||
+			(currentPeerAddr != nil && lastPeerAddr != nil && currentPeerAddr.String() != lastPeerAddr.String()) {
+
 			if currentPeerAddr != nil && p2pProto != nil {
 				log.Printf("Starting keep-alive for new peer: %s", currentPeerAddr.String())
 				p2pProto.StartKeepAlive(currentPeerAddr)

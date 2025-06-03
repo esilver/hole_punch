@@ -2,6 +2,7 @@ package stun
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -13,83 +14,29 @@ type STUNResult struct {
 	PublicPort int
 }
 
-// DiscoverWithConn uses an existing UDP connection for STUN discovery
-// NOTE: This function is not fully implemented for reliable use with shared connections
-// due to challenges with managing read deadlines on a connection that might be concurrently used.
-func DiscoverWithConn(conn *net.UDPConn, stunHost string, stunPort int) (*STUNResult, error) {
-	serverAddrStr := fmt.Sprintf("%s:%d", stunHost, stunPort)
-
-	raddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve STUN server address %s: %w", serverAddrStr, err)
-	}
-
-	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-	_, err = conn.WriteToUDP(message.Raw, raddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send STUN request via existing conn: %w", err)
-	}
-
-	// Reading response here is problematic on a shared conn without a dedicated response queue
-	// or way to distinguish STUN responses from other P2P data.
-	// For now, this function remains more of a placeholder for a more complex implementation.
-	return nil, fmt.Errorf("STUN discovery with shared connection not yet reliably implemented for response reading")
-}
-
-// DiscoverPublicEndpointWithTimeout performs STUN discovery with a configurable read timeout
-func DiscoverPublicEndpointWithTimeout(localAddr string, stunHost string, stunPort int, readTimeout time.Duration) (*STUNResult, error) {
-	serverAddrStr := fmt.Sprintf("%s:%d", stunHost, stunPort)
-
-	// Resolve STUN server address
-	raddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve STUN server address %s: %w", serverAddrStr, err)
-	}
-
-	// Log resolved address for debugging
-	// log.Printf("STUN: Resolved server address %s to %s", serverAddrStr, raddr.String())
-
-	// Create a UDP packet listener.
-	// If localAddr is like ":8081", it will try to bind to that local port.
-	// If localAddr is like ":0", it will bind to an ephemeral port.
-	pConn, err := net.ListenPacket("udp4", localAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on UDP port %s: %w", localAddr, err)
-	}
-	defer pConn.Close()
-
-	// Log local address for debugging
-	localSocketAddr := pConn.LocalAddr().String()
-	// log.Printf("STUN: Created UDP listener on %s", localSocketAddr)
-
-	// Build STUN binding request
+// performSTUNRequest performs a single STUN request on an existing connection
+func performSTUNRequest(pConn net.PacketConn, raddr net.Addr, readTimeoutPerAttempt time.Duration) (*STUNResult, error) {
 	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	// Send the request
-	_, err = pConn.WriteTo(message.Raw, raddr)
+	_, err := pConn.WriteTo(message.Raw, raddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send STUN request to %s: %w", raddr.String(), err)
 	}
 
 	// Read response
 	buf := make([]byte, 1500)
-	// Set a deadline for the read. net.PacketConn has SetReadDeadline.
-	if err := pConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+	if err := pConn.SetReadDeadline(time.Now().Add(readTimeoutPerAttempt)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline for STUN response: %w", err)
 	}
 
 	n, _, err := pConn.ReadFrom(buf)
 	if err != nil {
-		// Check if it's a timeout error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return nil, fmt.Errorf("STUN request to %s timed out after %v (sent from %s): %w", raddr.String(), readTimeout, localSocketAddr, err)
+			return nil, fmt.Errorf("STUN request to %s timed out after %v (local: %s): %w", raddr.String(), readTimeoutPerAttempt, pConn.LocalAddr().String(), err)
 		}
-		return nil, fmt.Errorf("failed to read STUN response from %s (local %s): %w", raddr.String(), localSocketAddr, err)
+		return nil, fmt.Errorf("failed to read STUN response from %s (local: %s): %w", raddr.String(), pConn.LocalAddr().String(), err)
 	}
-
-	// Log response details for debugging
-	// log.Printf("STUN: Received %d bytes response", n)
 
 	// Parse response
 	response := new(stun.Message)
@@ -98,58 +45,76 @@ func DiscoverPublicEndpointWithTimeout(localAddr string, stunHost string, stunPo
 		return nil, fmt.Errorf("failed to decode STUN response: %w", err)
 	}
 
-	// Extract XOR-mapped address
 	var xorAddr stun.XORMappedAddress
 	if err := xorAddr.GetFrom(response); err != nil {
-		// Fallback: Try MAPPED_ADDRESS if XOR_MAPPED_ADDRESS fails (some older STUN servers or certain NATs)
 		var mappedAddr stun.MappedAddress
 		if errMapped := mappedAddr.GetFrom(response); errMapped != nil {
 			return nil, fmt.Errorf("failed to get XOR-mapped or MAPPED address from STUN response: XOR err: %v, MAPPED err: %v", err, errMapped)
 		}
-		// log.Printf("STUN: Using MAPPED_ADDRESS: %s:%d", mappedAddr.IP.String(), mappedAddr.Port)
+		log.Printf("STUN Discovery (via performSTUNRequest): Using MAPPED_ADDRESS: %s:%d", mappedAddr.IP.String(), mappedAddr.Port)
 		return &STUNResult{
 			PublicIP:   mappedAddr.IP.String(),
 			PublicPort: mappedAddr.Port,
 		}, nil
 	}
-
-	// log.Printf("STUN: Using XOR_MAPPED_ADDRESS: %s:%d", xorAddr.IP.String(), xorAddr.Port)
+	log.Printf("STUN Discovery (via performSTUNRequest): Using XOR_MAPPED_ADDRESS: %s:%d", xorAddr.IP.String(), xorAddr.Port)
 	return &STUNResult{
 		PublicIP:   xorAddr.IP.String(),
 		PublicPort: xorAddr.Port,
 	}, nil
 }
 
-// DiscoverPublicEndpoint performs STUN discovery with default 10 second read timeout
-func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*STUNResult, error) {
-	return DiscoverPublicEndpointWithTimeout(localAddr, stunHost, stunPort, 10*time.Second)
+// DiscoverWithRetry is the improved main function to call from your worker.
+// It handles binding the localAddr ONCE and then retrying STUN transactions on that connection.
+func DiscoverWithRetry(localAddrToBind string, stunHost string, stunPort int, maxAttempts int) (*STUNResult, error) {
+	return DiscoverWithRetryAndTimeout(localAddrToBind, stunHost, stunPort, maxAttempts, 5*time.Second)
 }
 
-// DiscoverWithRetryTimeout performs STUN discovery with retries and configurable read timeout
-func DiscoverWithRetryTimeout(localAddr string, stunHost string, stunPort int, maxRetries int, readTimeout time.Duration) (*STUNResult, error) {
-	var lastErr error
+// DiscoverWithRetryAndTimeout is like DiscoverWithRetry but allows configuring the individual request timeout
+func DiscoverWithRetryAndTimeout(localAddrToBind string, stunHost string, stunPort int, maxAttempts int, readTimeoutPerAttempt time.Duration) (*STUNResult, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
 
-	for i := 0; i < maxRetries; i++ {
-		if i > 0 {
-			// Exponential backoff for retries, e.g., 1s, 2s, 4s
-			delay := time.Duration(1<<uint(i-1)) * time.Second
-			// log.Printf("STUN: Retry attempt %d/%d in %v...", i+1, maxRetries, delay)
+	// Create and bind the UDP PacketConn ONCE here.
+	pConn, err := net.ListenPacket("udp4", localAddrToBind)
+	if err != nil {
+		// This is a critical failure if we can't even bind the initial STUN socket.
+		return nil, fmt.Errorf("STUN initial bind failed on %s: %w", localAddrToBind, err)
+	}
+	defer pConn.Close() // Ensure this is closed when DiscoverWithRetry finishes.
+
+	log.Printf("STUN Discovery: Bound STUN client to local address %s (requested: %s)", pConn.LocalAddr().String(), localAddrToBind)
+
+	// Resolve STUN server address
+	serverAddrStr := fmt.Sprintf("%s:%d", stunHost, stunPort)
+	raddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		return nil, fmt.Errorf("STUN failed to resolve server address %s: %w", serverAddrStr, err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with cap
+			delay := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s ...
+			if delay > 8*time.Second {
+				delay = 8 * time.Second
+			} // Cap delay
+			log.Printf("STUN Discovery: Retrying attempt %d/%d in %v...", attempt+1, maxAttempts, delay)
 			time.Sleep(delay)
 		}
 
-		// log.Printf("STUN: Attempt %d/%d to discover public endpoint", i+1, maxRetries)
-		result, err := DiscoverPublicEndpointWithTimeout(localAddr, stunHost, stunPort, readTimeout)
+		log.Printf("STUN Discovery: Attempt %d/%d to discover public endpoint using local %s for STUN server %s",
+			attempt+1, maxAttempts, pConn.LocalAddr().String(), raddr.String())
+
+		result, err := performSTUNRequest(pConn, raddr, readTimeoutPerAttempt)
 		if err == nil {
-			return result, nil
+			return result, nil // Success!
 		}
-		lastErr = err
-		// log.Printf("STUN: Attempt %d/%d failed: %v", i+1, maxRetries, err)
+		lastErr = err // Store the last error encountered
+		log.Printf("STUN Discovery: Attempt %d/%d failed: %v", attempt+1, maxAttempts, err)
 	}
 
-	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
-}
-
-// DiscoverWithRetry performs STUN discovery with retries using default 10 second read timeout
-func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetries int) (*STUNResult, error) {
-	return DiscoverWithRetryTimeout(localAddr, stunHost, stunPort, maxRetries, 10*time.Second)
+	return nil, fmt.Errorf("STUN discovery failed after %d attempts. Last error: %w", maxAttempts, lastErr)
 }
