@@ -123,7 +123,8 @@
                             startBenchmarkButton.classList.add('opacity-50', 'cursor-not-allowed');
                         }
                     } else if (data.type === "p2p_message_received") {
-                        addMessage(data.content, "peer", data.from_peer_id ? data.from_peer_id.substring(0,8)+"..." : "Peer");
+                        const payload = data.payload || {};
+                        addMessage(payload.content || data.content, "peer", payload.from_peer_id ? payload.from_peer_id.substring(0,8)+"..." : "Peer");
                     } else if (data.type === "p2p_status_update") {
                         addMessage(`P2P Status: ${data.message}`, "system");
                         if (data.peer_id) {
