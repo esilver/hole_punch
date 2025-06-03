@@ -20,11 +20,21 @@
       "*.log",
       "*.tmp",
       ".DS_Store",
-      "repomix-output.xml"
+      "repomix-output.xml",
+      ".git/**",
+      "node_modules/**"
     ]
   },
   "include": [
     "**/*.go",
+    "**/cmd/**/*.go",
+    "**/cmd/**",
+    "holepunch-go/cmd/**",
+    "**/main.go",
+    "**/go.mod",
+    "**/go.sum",
+    "**/go.work",
+    "**/go.work.sum",
     "**/*.py",
     "**/*.md",
     "**/*.mod",

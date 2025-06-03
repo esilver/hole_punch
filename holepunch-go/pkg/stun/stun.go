@@ -46,6 +46,9 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 		return nil, fmt.Errorf("failed to resolve STUN server address %s: %w", serverAddrStr, err)
 	}
 
+	// Log resolved address for debugging
+	// log.Printf("STUN: Resolved server address %s to %s", serverAddrStr, raddr.String())
+
 	// Create a UDP packet listener.
 	// If localAddr is like ":8081", it will try to bind to that local port.
 	// If localAddr is like ":0", it will bind to an ephemeral port.
@@ -54,6 +57,10 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 		return nil, fmt.Errorf("failed to listen on UDP port %s: %w", localAddr, err)
 	}
 	defer pConn.Close()
+
+	// Log local address for debugging
+	localSocketAddr := pConn.LocalAddr().String()
+	// log.Printf("STUN: Created UDP listener on %s", localSocketAddr)
 
 	// Build STUN binding request
 	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
@@ -67,18 +74,22 @@ func DiscoverPublicEndpoint(localAddr string, stunHost string, stunPort int) (*S
 	// Read response
 	buf := make([]byte, 1500)
 	// Set a deadline for the read. net.PacketConn has SetReadDeadline.
-	if err := pConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil { // Increased timeout slightly
+	readTimeout := 5 * time.Second
+	if err := pConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline for STUN response: %w", err)
 	}
 
-	n, _, err := pConn.ReadFrom(buf) // We don't strictly need the remote address of the response here
+	n, _, err := pConn.ReadFrom(buf)
 	if err != nil {
 		// Check if it's a timeout error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return nil, fmt.Errorf("STUN request to %s timed out after 5s: %w", raddr.String(), err)
+			return nil, fmt.Errorf("STUN request to %s timed out after %v (sent from %s): %w", raddr.String(), readTimeout, localSocketAddr, err)
 		}
-		return nil, fmt.Errorf("failed to read STUN response from %s: %w", raddr.String(), err)
+		return nil, fmt.Errorf("failed to read STUN response from %s (local %s): %w", raddr.String(), localSocketAddr, err)
 	}
+
+	// Log response details for debugging  
+	// log.Printf("STUN: Received %d bytes response", n)
 
 	// Parse response
 	response := new(stun.Message)
@@ -116,15 +127,17 @@ func DiscoverWithRetry(localAddr string, stunHost string, stunPort int, maxRetri
 		if i > 0 {
 			// Exponential backoff for retries, e.g., 1s, 2s, 4s
 			delay := time.Duration(1<<uint(i-1)) * time.Second
-			// log.Printf("STUN: Retrying in %v...", delay)
+			// log.Printf("STUN: Retry attempt %d/%d in %v...", i+1, maxRetries, delay)
 			time.Sleep(delay)
 		}
 
+		// log.Printf("STUN: Attempt %d/%d to discover public endpoint", i+1, maxRetries)
 		result, err := DiscoverPublicEndpoint(localAddr, stunHost, stunPort)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
+		// log.Printf("STUN: Attempt %d/%d failed: %v", i+1, maxRetries, err)
 	}
 
 	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)

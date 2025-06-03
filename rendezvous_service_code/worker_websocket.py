@@ -36,8 +36,7 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
         "websocket_observed_port": client_port, 
         "websocket": websocket,
         "stun_reported_udp_ip": None, 
-        "stun_reported_udp_port": None,
-        "http_reported_public_ip": None
+        "stun_reported_udp_port": None
     }
     print(f"Worker '{worker_id}' registered. WebSocket EP: {client_host}:{client_port}. Total: {len(service_state.connected_workers)}")
     
@@ -58,13 +57,7 @@ async def websocket_register_worker(websocket: WebSocket, worker_id: str):
                 message = json.loads(raw_data)
                 msg_type = message.get("type")
 
-                if msg_type == "register_public_ip":
-                    new_ip = message.get("ip")
-                    if new_ip and worker_id in service_state.connected_workers:
-                        service_state.connected_workers[worker_id]["http_reported_public_ip"] = new_ip 
-                        print(f"Worker '{worker_id}' reported HTTP-based public IP: {new_ip}")
-                
-                elif msg_type == "update_udp_endpoint":
+                if msg_type == "update_udp_endpoint":
                     udp_ip = message.get("udp_ip")
                     udp_port = message.get("udp_port")
                     if udp_ip and udp_port and worker_id in service_state.connected_workers:

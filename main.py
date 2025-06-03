@@ -3,7 +3,6 @@ import os
 import uuid
 import websockets # For Rendezvous client AND UI server
 import signal
-import requests 
 import json
 import socket
 import stun # pystun3
@@ -373,7 +372,6 @@ async def attempt_hole_punch_when_ready(peer_udp_ip: str, peer_udp_port: int, pe
 
 async def connect_to_rendezvous(rendezvous_ws_url: str):
     global stop_signal_received, p2p_udp_transport, INTERNAL_UDP_PORT, ui_websocket_clients, our_stun_discovered_udp_ip, our_stun_discovered_udp_port
-    ip_echo_service_url = "https://api.ipify.org"
     ping_interval = float(os.environ.get("PING_INTERVAL_SEC", "25"))
     ping_timeout = float(os.environ.get("PING_TIMEOUT_SEC", "25"))
     udp_listener_active = False
@@ -388,13 +386,6 @@ async def connect_to_rendezvous(rendezvous_ws_url: str):
                                         ping_timeout=ping_timeout,
                                         proxy=None) as ws_to_rendezvous:
                 print(f"Worker '{worker_id}' connected to Rendezvous Service.")
-                try:
-                    response = requests.get(ip_echo_service_url, timeout=10)
-                    response.raise_for_status()
-                    http_public_ip = response.text.strip()
-                    await ws_to_rendezvous.send(json.dumps({"type": "register_public_ip", "ip": http_public_ip}))
-                    print(f"Worker '{worker_id}' sent HTTP-based IP ({http_public_ip}) to Rendezvous.")
-                except Exception as e_http_ip: print(f"Worker '{worker_id}': Error sending HTTP IP: {e_http_ip}")
                 
                 # Initial STUN discovery
                 stun_success_initial = await discover_and_report_stun_udp_endpoint(ws_to_rendezvous)

@@ -146,8 +146,10 @@ func (p *P2PProtocol) handleChatMessage(msg *models.P2PMessage, addr *net.UDPAdd
 
 	uiMsg := map[string]interface{}{
 		"type": "p2p_message_received",
-		"from_peer_id": msg.FromWorkerID,
-		"content":      content,
+		"payload": map[string]interface{}{
+			"from_peer_id": msg.FromWorkerID,
+			"content":      content,
+		},
 	}
 
 	for _, client := range clients {
@@ -201,9 +203,11 @@ func (p *P2PProtocol) handlePairingEcho(msg *models.P2PMessage, addr *net.UDPAdd
 	clients := p.state.UIWebsocketClients
 	p.state.Mu.RUnlock()
 
+	// Use Python-compatible message type
 	uiMsg := map[string]interface{}{
-		"type": "pairing_test_result",
+		"type": "p2p_status_update",
 		"payload": map[string]interface{}{
+			"status":  "pairing_test_success",
 			"test_id": msg.FromWorkerID,
 			"rtt_ms":  int64(rttMs), // Store as int if Python UI expects int
 			"success": true,
@@ -225,6 +229,20 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 		return fmt.Errorf("invalid benchmark chunk format: missing session_id")
 	}
 
+	// Extract seq number if present (for Python compatibility)
+	var seq int
+	if seqVal, ok := msg.Payload["seq"]; ok {
+		switch v := seqVal.(type) {
+		case float64:
+			seq = int(v)
+		case int:
+			seq = v
+		}
+	}
+
+	// Extract from_worker_id if present (for Python compatibility)
+	fromWorkerID, _ := msg.Payload["from_worker_id"].(string)
+
 	// Handle base64 encoded payload from Python-style implementation
 	payloadB64, ok := msg.Payload["payload"].(string)
 	if !ok {
@@ -244,10 +262,14 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 			Active:    true,
 		}
 		p.state.BenchmarkSessions[sessionID] = session
+		log.Printf("Started new benchmark session %s from worker %s", sessionID, fromWorkerID)
 	}
 
 	session.BytesReceived += int64(dataSize)
 	session.ChunksReceived++
+	if seq > 0 && seq%100 == 0 { // Log progress every 100 chunks
+		log.Printf("Benchmark session %s: received chunk %d, total bytes: %d", sessionID, seq, session.BytesReceived)
+	}
 	p.state.Mu.Unlock()
 
 	return nil
@@ -259,6 +281,20 @@ func (p *P2PProtocol) handleBenchmarkEnd(msg *models.P2PMessage, addr *net.UDPAd
 		return fmt.Errorf("invalid benchmark end format")
 	}
 
+	// Extract total_chunks if present (for Python compatibility)
+	var totalChunks int
+	if tcVal, ok := msg.Payload["total_chunks"]; ok {
+		switch v := tcVal.(type) {
+		case float64:
+			totalChunks = int(v)
+		case int:
+			totalChunks = v
+		}
+	}
+
+	// Extract from_worker_id if present (for Python compatibility)
+	fromWorkerID, _ := msg.Payload["from_worker_id"].(string)
+
 	p.state.Mu.Lock()
 	session, exists := p.state.BenchmarkSessions[sessionID]
 	if exists {
@@ -266,9 +302,40 @@ func (p *P2PProtocol) handleBenchmarkEnd(msg *models.P2PMessage, addr *net.UDPAd
 		duration := time.Since(session.StartTime).Seconds()
 		throughput := float64(session.BytesReceived) / duration / 1024 / 1024
 
-		log.Printf("Benchmark %s completed: %.2f MB in %.2fs (%.2f MB/s)",
-			sessionID, float64(session.BytesReceived)/1024/1024, duration, throughput)
+		log.Printf("Benchmark %s completed: %.2f MB in %.2fs (%.2f MB/s) from worker %s (expected %d chunks, received %d)",
+			sessionID, float64(session.BytesReceived)/1024/1024, duration, throughput, 
+			fromWorkerID, totalChunks, session.ChunksReceived)
 
+		// Send results to UI
+		p.state.Mu.Unlock() // Unlock before sending to UI to avoid deadlock
+		
+		// Notify UI clients about benchmark completion
+		p.state.Mu.RLock()
+		clients := p.state.UIWebsocketClients
+		p.state.Mu.RUnlock()
+
+		uiMsg := map[string]interface{}{
+			"type": "benchmark_status",
+			"payload": map[string]interface{}{
+				"status":         "completed",
+				"session_id":     sessionID,
+				"from_worker_id": fromWorkerID,
+				"bytes_received": session.BytesReceived,
+				"duration_sec":   duration,
+				"throughput_mbps": throughput,
+				"chunks_received": session.ChunksReceived,
+				"total_chunks":   totalChunks,
+			},
+		}
+
+		for _, client := range clients {
+			if err := client.WriteJSON(uiMsg); err != nil {
+				log.Printf("Failed to send benchmark results to UI: %v", err)
+			}
+		}
+
+		// Clean up session
+		p.state.Mu.Lock()
 		delete(p.state.BenchmarkSessions, sessionID)
 	}
 	p.state.Mu.Unlock()

@@ -50,7 +50,6 @@ async def list_workers():
         workers_info[worker_id_key] = {
             "websocket_observed_ip": data_val.get("websocket_observed_ip"),
             "websocket_observed_port": data_val.get("websocket_observed_port"),
-            "http_reported_public_ip": data_val.get("http_reported_public_ip"),
             "stun_reported_udp_ip": data_val.get("stun_reported_udp_ip"),
             "stun_reported_udp_port": data_val.get("stun_reported_udp_port"),
             "websocket_connected": is_connected
@@ -85,7 +84,6 @@ async def api_list_workers():
             "ready_for_pairing": is_ready,
             "websocket_ip": data.get("websocket_observed_ip"),
             "websocket_port": data.get("websocket_observed_port"),
-            "public_ip": data.get("http_reported_public_ip"),
             "udp_ip": data.get("stun_reported_udp_ip"),
             "udp_port": data.get("stun_reported_udp_port")
         })
