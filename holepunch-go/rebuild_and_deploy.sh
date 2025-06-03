@@ -46,7 +46,7 @@ if ! command -v gcloud >/dev/null 2>&1; then
 fi
 set -e # Re-enable immediate exit on failures
 
-echo "--- Starting Rebuild and Redeployment Process ---"
+echo "--- Starting Rebuild and Redeployment Process for Go Services ---"
 
 # === 1. Delete existing services AND build new images concurrently ===
 echo "Step 1: Deleting services and building new images concurrently (with timeouts to avoid hanging)…"
@@ -70,12 +70,12 @@ BUILD_PLATFORM="linux/amd64"
 echo "Building and pushing Rendezvous service image with Docker Buildx…"
 run_with_timeout ${BUILD_TIMEOUT_SEC}s docker buildx build --platform "${BUILD_PLATFORM}" \
   -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_RENDEZVOUS_REPO_NAME}/${RENDEZVOUS_SERVICE_NAME}:${RENDEZVOUS_IMAGE_TAG}" \
-  -f rendezvous_service_code/Dockerfile.rendezvous rendezvous_service_code --push & rend_build_pid=$!
+  -f deployments/Dockerfile.rendezvous . --push & rend_build_pid=$!
 
 echo "Building and pushing Worker service image with Docker Buildx…"
 run_with_timeout ${BUILD_TIMEOUT_SEC}s docker buildx build --platform "${BUILD_PLATFORM}" \
   -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_WORKER_REPO_NAME}/${WORKER_SERVICE_NAME}:${WORKER_IMAGE_TAG}" \
-  -f Dockerfile.worker . --push & worker_build_pid=$!
+  -f deployments/Dockerfile.worker . --push & worker_build_pid=$!
 
 # --- Wait for all four background jobs (deletes + builds) ---
 echo "Waiting for deletions and builds to complete…"
@@ -117,7 +117,8 @@ run_with_timeout ${DEPLOY_TIMEOUT_SEC}s gcloud run deploy "${RENDEZVOUS_SERVICE_
   --region "${REGION}" \
   --allow-unauthenticated \
   --timeout="${REQUEST_TIMEOUT_SEC}s" \
-  --session-affinity & rend_deploy_pid=$!
+  --session-affinity \
+  --set-env-vars="PING_INTERVAL_SEC=${PING_INTERVAL_SEC:-30},PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC:-60}" & rend_deploy_pid=$!
 
 # Worker deploy
 run_with_timeout ${DEPLOY_TIMEOUT_SEC}s gcloud run deploy "${WORKER_SERVICE_NAME}" \
@@ -127,9 +128,10 @@ run_with_timeout ${DEPLOY_TIMEOUT_SEC}s gcloud run deploy "${WORKER_SERVICE_NAME
   --platform managed \
   --allow-unauthenticated \
   --timeout="${REQUEST_TIMEOUT_SEC}s" \
-  --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_URL},STUN_HOST=${DEFAULT_STUN_HOST:-stun.l.google.com},STUN_PORT=${DEFAULT_STUN_PORT:-19302},INTERNAL_UDP_PORT=${INTERNAL_UDP_PORT:-8081},PING_INTERVAL_SEC=${PING_INTERVAL_SEC:-25},PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC:-25},BENCHMARK_GCS_URL=${BENCHMARK_GCS_URL},BENCHMARK_CHUNK_SIZE=${BENCHMARK_CHUNK_SIZE},STUN_RECHECK_INTERVAL_SEC=${STUN_RECHECK_INTERVAL_SEC:-60}" \
-  --cpu=1 \
-  --cpu-boost \
+  --set-env-vars="RENDEZVOUS_SERVICE_URL=${RENDEZVOUS_URL},INTERNAL_UDP_PORT=${INTERNAL_UDP_PORT:-8081},STUN_HOST=${STUN_HOST:-stun.l.google.com},STUN_PORT=${STUN_PORT:-19302},BENCHMARK_GCS_URL=${BENCHMARK_GCS_URL},BENCHMARK_CHUNK_SIZE=${BENCHMARK_CHUNK_SIZE:-8192},STUN_RECHECK_INTERVAL_SEC=${STUN_RECHECK_INTERVAL_SEC:-60}" \
+  --cpu=4 \
+  --memory=8Gi \
+  --no-cpu-throttling \
   --vpc-egress=all-traffic \
   --network=ip-worker-vpc \
   --subnet=ip-worker-subnet \
@@ -143,4 +145,17 @@ wait_and_report $worker_deploy_pid "Worker service deployment"
 
 echo "Both services deployed (or attempted) concurrently."
 
-echo "--- Rebuild and Redeployment Process Completed ---" 
+# === 3. Get service URLs ===
+echo ""
+echo "Getting service URLs..."
+RENDEZVOUS_URL=$(gcloud run services describe ${RENDEZVOUS_SERVICE_NAME} --platform=managed --region=${REGION} --format='value(status.url)' 2>/dev/null || echo "Failed to get URL")
+WORKER_URL=$(gcloud run services describe ${WORKER_SERVICE_NAME} --platform=managed --region=${REGION} --format='value(status.url)' 2>/dev/null || echo "Failed to get URL")
+
+echo ""
+echo "=== Deployment Complete ==="
+echo "Rendezvous Service: ${RENDEZVOUS_URL}"
+echo "Rendezvous Admin: ${RENDEZVOUS_URL}/admin"
+echo "Worker Service: ${WORKER_URL}"
+echo ""
+echo "Note: Workers will automatically connect to the rendezvous service."
+echo "--- Rebuild and Redeployment Process Completed ---"

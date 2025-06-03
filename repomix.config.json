@@ -1,0 +1,39 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "headerText": "Holepunch P2P UDP Communication System - Go Implementation",
+    "fileSummary": true,
+    "directoryStructure": true,
+    "showLineNumbers": true
+  },
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      ".venv/**",
+      "venv/**",
+      "__pycache__/**",
+      "*.pyc",
+      "bin/**",
+      "*.log",
+      "*.tmp",
+      ".DS_Store",
+      "repomix-output.xml"
+    ]
+  },
+  "include": [
+    "**/*.go",
+    "**/*.py",
+    "**/*.md",
+    "**/*.mod",
+    "**/*.sum",
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.json",
+    "**/*.html",
+    "**/*.sh",
+    "**/Dockerfile*"
+  ]
+}
