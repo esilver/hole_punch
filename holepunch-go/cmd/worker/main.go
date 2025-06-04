@@ -450,7 +450,7 @@ func handleUIWebSocket(c echo.Context) error {
 				})
 				break
 			}
-			err := p2pProto.SendMessage("chat_message", map[string]interface{}{"content": content}, peerAddr)
+			err := p2pProto.SendChatMessage(content, peerAddr)
 			if err != nil {
 				log.Printf("Error sending P2P message via UI command: %v", err)
 				ws.WriteJSON(map[string]interface{}{
@@ -472,8 +472,10 @@ func handleUIWebSocket(c echo.Context) error {
 			}
 			sizeKb := int(sizeKbFloat)
 
-			reqChunkSize := 1024
-			reqNumChunks := sizeKb
+			// 512-byte payloads keep us under MTU but we still want to send the exact
+			// size requested by the UI (size_kb × 1024 bytes).
+			const reqChunkSize = 512
+			reqNumChunks := (sizeKb * 1024) / reqChunkSize
 
 			state.Mu.RLock()
 			peerAddrBenchmark := state.CurrentP2PPeerAddr
@@ -499,7 +501,11 @@ func handleUIWebSocket(c echo.Context) error {
 
 			sessionID := uuid.New().String()
 			go func() {
+				log.Printf("Starting benchmark send: session=%s, chunks=%d, chunk_size=%d, to=%s",
+					sessionID, reqNumChunks, reqChunkSize, peerAddrBenchmark)
+
 				data := make([]byte, reqChunkSize)
+				startTime := time.Now()
 				for i := 0; i < reqNumChunks; i++ {
 					payloadBase64 := base64.StdEncoding.EncodeToString(data)
 					p2pProto.SendMessage("benchmark_chunk", map[string]interface{}{
@@ -508,8 +514,13 @@ func handleUIWebSocket(c echo.Context) error {
 						"payload":        payloadBase64,
 						"from_worker_id": state.WorkerID,
 					}, peerAddrBenchmark)
-
 				}
+
+				duration := time.Since(startTime)
+				throughputMbps := float64(reqNumChunks*reqChunkSize*8) / duration.Seconds() / 1e6
+				log.Printf("Benchmark send completed: session=%s, duration=%v, throughput=%.2f Mbps",
+					sessionID, duration, throughputMbps)
+
 				p2pProto.SendMessage("benchmark_end", map[string]interface{}{
 					"session_id":     sessionID,
 					"total_chunks":   reqNumChunks,

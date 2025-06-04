@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/elisilver/holepunch/pkg/models"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -19,15 +20,30 @@ type P2PProtocol struct {
 	state           *models.WorkerState
 	messageHandlers map[string]MessageHandler
 	mu              sync.RWMutex
+
+	// For reassembling chunked chat messages
+	chatReassemblySessions map[string]*chatReassemblySession
+	chatMu                 sync.Mutex
 }
 
 type MessageHandler func(msg *models.P2PMessage, addr *net.UDPAddr) error
 
+// chatReassemblySession keeps track of incoming chat message chunks so that they can be
+// re-assembled into the original message before being forwarded to the UI. Each chunk
+// is identified by its sequence index starting at 0.
+type chatReassemblySession struct {
+	totalChunks  int
+	chunks       map[int]string
+	fromWorkerID string
+	createdAt    time.Time
+}
+
 func NewP2PProtocol(conn *net.UDPConn, state *models.WorkerState) *P2PProtocol {
 	p := &P2PProtocol{
-		conn:            conn,
-		state:           state,
-		messageHandlers: make(map[string]MessageHandler),
+		conn:                   conn,
+		state:                  state,
+		messageHandlers:        make(map[string]MessageHandler),
+		chatReassemblySessions: make(map[string]*chatReassemblySession),
 	}
 
 	p.registerHandlers()
@@ -41,6 +57,7 @@ func (p *P2PProtocol) registerHandlers() {
 	p.messageHandlers["p2p_pairing_echo"] = p.handlePairingEcho
 	p.messageHandlers["benchmark_chunk"] = p.handleBenchmarkChunk
 	p.messageHandlers["benchmark_end"] = p.handleBenchmarkEnd
+	p.messageHandlers["chat_message_chunk"] = p.handleChatMessageChunk
 }
 
 func (p *P2PProtocol) Start() {
@@ -77,7 +94,6 @@ func (p *P2PProtocol) readLoop() {
 			p.state.Mu.Unlock()
 			continue
 		}
-
 
 		// Check if this might be a STUN response (from known STUN servers)
 		if addr.Port == 19302 || addr.Port == 3478 {
@@ -205,7 +221,7 @@ func (p *P2PProtocol) handlePairingEcho(msg *models.P2PMessage, addr *net.UDPAdd
 
 	// Use message type that matches the UI expectation
 	uiMsg := map[string]interface{}{
-		"type": "p2p_status_update",
+		"type":    "p2p_status_update",
 		"message": fmt.Sprintf("Pairing test successful! RTT: %.2fms", rttMs),
 		"peer_id": msg.FromWorkerID,
 	}
@@ -223,17 +239,6 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 	sessionID, ok := msg.Payload["session_id"].(string)
 	if !ok {
 		return fmt.Errorf("invalid benchmark chunk format: missing session_id")
-	}
-
-	// Extract seq number if present (for Python compatibility)
-	var seq int
-	if seqVal, ok := msg.Payload["seq"]; ok {
-		switch v := seqVal.(type) {
-		case float64:
-			seq = int(v)
-		case int:
-			seq = v
-		}
 	}
 
 	// Extract from_worker_id if present (for Python compatibility)
@@ -263,9 +268,8 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 
 	session.BytesReceived += int64(dataSize)
 	session.ChunksReceived++
-	if seq > 0 && seq%100 == 0 { // Log progress every 100 chunks
-		log.Printf("Benchmark session %s: received chunk %d, total bytes: %d", sessionID, seq, session.BytesReceived)
-	}
+
+	// No per-chunk logging for benchmarks – keeps the hot path lightweight
 	p.state.Mu.Unlock()
 
 	return nil
@@ -299,28 +303,33 @@ func (p *P2PProtocol) handleBenchmarkEnd(msg *models.P2PMessage, addr *net.UDPAd
 		throughput := float64(session.BytesReceived) / duration / 1024 / 1024
 
 		log.Printf("Benchmark %s completed: %.2f MB in %.2fs (%.2f MB/s) from worker %s (expected %d chunks, received %d)",
-			sessionID, float64(session.BytesReceived)/1024/1024, duration, throughput, 
+			sessionID, float64(session.BytesReceived)/1024/1024, duration, throughput,
 			fromWorkerID, totalChunks, session.ChunksReceived)
 
 		// Send results to UI
 		p.state.Mu.Unlock() // Unlock before sending to UI to avoid deadlock
-		
+
 		// Notify UI clients about benchmark completion
 		p.state.Mu.RLock()
 		clients := p.state.UIWebsocketClients
 		p.state.Mu.RUnlock()
 
+		// Compose user-friendly summary message for UI convenience
+		summary := fmt.Sprintf("Benchmark completed: %.2f MB in %.2fs (%.2f MB/s)",
+			float64(session.BytesReceived)/1024/1024, duration, throughput)
+
 		uiMsg := map[string]interface{}{
-			"type": "benchmark_status",
+			"type":    "benchmark_status",
+			"message": summary,
 			"payload": map[string]interface{}{
-				"status":         "completed",
-				"session_id":     sessionID,
-				"from_worker_id": fromWorkerID,
-				"bytes_received": session.BytesReceived,
-				"duration_sec":   duration,
+				"status":          "completed",
+				"session_id":      sessionID,
+				"from_worker_id":  fromWorkerID,
+				"bytes_received":  session.BytesReceived,
+				"duration_sec":    duration,
 				"throughput_mbps": throughput,
 				"chunks_received": session.ChunksReceived,
-				"total_chunks":   totalChunks,
+				"total_chunks":    totalChunks,
 			},
 		}
 
@@ -375,4 +384,126 @@ func (p *P2PProtocol) InitiatePairingTest(peerID string, peerAddr *net.UDPAddr) 
 			log.Printf("Failed to send pairing test: %v", err)
 		}
 	}
+}
+
+// SendChatMessage will transparently split large chat messages into multiple UDP
+// datagrams so that each individual packet stays well below typical MTU limits (~1.2KB).
+// For small messages (\<= maxChunkSize runes) a regular single "chat_message" is sent.
+func (p *P2PProtocol) SendChatMessage(content string, addr *net.UDPAddr) error {
+	const maxChunkSize = 900 // runes; keeps payload < ~1.2KB once JSON encoded
+
+	// Fast-path for short messages
+	if len([]rune(content)) <= maxChunkSize {
+		return p.SendMessage("chat_message", map[string]interface{}{"content": content}, addr)
+	}
+
+	sessionID := uuid.New().String()
+	runes := []rune(content)
+	total := (len(runes) + maxChunkSize - 1) / maxChunkSize
+
+	for i := 0; i < total; i++ {
+		start := i * maxChunkSize
+		end := start + maxChunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		chunk := string(runes[start:end])
+
+		payload := map[string]interface{}{
+			"session_id":    sessionID,
+			"seq":           i,
+			"total":         total,
+			"content_chunk": chunk,
+		}
+
+		if err := p.SendMessage("chat_message_chunk", payload, addr); err != nil {
+			return err
+		}
+
+		// Small delay to reduce likelihood of UDP queue drops when many chunks
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// handleChatMessageChunk collects chunks and forwards re-assembled chat messages to the UI.
+func (p *P2PProtocol) handleChatMessageChunk(msg *models.P2PMessage, addr *net.UDPAddr) error {
+	payload := msg.Payload
+
+	sessionID, ok := payload["session_id"].(string)
+	if !ok {
+		return fmt.Errorf("chat_message_chunk missing session_id")
+	}
+
+	// seq & total may arrive as float64 decoded from JSON numbers
+	seqNumber := 0
+	if seqRaw, ok := payload["seq"]; ok {
+		switch v := seqRaw.(type) {
+		case float64:
+			seqNumber = int(v)
+		case int:
+			seqNumber = v
+		}
+	}
+
+	totalChunks := 0
+	if totalRaw, ok := payload["total"]; ok {
+		switch v := totalRaw.(type) {
+		case float64:
+			totalChunks = int(v)
+		case int:
+			totalChunks = v
+		}
+	}
+
+	chunkContent, ok := payload["content_chunk"].(string)
+	if !ok {
+		return fmt.Errorf("chat_message_chunk missing content_chunk")
+	}
+
+	p.chatMu.Lock()
+	session, exists := p.chatReassemblySessions[sessionID]
+	if !exists {
+		session = &chatReassemblySession{
+			totalChunks:  totalChunks,
+			chunks:       make(map[int]string),
+			fromWorkerID: msg.FromWorkerID,
+			createdAt:    time.Now(),
+		}
+		p.chatReassemblySessions[sessionID] = session
+	}
+
+	session.chunks[seqNumber] = chunkContent
+
+	// If we now have all chunks, reassemble
+	if session.totalChunks > 0 && len(session.chunks) == session.totalChunks {
+		var builder strings.Builder
+		for i := 0; i < session.totalChunks; i++ {
+			if part, ok := session.chunks[i]; ok {
+				builder.WriteString(part)
+			} else {
+				// Missing chunk – should not happen, but bail out safely
+				p.chatMu.Unlock()
+				return fmt.Errorf("missing chunk %d in session %s", i, sessionID)
+			}
+		}
+
+		fullContent := builder.String()
+		// Clean up
+		delete(p.chatReassemblySessions, sessionID)
+		p.chatMu.Unlock()
+
+		// Forward as regular chat message to UI for consistency
+		fakeMsg := models.P2PMessage{
+			Type:         "chat_message",
+			FromWorkerID: session.fromWorkerID,
+			Payload:      map[string]interface{}{"content": fullContent},
+		}
+		return p.handleChatMessage(&fakeMsg, addr)
+	}
+
+	p.chatMu.Unlock()
+	return nil
 }

@@ -31,7 +31,7 @@ func main() {
 	log.Println("Revision: Fixed port binding race condition")
 	log.Println("Build Date:", time.Now().Format("2006-01-02 15:04:05"))
 	log.Println("=====================================")
-	
+
 	state = models.NewServiceState()
 
 	port := getEnvInt("PORT", 8080)
@@ -55,7 +55,6 @@ func main() {
 	e.GET("/api/workers", getWorkers)
 	e.POST("/api/connect", connectWorkers)
 
-
 	log.Printf("Rendezvous service starting on port %d", port)
 	if err := e.Start(fmt.Sprintf(":%d", port)); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
@@ -74,14 +73,14 @@ func handleWorkerWebSocket(c echo.Context) error {
 
 	workerID := c.Param("worker_id")
 	clientIP := c.RealIP()
-	
+
 	// Extract client port from RemoteAddr
 	clientAddr := c.Request().RemoteAddr
 	var clientPort int
 	if _, portStr, err := net.SplitHostPort(clientAddr); err == nil {
 		clientPort, _ = strconv.Atoi(portStr)
 	}
-	
+
 	log.Printf("Worker %s connected from %s:%d", workerID, clientIP, clientPort)
 
 	// Check for duplicate worker and handle it
@@ -102,7 +101,7 @@ func handleWorkerWebSocket(c echo.Context) error {
 		}
 		state.WorkersReadyForPairing = newPairingList
 	}
-	
+
 	// Initialize worker info
 	state.ConnectedWorkers[workerID] = &models.WorkerInfo{
 		ID:                    workerID,
@@ -563,14 +562,14 @@ func attemptToPairWorkers(newWorkerID string) {
 	if err := worker2.Websocket.WriteJSON(offer2); err != nil {
 		log.Printf("Failed to send offer to worker %s: %v", worker2ID, err)
 	}
-	
+
 	// Broadcast pairing event
 	broadcastConnectionInitiated(worker1ID, worker2ID)
 }
 
 func broadcastWorkerUpdate() {
 	workers, counts := getWorkersInfo()
-	
+
 	// Create payload structure that matches the UI expectation
 	payload := map[string]interface{}{
 		"workers":         workers,
@@ -578,7 +577,7 @@ func broadcastWorkerUpdate() {
 		"connected_count": counts["connected"],
 		"ready_count":     counts["ready"],
 	}
-	
+
 	msg := map[string]interface{}{
 		"type":    "workers_update",
 		"payload": payload,
@@ -612,9 +611,9 @@ func broadcastWorkerConnected(workerID string, websocketIP string) {
 	state.Mu.RUnlock()
 
 	broadcastToAdmins(map[string]interface{}{
-		"type": "worker_connected",
-		"worker_id": workerID,
-		"websocket_ip": websocketIP,
+		"type":          "worker_connected",
+		"worker_id":     workerID,
+		"websocket_ip":  websocketIP,
 		"total_workers": totalWorkers,
 	})
 }
@@ -625,27 +624,27 @@ func broadcastWorkerDisconnected(workerID string) {
 	state.Mu.RUnlock()
 
 	broadcastToAdmins(map[string]interface{}{
-		"type": "worker_disconnected",
-		"worker_id": workerID,
+		"type":          "worker_disconnected",
+		"worker_id":     workerID,
 		"total_workers": totalWorkers,
 	})
 }
 
 func broadcastWorkerUDPUpdated(workerID string, udpIP string, udpPort int) {
 	broadcastToAdmins(map[string]interface{}{
-		"type": "worker_udp_updated",
+		"type":      "worker_udp_updated",
 		"worker_id": workerID,
-		"udp_ip": udpIP,
-		"udp_port": udpPort,
+		"udp_ip":    udpIP,
+		"udp_port":  udpPort,
 	})
 }
 
 func broadcastConnectionInitiated(workerAID, workerBID string) {
 	broadcastToAdmins(map[string]interface{}{
-		"type": "connection_initiated",
+		"type":        "connection_initiated",
 		"worker_a_id": workerAID,
 		"worker_b_id": workerBID,
-		"timestamp": time.Now().Format(time.RFC3339),
+		"timestamp":   time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -655,7 +654,7 @@ func getWorkersInfo() ([]map[string]interface{}, map[string]int) {
 
 	workers := make([]map[string]interface{}, 0)
 	readyCount := 0
-	
+
 	for id, worker := range state.ConnectedWorkers {
 		// Check if worker is in ready for pairing list
 		isReady := false
@@ -666,7 +665,7 @@ func getWorkersInfo() ([]map[string]interface{}, map[string]int) {
 				break
 			}
 		}
-		
+
 		workers = append(workers, map[string]interface{}{
 			"worker_id":           id,
 			"websocket_connected": worker.Websocket != nil,
@@ -674,18 +673,21 @@ func getWorkersInfo() ([]map[string]interface{}, map[string]int) {
 			"ready_for_pairing":   isReady,
 			"websocket_ip":        worker.WebsocketObservedIP,
 			"websocket_port":      worker.WebsocketObservedPort,
-			"public_ip":           worker.HTTPReportedPublicIP,  // Added for Python admin UI compatibility
-			"udp_ip":              worker.StunReportedUDPIP,    // Python compatibility (without 'stun_' prefix)
-			"udp_port":            worker.StunReportedUDPPort,  // Python compatibility (without 'stun_' prefix)
+			"http_public_ip":      worker.HTTPReportedPublicIP,
+			"stun_udp_ip":         worker.StunReportedUDPIP,
+			"stun_udp_port":       worker.StunReportedUDPPort,
+			"public_ip":           worker.HTTPReportedPublicIP,
+			"udp_ip":              worker.StunReportedUDPIP,
+			"udp_port":            worker.StunReportedUDPPort,
 		})
 	}
-	
+
 	counts := map[string]int{
 		"total":     len(workers),
 		"connected": len(workers),
 		"ready":     readyCount,
 	}
-	
+
 	return workers, counts
 }
 
