@@ -241,6 +241,17 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 		return fmt.Errorf("invalid benchmark chunk format: missing session_id")
 	}
 
+	// Extract total_chunks if present
+	totalChunksFromMsg := 0
+	if tcVal, ok := msg.Payload["total_chunks"]; ok {
+		switch v := tcVal.(type) {
+		case float64:
+			totalChunksFromMsg = int(v)
+		case int:
+			totalChunksFromMsg = v
+		}
+	}
+
 	// Extract from_worker_id if present (for Python compatibility)
 	fromWorkerID, _ := msg.Payload["from_worker_id"].(string)
 
@@ -259,17 +270,42 @@ func (p *P2PProtocol) handleBenchmarkChunk(msg *models.P2PMessage, addr *net.UDP
 	session, exists := p.state.BenchmarkSessions[sessionID]
 	if !exists {
 		session = &models.BenchmarkSession{
-			StartTime: time.Now(),
-			Active:    true,
+			StartTime:                   time.Now(),
+			Active:                      true,
+			TotalChunks:                 totalChunksFromMsg, // Initialize with total_chunks from first message
+			LastReportedProgressPercent: 0,
 		}
 		p.state.BenchmarkSessions[sessionID] = session
-		log.Printf("Started new benchmark session %s from worker %s", sessionID, fromWorkerID)
+		log.Printf("Started new benchmark session %s from worker %s, expecting %d chunks", sessionID, fromWorkerID, totalChunksFromMsg)
+	}
+
+	// If TotalChunks wasn't set by the first message (e.g. older sender), update it.
+	// This is a fallback, ideally the first message always contains it.
+	if session.TotalChunks == 0 && totalChunksFromMsg > 0 {
+		session.TotalChunks = totalChunksFromMsg
 	}
 
 	session.BytesReceived += int64(dataSize)
 	session.ChunksReceived++
 
-	// No per-chunk logging for benchmarks – keeps the hot path lightweight
+	// Report progress every ~2% via chat message
+	if session.TotalChunks > 0 {
+		currentProgressPercent := (session.ChunksReceived * 100) / session.TotalChunks
+		// Ensure progress is capped at 100 for the last message
+		if session.ChunksReceived == session.TotalChunks {
+			currentProgressPercent = 100
+		}
+
+		if currentProgressPercent >= session.LastReportedProgressPercent+2 || currentProgressPercent == 100 {
+			// Ensure we don't send duplicate 100% messages if the last chunk itself triggers a >2% step to 100%
+			if !(session.LastReportedProgressPercent == 100 && currentProgressPercent == 100 && session.ChunksReceived < session.TotalChunks) {
+				progressMsg := fmt.Sprintf("[Receiver] Benchmark progress: %d%% (%d/%d chunks received)", currentProgressPercent, session.ChunksReceived, session.TotalChunks)
+				// Send chat message back to the sender (addr)
+				p.SendChatMessage(progressMsg, addr) // Using existing SendChatMessage method
+				session.LastReportedProgressPercent = currentProgressPercent
+			}
+		}
+	}
 	p.state.Mu.Unlock()
 
 	return nil

@@ -506,6 +506,8 @@ func handleUIWebSocket(c echo.Context) error {
 
 				data := make([]byte, reqChunkSize)
 				startTime := time.Now()
+				lastReportedProgressPercent := 0
+
 				for i := 0; i < reqNumChunks; i++ {
 					payloadBase64 := base64.StdEncoding.EncodeToString(data)
 					p2pProto.SendMessage("benchmark_chunk", map[string]interface{}{
@@ -513,7 +515,22 @@ func handleUIWebSocket(c echo.Context) error {
 						"seq":            i,
 						"payload":        payloadBase64,
 						"from_worker_id": state.WorkerID,
+						"total_chunks":   reqNumChunks,
 					}, peerAddrBenchmark)
+
+					// Report progress every ~2%
+					if reqNumChunks > 0 { // Avoid division by zero if reqNumChunks is 0
+						currentProgressPercent := (i + 1) * 100 / reqNumChunks
+						if currentProgressPercent >= lastReportedProgressPercent+2 || currentProgressPercent == 100 {
+							progressMsg := fmt.Sprintf("[Sender] Benchmark progress: %d%% (%d/%d chunks sent)", currentProgressPercent, i+1, reqNumChunks)
+							if p2pProto != nil && peerAddrBenchmark != nil {
+								p2pProto.SendChatMessage(progressMsg, peerAddrBenchmark)
+							}
+							lastReportedProgressPercent = currentProgressPercent
+						}
+					}
+
+					// No artificial delay – saturate the link
 				}
 
 				duration := time.Since(startTime)

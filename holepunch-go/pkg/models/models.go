@@ -63,10 +63,12 @@ type WorkerState struct {
 }
 
 type BenchmarkSession struct {
-	StartTime      time.Time
-	BytesReceived  int64
-	ChunksReceived int
-	Active         bool
+	StartTime                   time.Time
+	BytesReceived               int64
+	ChunksReceived              int
+	TotalChunks                 int
+	LastReportedProgressPercent int
+	Active                      bool
 }
 
 func NewWorkerState(workerID string) *WorkerState {
